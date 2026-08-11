@@ -1,0 +1,37 @@
+data:
+  dataset: synthetic
+synthetic:
+  feedback_strength: 1.0
+  disease_treatment_effect: 0.75
+  toxicity_treatment_effect: 0.55
+policy:
+  tilt: 1.0
+  temperature: 1.0
+  action_costs: [0.0, 0.05, 0.10]
+  propensity_floor: 0.01
+  policy_ratio_cap: 10.0
+cot:
+  rho_cap: 4.0
+  weight_cap: 40.0
+  loss: mse
+certification:
+  alpha: 0.10
+  delta: 0.05
+  ratio_error_bound: 0.0
+  ratio_bound_source: none
+  ratio_delta: 0.0
+  practical_bootstrap_resamples: 2000
+samples:
+  logged: 5000
+  oracle_rollouts: 50000
+  oracle_surface_rollouts: 5000
+  online_rollouts: 2000
+horizon: 12
+q_grid_size: 101
+q_quantile_min: 0.50
+q_quantile_max: 0.999
+seeds:
+  start: 0
+  stop: 200
+devices: [cuda:0, cuda:1]
+output_dir: results/final/main/synthetic

@@ -1,0 +1,94 @@
+"""Run the per-step SC-PCP experiment on one or two GPUs."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from multiprocessing import get_context
+from pathlib import Path
+import sys
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from scpcp.artifacts import (
+    mark_study_complete,
+    mark_study_failed,
+    write_seed_result,
+    write_study_metadata,
+)
+from scpcp.config import ExperimentConfig
+from scpcp.device import resolve_devices
+from scpcp.experiment import run_seed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run per-step performative SC-PCP")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--devices", default=None, help="comma-separated CUDA devices; default uses both GPUs")
+    parser.add_argument("--seeds", default=None, help="seed range such as 0:20 or comma-separated integers")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    args = parser.parse_args()
+
+    config = ExperimentConfig.from_yaml(args.config)
+    devices = resolve_devices(args.devices or config.devices)
+    seeds = _parse_seeds(args.seeds, config.seeds)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir = args.output_dir or config.output_dir / f"{timestamp}_{config.data.dataset}"
+    config = config.with_overrides(devices=devices, seeds=seeds, output_dir=output_dir)
+    write_study_metadata(output_dir, config)
+    jobs = [(seed, devices[index % len(devices)]) for index, seed in enumerate(seeds)]
+    try:
+        # A separate single-process executor owns each GPU.  A shared executor
+        # may dispatch successive jobs for different devices to one persistent
+        # worker, leaving CUDA contexts allocated on both cards.
+        with ExitStack() as stack:
+            executors = [
+                stack.enter_context(
+                    ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"))
+                )
+                for _ in devices
+            ]
+            futures = {
+                executors[index % len(executors)].submit(
+                    _run_and_write,
+                    config,
+                    seed,
+                    device,
+                    output_dir,
+                ): seed
+                for index, (seed, device) in enumerate(jobs)
+            }
+            for future in as_completed(futures):
+                print(future.result(), flush=True)
+    except BaseException as error:
+        mark_study_failed(output_dir, seeds, error)
+        raise
+    mark_study_complete(output_dir, seeds)
+    print(output_dir)
+
+
+def _run_and_write(config: ExperimentConfig, seed: int, device: str, output_dir: Path) -> str:
+    try:
+        result = run_seed(config, seed=seed, device=device)
+        return str(write_seed_result(result, output_dir, config))
+    finally:
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+
+def _parse_seeds(value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return default
+    if ":" in value:
+        start, stop = (int(part) for part in value.split(":"))
+        return tuple(range(start, stop))
+    return tuple(int(part) for part in value.split(",") if part)
+
+
+if __name__ == "__main__":
+    main()
