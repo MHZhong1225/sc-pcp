@@ -10,7 +10,7 @@ interface required for a fair SC-PCP experiment.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -69,6 +69,43 @@ class OnlineBaselineResult:
     radius_by_time: Tensor
     target_deployments: int
     rounds: int
+    adaptation_per_time_coverage: Tensor
+    adaptation_round_worst_coverage: tuple[float, ...]
+    adaptation_pathwise_coverage: float
+
+
+@dataclass
+class _CoverageAccumulator:
+    covered_by_time: Tensor
+    trajectories: int = 0
+    pathwise_hits: int = 0
+    round_worst: list[float] = field(default_factory=list)
+
+    @classmethod
+    def create(cls, horizon: int) -> "_CoverageAccumulator":
+        return cls(torch.zeros(horizon, dtype=torch.float64))
+
+    def update(self, scores: Tensor, radius: float | Tensor) -> None:
+        scores = scores.detach().cpu()
+        threshold = torch.as_tensor(radius, dtype=scores.dtype).cpu()
+        hits = scores <= threshold
+        per_time = hits.to(torch.float64).mean(dim=0)
+        self.covered_by_time += hits.to(torch.float64).sum(dim=0)
+        self.trajectories += len(scores)
+        self.pathwise_hits += int(hits.all(dim=1).sum().item())
+        self.round_worst.append(float(per_time.min().item()))
+
+    def finish(self, radii: Tensor, rounds: int) -> OnlineBaselineResult:
+        if self.trajectories < 1:
+            raise RuntimeError("online adaptation produced no trajectories")
+        return OnlineBaselineResult(
+            radius_by_time=radii,
+            target_deployments=self.trajectories,
+            rounds=rounds,
+            adaptation_per_time_coverage=(self.covered_by_time / self.trajectories).to(torch.float32),
+            adaptation_round_worst_coverage=tuple(self.round_worst),
+            adaptation_pathwise_coverage=self.pathwise_hits / self.trajectories,
+        )
 
 
 @torch.no_grad()
@@ -91,6 +128,7 @@ def aci_style_controller(
     histories = [initial_scores[:, time].detach().cpu() for time in range(horizon)]
     alpha_time = torch.full((horizon,), alpha)
     round_sizes = _online_round_sizes(total_rollouts, rounds)
+    adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         radii = torch.stack([_finite_quantile(history, 1.0 - float(alpha_time[t])) for t, history in enumerate(histories)])
         deployed = rollout(
@@ -105,12 +143,13 @@ def aci_style_controller(
         from scpcp.scores import score_batch
 
         scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes).cpu()
+        adaptation.update(scores, radii)
         misses = (scores > radii[None, :]).float().mean(dim=0)
         alpha_time = (alpha_time + gamma * (alpha - misses)).clamp(0.001, 0.999)
         for time in range(horizon):
             histories[time] = torch.cat((histories[time], scores[:, time]))[-10_000:]
     radii = torch.stack([_finite_quantile(history, 1.0 - float(alpha_time[t])) for t, history in enumerate(histories)])
-    return OnlineBaselineResult(radii, target_deployments=sum(round_sizes), rounds=rounds)
+    return adaptation.finish(radii, rounds)
 
 
 @torch.no_grad()
@@ -131,6 +170,7 @@ def repeated_recalibration(
 
     radius = initial_radius
     round_sizes = _online_round_sizes(total_rollouts, rounds)
+    adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         deployed = rollout(
             environment,
@@ -144,12 +184,9 @@ def repeated_recalibration(
         from scpcp.scores import score_batch
 
         scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes)
+        adaptation.update(scores, radius)
         radius = historical_per_step_radius(scores, alpha)
-    return OnlineBaselineResult(
-        radius_by_time=torch.full((horizon,), radius),
-        target_deployments=sum(round_sizes),
-        rounds=rounds,
-    )
+    return adaptation.finish(torch.full((horizon,), radius), rounds)
 
 
 @torch.no_grad()
@@ -176,6 +213,7 @@ def multidim_spci_style_controller(
 
     histories = [initial_scores[:, time].detach().cpu()[-residual_window:] for time in range(horizon)]
     round_sizes = _online_round_sizes(total_rollouts, rounds)
+    adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         radii = torch.stack([_finite_quantile(history, 1.0 - alpha) for history in histories])
         deployed = rollout(
@@ -190,10 +228,11 @@ def multidim_spci_style_controller(
         from scpcp.scores import score_batch
 
         scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes).cpu()
+        adaptation.update(scores, radii)
         for time in range(horizon):
             histories[time] = torch.cat((histories[time], scores[:, time]))[-residual_window:]
     radii = torch.stack([_finite_quantile(history, 1.0 - alpha) for history in histories])
-    return OnlineBaselineResult(radii, target_deployments=sum(round_sizes), rounds=rounds)
+    return adaptation.finish(radii, rounds)
 
 
 @torch.no_grad()
@@ -223,6 +262,7 @@ def prc_max_time(
     radius = float(initial_radius)
     q_grid = q_grid.detach().cpu()
     round_sizes = _online_round_sizes(total_rollouts, rounds)
+    adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         margin = math.sqrt(math.log(len(q_grid) * horizon / delta) / (2.0 * rollout_size))
         deployed = rollout(
@@ -237,16 +277,13 @@ def prc_max_time(
         from scpcp.scores import score_batch
 
         scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes).cpu()
+        adaptation.update(scores, radius)
         coverage = (scores[:, :, None] <= q_grid[None, None, :]).float().mean(dim=0).transpose(0, 1)
         safe = (coverage.amin(dim=1) - margin >= 1.0 - alpha).nonzero().squeeze(1)
         guarded = [index for index in safe.tolist() if abs(float(q_grid[index]) - radius) <= maximum_step]
         if guarded:
             radius = float(q_grid[min(guarded)])
-    return OnlineBaselineResult(
-        radius_by_time=torch.full((horizon,), radius),
-        target_deployments=sum(round_sizes),
-        rounds=rounds,
-    )
+    return adaptation.finish(torch.full((horizon,), radius), rounds)
 
 
 def _finite_quantile(values: Tensor, probability: float) -> Tensor:

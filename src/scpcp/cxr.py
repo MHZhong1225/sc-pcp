@@ -13,10 +13,8 @@ from scpcp.config import DataConfig
 
 class _CXRDataset(Dataset[tuple[Tensor, Tensor]]):
     def __init__(self, paths: list[str], labels: Tensor, indices: Tensor) -> None:
-        from PIL import Image
         from torchvision.transforms import v2
 
-        self._image = Image
         self.paths = paths
         self.labels = labels
         self.indices = indices.tolist()
@@ -33,8 +31,10 @@ class _CXRDataset(Dataset[tuple[Tensor, Tensor]]):
         return len(self.indices)
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        from PIL import Image
+
         row = self.indices[index]
-        with self._image.open(self.paths[row]) as image:
+        with Image.open(self.paths[row]) as image:
             return self.transform(image.convert("RGB")), self.labels[row]
 
 
@@ -74,7 +74,7 @@ def index_cxr_embeddings(
     torch.manual_seed(seed)
     model = _DenseNetCXR(config.cxr_embedding_dim).to(resolved)
     train_dataset = _CXRDataset(paths, labels, training_rows.cpu())
-    loader = DataLoader(train_dataset, batch_size=config.cxr_batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    loader = DataLoader(train_dataset, batch_size=config.cxr_batch_size, shuffle=True, num_workers=0, pin_memory=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     model.train()
     for _ in range(config.cxr_epochs):
@@ -90,7 +90,7 @@ def index_cxr_embeddings(
         _CXRDataset(paths, labels, all_rows),
         batch_size=config.cxr_batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
     )
     pieces = []

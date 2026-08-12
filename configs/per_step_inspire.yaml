@@ -24,7 +24,7 @@ policy:
 cot:
   rho_cap: 4.0
   weight_cap: 40.0
-  loss: mse
+  loss: huber
   q_samples_per_batch: 4
 certification:
   alpha: 0.10
@@ -34,6 +34,11 @@ certification:
 samples:
   oracle_rollouts: 50000
   online_rollouts: 2000
+baselines:
+  mfcs_depth: 3
+  aci_gamma: 0.01
+  multidim_buffer: 1000
+  online_rounds: 3
 horizon: 12
 q_grid_size: 101
 q_quantile_min: 0.50

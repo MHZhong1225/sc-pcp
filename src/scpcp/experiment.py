@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from scpcp.baselines import (
+    OnlineBaselineResult,
     aci_style_controller,
     finite_depth_mfcs_selection,
     historical_per_step_radius,
@@ -309,13 +310,14 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     # Baselines that do not fit COT receive the union of the two post-predictor
     # calibration roles, so they are not disadvantaged in total data access.
     historical_radius = historical_per_step_radius(baseline_scores, config.certification.alpha)
+    mfcs_method = f"MFCS-style (depth={config.baselines.mfcs_depth})"
     mfcs_selection, mfcs_diagonal = finite_depth_mfcs_selection(
         baseline_batch.to(device),
         baseline_scores.to(device),
         q_grid=q_grid.to(device),
         target_policy=policy,
         logging_policy=logging_policy,
-        depth=3,
+        depth=config.baselines.mfcs_depth,
         alpha=config.certification.alpha,
         weight_cap=config.cot.weight_cap,
     )
@@ -347,10 +349,26 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     iw_deployment_diagonal = iw_deployment_certificate.estimates
     records = [
         _evaluate_scalar_method("Historical CP", historical_radius, task, policy, region, config, seed, device),
-        _evaluate_scalar_method("MFCS-style (depth=3)", mfcs_selection.radius, task, policy, region, config, seed + 11, device, selection=mfcs_selection),
+        _evaluate_scalar_method(mfcs_method, mfcs_selection.radius, task, policy, region, config, seed + 11, device, selection=mfcs_selection),
         _evaluate_scalar_method(IW_ABLATION_METHOD, iw_deployment_selection.radius, task, policy, region, config, seed + 22, device, selection=iw_deployment_selection, certificate=iw_deployment_certificate),
         _evaluate_scalar_method(SCPCP_METHOD, cot_deployment_selection.radius, task, policy, region, config, seed + 44, device, selection=cot_deployment_selection, certificate=cot_deployment_certificate),
     ]
+    if learned_cot_oracle_l1_selection is not None and learned_cot_oracle_l1_certificate is not None:
+        records.append(
+            _evaluate_scalar_method(
+                "SC-PCP (exact-MDP oracle-bound audit)",
+                learned_cot_oracle_l1_selection.radius,
+                task,
+                policy,
+                region,
+                config,
+                seed + 56,
+                device,
+                selection=learned_cot_oracle_l1_selection,
+                certificate=learned_cot_oracle_l1_certificate,
+                information_regime="internal_oracle_ratio_bound_validation_only",
+            )
+        )
     if oracle_selection is not None:
         records.append(
             _evaluate_scalar_method(
@@ -373,15 +391,16 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         region,
         baseline_scores,
         alpha=config.certification.alpha,
-        gamma=0.01,
-        rounds=3,
+        gamma=config.baselines.aci_gamma,
+        rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
         seed=seed + 66,
         device=device,
     )
+    aci_method = f"ACI-style online (gamma={config.baselines.aci_gamma:g})"
     records.append(
-        _evaluate_stagewise_method("ACI-style online", online.radius_by_time, task, policy, region, config, seed + 77, device, online.target_deployments)
+        _evaluate_stagewise_method(aci_method, online, task, policy, region, config, seed + 77, device)
     )
     spci = multidim_spci_style_controller(
         task.environment,
@@ -389,14 +408,16 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         region,
         baseline_scores,
         alpha=config.certification.alpha,
-        rounds=3,
+        rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
         seed=seed + 82,
         device=device,
+        residual_window=config.baselines.multidim_buffer,
     )
+    spci_method = f"MultiDimSPCI-style online (buffer={config.baselines.multidim_buffer})"
     records.append(
-        _evaluate_stagewise_method("MultiDimSPCI-style online", spci.radius_by_time, task, policy, region, config, seed + 83, device, spci.target_deployments)
+        _evaluate_stagewise_method(spci_method, spci, task, policy, region, config, seed + 83, device)
     )
     repeated = repeated_recalibration(
         task.environment,
@@ -404,14 +425,14 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         region,
         historical_radius,
         alpha=config.certification.alpha,
-        rounds=3,
+        rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
         seed=seed + 88,
         device=device,
     )
     records.append(
-        _evaluate_stagewise_method("Repeated recalibration", repeated.radius_by_time, task, policy, region, config, seed + 99, device, repeated.target_deployments)
+        _evaluate_stagewise_method("Repeated recalibration", repeated, task, policy, region, config, seed + 99, device)
     )
     prc = prc_max_time(
         task.environment,
@@ -421,7 +442,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         q_grid,
         alpha=config.certification.alpha,
         delta=config.certification.delta,
-        rounds=3,
+        rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
         seed=seed + 103,
@@ -430,14 +451,13 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     records.append(
         _evaluate_stagewise_method(
             "PRC-MaxTime-style online (grid-adapted)",
-            prc.radius_by_time,
+            prc,
             task,
             policy,
             region,
             config,
             seed + 104,
             device,
-            prc.target_deployments,
         )
     )
     cot_ess = effective_sample_sizes(cot_weights, splits.certification.patient_ids)
@@ -445,7 +465,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     records.extend(
         (
             _logged_record("Historical CP", historical_radius, cert_scores, None, None, None, policy, logging_policy, splits.certification, config, q_grid),
-            _logged_record("MFCS-style (depth=3)", mfcs_selection.radius, cert_scores, mfcs_diagonal, None, None, policy, logging_policy, splits.certification, config, q_grid, mfcs_selection),
+            _logged_record(mfcs_method, mfcs_selection.radius, cert_scores, mfcs_diagonal, None, None, policy, logging_policy, splits.certification, config, q_grid, mfcs_selection),
             _logged_record(IW_ABLATION_METHOD, iw_deployment_selection.radius, cert_scores, iw_deployment_diagonal, iw_deployment_certificate, iw_ess, policy, logging_policy, splits.certification, config, q_grid, iw_deployment_selection),
             _logged_record(SCPCP_METHOD, cot_deployment_selection.radius, cert_scores, cot_deployment_diagonal, cot_deployment_certificate, cot_ess, policy, logging_policy, splits.certification, config, q_grid, cot_deployment_selection),
         )
@@ -683,15 +703,15 @@ def _evaluate_scalar_method(
 
 def _evaluate_stagewise_method(
     name: str,
-    radii: Tensor,
+    adaptation: OnlineBaselineResult,
     task: _Task,
     policy: BehaviorAnchoredPolicy,
     outcome_model: object,
     config: ExperimentConfig,
     seed: int,
     device: str,
-    target_deployments: int,
 ) -> dict[str, Any]:
+    radii = adaptation.radius_by_time
     coverage, deployed, scores = per_step_oracle_metrics(
         task.environment,
         policy,
@@ -702,9 +722,37 @@ def _evaluate_stagewise_method(
         seed=seed,
         device=device,
     )
-    return _deployment_record(
-        name, radii.cpu(), coverage, deployed, scores, config, policy, outcome_model, None, None, target_deployments
+    record = _deployment_record(
+        name,
+        radii.cpu(),
+        coverage,
+        deployed,
+        scores,
+        config,
+        policy,
+        outcome_model,
+        None,
+        None,
+        adaptation.target_deployments,
     )
+    per_time = adaptation.adaptation_per_time_coverage
+    adaptation_target = 1.0 - config.certification.alpha
+    record.update(
+        {
+            "adaptation_trajectories": adaptation.target_deployments,
+            "adaptation_rounds": adaptation.rounds,
+            "adaptation_target_coverage": adaptation_target,
+            "adaptation_empirical_target_met": bool(
+                float(per_time.min().item()) >= adaptation_target - 1e-7
+            ),
+            "adaptation_worst_coverage": float(per_time.min().item()),
+            "adaptation_average_coverage": float(per_time.mean().item()),
+            "adaptation_pathwise_coverage": adaptation.adaptation_pathwise_coverage,
+            "adaptation_per_time_coverage": json.dumps([float(value) for value in per_time.tolist()]),
+            "adaptation_round_worst_coverage": json.dumps(list(adaptation.adaptation_round_worst_coverage)),
+        }
+    )
+    return record
 
 
 def _metric_placeholders() -> dict[str, float | str]:
@@ -729,6 +777,23 @@ def _metric_placeholders() -> dict[str, float | str]:
         "logged_descriptive_per_time_clinical_cost": "[]",
         "logged_state_model_estimated_clinical_cost": missing,
         "logged_state_model_estimated_clinical_utility": missing,
+        "estimated_min_coverage": missing,
+        "lower_bound_min": missing,
+        "mean_ess": missing,
+        "minimum_ess": missing,
+        "median_policy_kl": missing,
+        "maximum_policy_ratio": missing,
+        "prediction_set_mean_score": missing,
+        "certified": False,
+        "adaptation_trajectories": 0,
+        "adaptation_rounds": 0,
+        "adaptation_target_coverage": missing,
+        "adaptation_empirical_target_met": missing,
+        "adaptation_worst_coverage": missing,
+        "adaptation_average_coverage": missing,
+        "adaptation_pathwise_coverage": missing,
+        "adaptation_per_time_coverage": "[]",
+        "adaptation_round_worst_coverage": "[]",
     }
 
 
@@ -824,6 +889,25 @@ def _deployment_record(
     else:
         volumes = 4.0 * step_radius.square() * scales[:, 0] * scales[:, 1]
         log_volumes = (volumes + 1e-12).log()
+    selected_index = None if selection is None else selection.index
+    has_selected_certificate = certificate is not None and selected_index is not None
+    estimated_min = (
+        float(certificate.estimates[selected_index].amin().item())
+        if has_selected_certificate
+        else float("nan")
+    )
+    lower_bound_min = (
+        float(certificate.lower_bounds[selected_index].amin().item())
+        if has_selected_certificate
+        else float("nan")
+    )
+    formally_certified = bool(
+        has_selected_certificate
+        and certificate is not None
+        and certificate.formal
+        and selection is not None
+        and selection.status == "CERTIFIED"
+    )
     return {
         **_metric_placeholders(),
         "track": "empirical_environment",
@@ -851,6 +935,9 @@ def _deployment_record(
         "target_policy_trajectories": target_deployments,
         "oracle_evaluation_trajectories": deployed.n,
         "score_mean": float(scores.mean().item()),
+        "estimated_min_coverage": estimated_min,
+        "lower_bound_min": lower_bound_min,
+        "certified": formally_certified,
     }
 
 

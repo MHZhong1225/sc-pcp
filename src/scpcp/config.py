@@ -68,12 +68,14 @@ class COTConfig:
     epochs: int = 100
     patience: int = 10
     gradient_clip: float = 5.0
-    rho_cap: float = 20.0
+    # Keep the direct Python defaults internally consistent with the default
+    # policy-ratio cap and the global state-action weight cap.
+    rho_cap: float = 4.0
     weight_cap: float = 40.0
     normalization_penalty: float = 1.0
     validation_fraction: float = 0.15
     q_samples_per_batch: int = 4
-    loss: str = "mse"
+    loss: str = "huber"
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,16 @@ class SampleConfig:
 
 
 @dataclass(frozen=True)
+class BaselineConfig:
+    """Prespecified settings for transparent task-aligned baselines."""
+
+    mfcs_depth: int = 3
+    aci_gamma: float = 0.01
+    multidim_buffer: int = 1_000
+    online_rounds: int = 3
+
+
+@dataclass(frozen=True)
 class DataConfig:
     dataset: str = "synthetic"
     data_root: Path = Path("/home/ubuntu/zmh/dataset")
@@ -130,6 +142,7 @@ class ExperimentConfig:
     cot: COTConfig = COTConfig()
     certification: CertificationConfig = CertificationConfig()
     samples: SampleConfig = SampleConfig()
+    baselines: BaselineConfig = BaselineConfig()
     data: DataConfig = DataConfig()
     horizon: int = 12
     q_grid_size: int = 101
@@ -229,6 +242,19 @@ class ExperimentConfig:
             raise ValueError("at least one seed and device are required")
         if any(value <= 0 for value in asdict(self.samples).values()):
             raise ValueError("sample sizes must be positive")
+        if self.baselines.mfcs_depth < 1:
+            raise ValueError("MFCS depth must be positive")
+        if not 0.0 < self.baselines.aci_gamma <= 1.0:
+            raise ValueError("ACI gamma must lie in (0, 1]")
+        if self.baselines.multidim_buffer < 1:
+            raise ValueError("MultiDimSPCI buffer must be positive")
+        if self.baselines.online_rounds < 1:
+            raise ValueError("online baseline rounds must be positive")
+        if self.samples.online_rollouts < self.baselines.online_rounds:
+            raise ValueError(
+                "online_rollouts must be at least online_rounds so every adaptation round "
+                "receives a trajectory"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)

@@ -23,6 +23,7 @@ python scripts/plot_per_step.py \
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -58,7 +59,7 @@ SEED_PATTERN = re.compile(r"seed_(\d+)$")
 
 METHOD_STYLES = {
     "Historical CP": ("#6B7280", "o"),
-    "MFCS-style (depth=3)": ("#16A085", "D"),
+    "MFCS-style": ("#16A085", "D"),
     "IW-SC-PCP": ("#D97706", "X"),
     "SC-PCP": ("#0F4C81", "*"),
     "MC-oracle SC-PCP (reference)": ("#111827", "^"),
@@ -70,7 +71,7 @@ METHOD_STYLES = {
 
 DISPLAY_LABELS = {
     "Historical CP": "Historical CP",
-    "MFCS-style (depth=3)": "MFCS-style (depth 3)",
+    "MFCS-style": "MFCS-style",
     "IW-SC-PCP": "IW-SC-PCP",
     "SC-PCP": "SC-PCP (ours)",
     "MC-oracle SC-PCP (reference)": "MC oracle",
@@ -81,6 +82,8 @@ DISPLAY_LABELS = {
 }
 
 MAIN_RESULT_METHODS = tuple(METHOD_STYLES)
+TRACK_A_CONTEXT_COLUMNS = ("run_root", "dataset", "horizon", "setting")
+FACTORIAL_CONTEXT_COLUMNS = ("study_root", "dataset", "horizon")
 
 
 def main() -> None:
@@ -113,18 +116,53 @@ def main() -> None:
         certification_summary.to_csv(args.output / "track_a_certification_summary.csv", index=False)
         coverage_source = build_per_time_source(track_a)
         coverage_source.to_csv(args.output / "track_a_per_time_coverage.csv", index=False)
-        for setting, setting_records in track_a.groupby("setting", sort=False):
-            setting_source = coverage_source[coverage_source["setting"] == setting]
+        adaptation_source = build_adaptation_round_source(track_a)
+        adaptation_source.to_csv(args.output / "online_adaptation_summary.csv", index=False)
+        for context_values, setting_records in track_a.groupby(
+            list(TRACK_A_CONTEXT_COLUMNS), dropna=False, sort=False
+        ):
+            context = dict(zip(TRACK_A_CONTEXT_COLUMNS, context_values))
+            setting_source = build_per_time_source(setting_records)
             target = _setting_target(setting_records)
-            plot_per_time_coverage(setting_source, target, args.output / _figure_stem("track_a_per_time_coverage", setting))
-            plot_tradeoff(setting_records, target, args.output / _figure_stem("track_a_tradeoff", setting))
+            label = _figure_context_label(
+                context["run_root"], context["dataset"], context["horizon"], context["setting"]
+            )
+            plot_per_time_coverage(
+                setting_source,
+                target,
+                args.output / _figure_stem("track_a_per_time_coverage", label),
+            )
+            plot_tradeoff(
+                setting_records,
+                target,
+                args.output / _figure_stem("track_a_tradeoff", label),
+            )
+            setting_adaptation = adaptation_source[
+                adaptation_source["run_root"].eq(context["run_root"])
+                & adaptation_source["dataset"].eq(context["dataset"])
+                & adaptation_source["horizon"].eq(context["horizon"])
+                & adaptation_source["setting"].eq(context["setting"])
+            ]
+            if not setting_adaptation.empty:
+                plot_online_adaptation(
+                    setting_adaptation,
+                    target,
+                    args.output / _figure_stem("online_adaptation", label),
+                )
         factorial_summary = summarize_factorial_track_a(track_a)
         if not factorial_summary.empty:
             factorial_summary.to_csv(args.output / "track_a_factorial_summary.csv", index=False)
-            plot_factorial_worst_coverage(
-                factorial_summary,
-                args.output / "track_a_factorial_worst_coverage",
-            )
+            for context_values, context_summary in factorial_summary.groupby(
+                list(FACTORIAL_CONTEXT_COLUMNS), dropna=False, sort=False
+            ):
+                context = dict(zip(FACTORIAL_CONTEXT_COLUMNS, context_values))
+                label = _figure_context_label(
+                    context["study_root"], context["dataset"], context["horizon"], "factorial"
+                )
+                plot_factorial_worst_coverage(
+                    context_summary,
+                    args.output / _figure_stem("track_a_factorial_worst_coverage", label),
+                )
     if not track_b.empty:
         summarize_track_b(track_b).to_csv(args.output / "track_b_summary.csv", index=False)
 
@@ -146,7 +184,10 @@ def main() -> None:
         seed = seed_from_path(surface_file.parent)
         run_records = records[(records["run_root"] == str(run_root)) & (records["seed"] == seed)]
         target = _setting_target(run_records)
-        label = f"{run_root.name}_seed_{seed:05d}"
+        dataset = _first_text(run_records, "dataset")
+        horizon = _first_numeric(run_records, "horizon")
+        setting = _first_text(run_records, "setting") or run_root.name
+        label = f"{_figure_context_label(run_root, dataset, horizon, setting)}_seed_{seed:05d}"
         plot_dcov_heatmaps(arrays, run_records, target, args.output / _figure_stem("dcov_min", label))
         plot_certification_diagnostics(arrays, run_records, target, args.output / _figure_stem("certification", label))
 
@@ -273,9 +314,16 @@ def add_mc_oracle_q_errors(records: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_track_a(records: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for (setting, information_regime, selection_estimand, method), group in records.groupby(
-        ["setting", "information_regime", "selection_estimand", "method"], sort=False
+    group_columns = (
+        *TRACK_A_CONTEXT_COLUMNS,
+        "information_regime",
+        "selection_estimand",
+        "method",
+    )
+    for group_values, group in records.groupby(
+        list(group_columns), dropna=False, sort=False
     ):
+        group_key = dict(zip(group_columns, group_values))
         evaluated = group[group["worst_coverage"].notna()]
         target = _setting_target(group)
         certified = _certificate_success(group)
@@ -283,26 +331,14 @@ def summarize_track_a(records: pd.DataFrame) -> pd.DataFrame:
         abstention_rate = _status_rate(group, "UNCERTIFIED")
         rows.append(
             {
-                "setting": setting,
-                "information_regime": information_regime,
-                "selection_estimand": selection_estimand,
-                "method": method,
+                **group_key,
                 "n_runs": len(group),
                 "n_evaluated": len(evaluated),
                 "n_abstained": int(round(len(group) * abstention_rate)),
                 "abstention_rate": abstention_rate,
-                # Retained for older downstream readers.  The new name states
-                # what it measures: no radius was available on the fixed grid.
-                "uncertified_rate": abstention_rate,
                 "formal_certificate_rate": float(certified.mean()),
                 "target_coverage": target,
-                "target_met_rate": _target_met_rate(evaluated, target),
-                "primary_per_step_target_met_rate": _target_met_rate(evaluated, target),
                 "fresh_target_met_rate_all_runs": fresh_target_met_rate,
-                # Backward-compatible alias. This is an empirical fresh-rollout
-                # success rate, not the probability of issuing a certificate.
-                "cert_rate": fresh_target_met_rate,
-                "cert_rate_among_evaluated": _target_met_rate(evaluated, target),
                 "mean_worst_coverage": _mean(evaluated, "worst_coverage"),
                 "se_worst_coverage": _standard_error(evaluated, "worst_coverage"),
                 "mean_average_coverage": _mean(evaluated, "average_coverage"),
@@ -326,6 +362,10 @@ def summarize_track_a(records: pd.DataFrame) -> pd.DataFrame:
                 ),
                 "mean_target_policy_trajectories": _mean(evaluated, "target_policy_trajectories"),
                 "mean_evaluation_trajectories": _mean(evaluated, "oracle_evaluation_trajectories"),
+                "mean_adaptation_worst_coverage": _mean(group, "adaptation_worst_coverage"),
+                "se_adaptation_worst_coverage": _standard_error(group, "adaptation_worst_coverage"),
+                "mean_adaptation_average_coverage": _mean(group, "adaptation_average_coverage"),
+                "mean_adaptation_pathwise_coverage": _mean(group, "adaptation_pathwise_coverage"),
             }
         )
     return pd.DataFrame(rows)
@@ -338,8 +378,9 @@ def build_main_results(summary: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     primary = summary[
         summary["selection_estimand"].fillna("per_step").eq("per_step")
-        & summary["method"].isin(MAIN_RESULT_METHODS)
     ].copy()
+    primary["_method_family"] = primary["method"].map(method_family)
+    primary = primary[primary["_method_family"].isin(MAIN_RESULT_METHODS)]
     regime_panel = {
         "offline_logged_data": "offline",
         "on_policy_adaptation": "online_with_adaptation_data",
@@ -351,9 +392,14 @@ def build_main_results(summary: pd.DataFrame) -> pd.DataFrame:
         primary["information_regime"].map(regime_panel).fillna("other"),
     )
     method_order = {method: index for index, method in enumerate(MAIN_RESULT_METHODS)}
-    primary["_method_order"] = primary["method"].map(method_order)
-    primary = primary.sort_values(["setting", "comparison_panel", "_method_order"])
+    primary["_method_order"] = primary["_method_family"].map(method_order)
+    primary = primary.sort_values(
+        ["dataset", "horizon", "setting", "run_root", "comparison_panel", "_method_order"]
+    )
     columns = [
+        "run_root",
+        "dataset",
+        "horizon",
         "setting",
         "comparison_panel",
         "information_regime",
@@ -379,6 +425,10 @@ def build_main_results(summary: pd.DataFrame) -> pd.DataFrame:
         "se_clinical_cost",
         "mean_target_policy_trajectories",
         "mean_evaluation_trajectories",
+        "mean_adaptation_worst_coverage",
+        "se_adaptation_worst_coverage",
+        "mean_adaptation_average_coverage",
+        "mean_adaptation_pathwise_coverage",
     ]
     return primary.loc[:, columns].reset_index(drop=True)
 
@@ -387,15 +437,17 @@ def write_main_results_markdown(results: pd.DataFrame, output: Path) -> None:
     """Write a compact human-readable companion to the numeric main table."""
 
     header = (
-        "| Setting | Panel | Method | Runs | Target met | WorstCov | AvgCov | "
-        "MeanLogVolume | Clinical cost | Adaptation trajectories |\n"
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        "| Dataset | Horizon | Setting | Panel | Method | Runs | Fresh target met | WorstCov | AvgCov | "
+        "MeanLogVolume | Clinical cost | Adaptation cumulative WorstCov | Adaptation trajectories |\n"
+        "|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     rows = []
     for row in results.itertuples(index=False):
         rows.append(
-            "| {setting} | {panel} | {method} | {evaluated}/{runs} | {met} | "
-            "{worst} | {average} | {volume} | {cost} | {adaptation} |".format(
+            "| {dataset} | {horizon} | {setting} | {panel} | {method} | {evaluated}/{runs} | {met} | "
+            "{worst} | {average} | {volume} | {cost} | {adaptation_coverage} | {adaptation} |".format(
+                dataset=row.dataset,
+                horizon=_format_numeric(row.horizon),
                 setting=row.setting,
                 panel=row.comparison_panel,
                 method=display_label(row.method),
@@ -406,6 +458,11 @@ def write_main_results_markdown(results: pd.DataFrame, output: Path) -> None:
                 average=_format_mean_se(row.mean_average_coverage, row.se_average_coverage, row.n_evaluated),
                 volume=_format_mean_se(row.mean_log_volume, row.se_log_volume, row.n_evaluated),
                 cost=_format_mean_se(row.mean_clinical_cost, row.se_clinical_cost, row.n_evaluated),
+                adaptation_coverage=_format_mean_se(
+                    row.mean_adaptation_worst_coverage,
+                    row.se_adaptation_worst_coverage,
+                    row.n_runs,
+                ),
                 adaptation=f"{row.mean_target_policy_trajectories:.0f}",
             )
         )
@@ -430,6 +487,11 @@ def _format_rate(value: float) -> str:
     return "—" if not np.isfinite(value) else f"{value:.1%}"
 
 
+def _format_numeric(value: object) -> str:
+    numeric = _as_float(value)
+    return "—" if not np.isfinite(numeric) else f"{numeric:g}"
+
+
 def track_a_certification_summary(summary: pd.DataFrame) -> pd.DataFrame:
     """Return fresh target attainment, abstention, and formal-status rates.
 
@@ -439,6 +501,9 @@ def track_a_certification_summary(summary: pd.DataFrame) -> pd.DataFrame:
     """
 
     columns = [
+        "run_root",
+        "dataset",
+        "horizon",
         "setting",
         "information_regime",
         "selection_estimand",
@@ -448,8 +513,6 @@ def track_a_certification_summary(summary: pd.DataFrame) -> pd.DataFrame:
         "n_abstained",
         "target_coverage",
         "fresh_target_met_rate_all_runs",
-        "cert_rate",
-        "cert_rate_among_evaluated",
         "abstention_rate",
         "formal_certificate_rate",
     ]
@@ -459,29 +522,56 @@ def track_a_certification_summary(summary: pd.DataFrame) -> pd.DataFrame:
 def summarize_factorial_track_a(records: pd.DataFrame) -> pd.DataFrame:
     """Aggregate the beta × eta matrix for the per-step target."""
 
-    required = {"feedback_strength", "policy_tilt", "method_family"}
+    required = {
+        *FACTORIAL_CONTEXT_COLUMNS,
+        "feedback_strength",
+        "policy_tilt",
+        "method_family",
+    }
     if not required.issubset(records):
         return pd.DataFrame()
     primary = records[records["selection_estimand"].fillna("per_step").eq("per_step")].copy()
     primary = primary[primary["feedback_strength"].notna() & primary["policy_tilt"].notna()]
-    if primary["feedback_strength"].nunique() < 2 or primary["policy_tilt"].nunique() < 2:
+    factorial_contexts = [
+        context
+        for _, context in primary.groupby(
+            list(FACTORIAL_CONTEXT_COLUMNS), dropna=False, sort=False
+        )
+        if context["feedback_strength"].nunique() >= 2
+        and context["policy_tilt"].nunique() >= 2
+    ]
+    if not factorial_contexts:
         return pd.DataFrame()
+    primary = pd.concat(factorial_contexts, ignore_index=True)
     rows = []
-    group_columns = ("method_family", "feedback_strength", "policy_tilt")
-    for (method, beta, eta), group in primary.groupby(list(group_columns), sort=False):
+    group_columns = (
+        *FACTORIAL_CONTEXT_COLUMNS,
+        "method_family",
+        "feedback_strength",
+        "policy_tilt",
+    )
+    for group_values, group in primary.groupby(
+        list(group_columns), dropna=False, sort=False
+    ):
+        group_key = dict(zip(group_columns, group_values))
         target = _setting_target(group)
         evaluated = group[group["worst_coverage"].notna()]
         abstention_rate = _status_rate(group, "UNCERTIFIED")
         rows.append(
             {
-                "method": method,
-                "feedback_strength": beta,
-                "policy_tilt": eta,
+                **{
+                    name: value
+                    for name, value in group_key.items()
+                    if name != "method_family"
+                },
+                "method": group_key["method_family"],
                 "n_runs": len(group),
                 "n_evaluated": len(evaluated),
                 "abstention_rate": abstention_rate,
-                "cert_rate": _all_run_target_met_rate(group, target, "worst_coverage"),
-                "cert_rate_among_evaluated": _target_met_rate(evaluated, target),
+                "formal_certificate_rate": float(_certificate_success(group).mean()),
+                "fresh_target_met_rate_all_runs": _all_run_target_met_rate(
+                    group, target, "worst_coverage"
+                ),
                 "mean_worst_coverage": _mean(evaluated, "worst_coverage"),
                 "se_worst_coverage": _standard_error(evaluated, "worst_coverage"),
                 "mean_log_volume": _mean(evaluated, "mean_log_volume"),
@@ -766,7 +856,7 @@ def summarize_track_b(records: pd.DataFrame) -> pd.DataFrame:
                 "selection_estimand": selection_estimand,
                 "method": method,
                 "n_runs": len(group),
-                "uncertified_rate": _status_rate(group, "UNCERTIFIED"),
+                "abstention_rate": _status_rate(group, "UNCERTIFIED"),
                 "formal_certificate_rate": float(_certificate_success(group).mean()),
                 "mean_estimated_min_coverage": _mean(group, "estimated_min_coverage"),
                 "se_estimated_min_coverage": _standard_error(group, "estimated_min_coverage"),
@@ -818,6 +908,9 @@ def build_per_time_source(records: pd.DataFrame) -> pd.DataFrame:
         for time, coverage in enumerate(values, start=1):
             rows.append(
                 {
+                    "run_root": row.run_root,
+                    "dataset": row.dataset,
+                    "horizon": row.horizon,
                     "setting": row.setting,
                     "seed": row.seed,
                     "method": row.method,
@@ -825,7 +918,19 @@ def build_per_time_source(records: pd.DataFrame) -> pd.DataFrame:
                     "coverage": coverage,
                 }
             )
-    return pd.DataFrame(rows, columns=["setting", "seed", "method", "time", "coverage"])
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "run_root",
+            "dataset",
+            "horizon",
+            "setting",
+            "seed",
+            "method",
+            "time",
+            "coverage",
+        ],
+    )
 
 
 def parse_curve(value: object) -> np.ndarray:
@@ -834,6 +939,63 @@ def parse_curve(value: object) -> np.ndarray:
     except (TypeError, json.JSONDecodeError):
         return np.empty(0, dtype=float)
     return result[np.isfinite(result)]
+
+
+def build_adaptation_round_source(records: pd.DataFrame) -> pd.DataFrame:
+    """Summarize round-local coverage observed by online controllers.
+
+    The final adaptation metrics in the main table pool every trajectory used
+    during adaptation.  This companion source keeps the per-round worst-time
+    coverage so that transient failures are not hidden by that pooled number.
+    """
+
+    provenance_columns = [
+        "run_root",
+        "dataset",
+        "horizon",
+        "setting",
+        "method",
+        "round",
+    ]
+    output_columns = [
+        *provenance_columns,
+        "n_runs",
+        "mean_round_worst_coverage",
+        "se_round_worst_coverage",
+    ]
+    rows: list[dict[str, object]] = []
+    for row in primary_per_step_records(records).itertuples(index=False):
+        values = parse_curve(getattr(row, "adaptation_round_worst_coverage", "[]"))
+        for round_index, coverage in enumerate(values, start=1):
+            rows.append(
+                {
+                    "run_root": row.run_root,
+                    "dataset": row.dataset,
+                    "horizon": row.horizon,
+                    "setting": row.setting,
+                    "seed": row.seed,
+                    "method": row.method,
+                    "round": round_index,
+                    "coverage": float(coverage),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+
+    raw = pd.DataFrame(rows)
+    summary_rows: list[dict[str, object]] = []
+    for values, group in raw.groupby(provenance_columns, dropna=False, sort=False):
+        key = dict(zip(provenance_columns, values))
+        coverage = pd.to_numeric(group["coverage"], errors="coerce").dropna()
+        summary_rows.append(
+            {
+                **key,
+                "n_runs": int(group["seed"].nunique()),
+                "mean_round_worst_coverage": float(coverage.mean()),
+                "se_round_worst_coverage": _series_standard_error(coverage),
+            }
+        )
+    return pd.DataFrame(summary_rows, columns=output_columns)
 
 
 def plot_per_time_coverage(source: pd.DataFrame, target: float, output_stem: Path) -> None:
@@ -846,7 +1008,7 @@ def plot_per_time_coverage(source: pd.DataFrame, target: float, output_stem: Pat
         mean = aggregate["mean"].to_numpy()
         count = aggregate["count"].to_numpy()
         standard_error = aggregate["std"].fillna(0.0).to_numpy() / np.sqrt(count)
-        color, marker = METHOD_STYLES.get(method, ("#4B5563", "o"))
+        color, marker = METHOD_STYLES.get(method_family(method), ("#4B5563", "o"))
         axis.plot(
             time,
             mean,
@@ -885,6 +1047,72 @@ def plot_per_time_coverage(source: pd.DataFrame, target: float, output_stem: Pat
     save_figure(figure, output_stem)
 
 
+def plot_online_adaptation(source: pd.DataFrame, target: float, output_stem: Path) -> None:
+    """Plot coverage on the data consumed in each online adaptation round."""
+
+    if source.empty:
+        return
+    figure, axis = plt.subplots(figsize=(7.2, 4.4), constrained_layout=True)
+    for method, group in source.groupby("method", sort=False):
+        group = group.sort_values("round")
+        rounds = group["round"].to_numpy(dtype=float)
+        mean = group["mean_round_worst_coverage"].to_numpy(dtype=float)
+        standard_error = group["se_round_worst_coverage"].fillna(0.0).to_numpy(dtype=float)
+        color, marker = METHOD_STYLES.get(method_family(method), ("#4B5563", "o"))
+        axis.plot(
+            rounds,
+            mean,
+            color=color,
+            marker=marker,
+            markersize=4.5,
+            linewidth=1.5,
+            label=display_label(method),
+        )
+        if np.any(standard_error > 0.0):
+            axis.fill_between(
+                rounds,
+                np.clip(mean - 1.96 * standard_error, 0.0, 1.0),
+                np.clip(mean + 1.96 * standard_error, 0.0, 1.0),
+                color=color,
+                alpha=0.12,
+            )
+    if np.isfinite(target):
+        axis.axhline(
+            target,
+            color="#111827",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"Target ({target:.2f})",
+        )
+    axis.set_xlabel("Online adaptation round")
+    axis.set_ylabel("Round-local worst per-step coverage")
+    axis.set_xticks(sorted(source["round"].dropna().unique()))
+    axis.set_ylim(*coverage_axis_limits(source["mean_round_worst_coverage"], target))
+    axis.grid(axis="y", color="#E5E7EB", linewidth=0.7)
+    axis.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=3,
+        fontsize=6.4,
+        columnspacing=1.0,
+        handletextpad=0.5,
+    )
+    lower = int(source["n_runs"].min())
+    upper = int(source["n_runs"].max())
+    seed_note = f"n={lower}" if lower == upper else f"n={lower}–{upper} per point"
+    axis.text(
+        0.99,
+        0.02,
+        f"Shading: 95% normal-approx. CI; {seed_note}",
+        transform=axis.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=6,
+        color="#4B5563",
+    )
+    save_figure(figure, output_stem)
+
+
 def plot_tradeoff(records: pd.DataFrame, target: float, output_stem: Path) -> None:
     """Plot the primary per-step efficiency comparison."""
 
@@ -898,7 +1126,7 @@ def plot_tradeoff(records: pd.DataFrame, target: float, output_stem: Path) -> No
         y = group["worst_coverage"].mean()
         x_error = _standard_error(group, "mean_log_volume")
         y_error = _standard_error(group, "worst_coverage")
-        color, marker = METHOD_STYLES.get(method, ("#4B5563", "o"))
+        color, marker = METHOD_STYLES.get(method_family(method), ("#4B5563", "o"))
         online = _first_text(group, "information_regime") == "on_policy_adaptation"
         axis.errorbar(
             x,
@@ -1088,8 +1316,14 @@ def grid_diagonal(surface: np.ndarray) -> np.ndarray:
 
 def method_family(method: object) -> str:
     """Return the stable method name used by the final experiment."""
-
-    return str(method)
+    name = str(method)
+    if name.startswith("MFCS-style (depth="):
+        return "MFCS-style"
+    if name.startswith("ACI-style online (gamma="):
+        return "ACI-style online"
+    if name.startswith("MultiDimSPCI-style online (buffer="):
+        return "MultiDimSPCI-style online"
+    return name
 
 
 def per_step_scalar_selection_points(
@@ -1147,7 +1381,18 @@ def primary_per_step_records(records: pd.DataFrame) -> pd.DataFrame:
 
 
 def display_label(method: object) -> str:
-    return DISPLAY_LABELS.get(str(method), str(method))
+    name = str(method)
+    family = method_family(name)
+    if family == "MFCS-style":
+        depth = re.search(r"depth=([^\)]+)", name)
+        return f"MFCS-style (depth {depth.group(1)})" if depth else DISPLAY_LABELS[family]
+    if family == "ACI-style online":
+        gamma = re.search(r"gamma=([^\)]+)", name)
+        return f"ACI-style (online; gamma {gamma.group(1)})" if gamma else DISPLAY_LABELS[family]
+    if family == "MultiDimSPCI-style online":
+        buffer = re.search(r"buffer=([^\)]+)", name)
+        return f"MultiDimSPCI-style (online; buffer {buffer.group(1)})" if buffer else DISPLAY_LABELS[family]
+    return DISPLAY_LABELS.get(family, name)
 
 
 def seed_count_note(records: pd.DataFrame) -> str:
@@ -1254,12 +1499,6 @@ def _status_rate(records: pd.DataFrame, prefix: str) -> float:
     return float(status.str.startswith(prefix).mean())
 
 
-def _target_met_rate(records: pd.DataFrame, target: float) -> float:
-    if records.empty or not np.isfinite(target):
-        return float("nan")
-    return float((records["worst_coverage"] >= target - 1e-7).mean())
-
-
 def _all_run_target_met_rate(records: pd.DataFrame, target: float, column: str) -> float:
     if records.empty or not np.isfinite(target) or column not in records:
         return float("nan")
@@ -1279,6 +1518,13 @@ def _first_text(records: pd.DataFrame, column: str) -> str:
     values = records[column].dropna().astype(str)
     values = values[values.ne("")]
     return "" if values.empty else str(values.iloc[0])
+
+
+def _first_numeric(records: pd.DataFrame, column: str) -> float:
+    if column not in records:
+        return float("nan")
+    values = pd.to_numeric(records[column], errors="coerce").dropna()
+    return float(values.iloc[0]) if not values.empty else float("nan")
 
 
 def _standard_error(records: pd.DataFrame, column: str) -> float:
@@ -1305,6 +1551,12 @@ def _setting_target(records: pd.DataFrame) -> float:
 def _figure_stem(prefix: str, label: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
     return Path(prefix + "_" + safe)
+
+
+def _figure_context_label(root: object, dataset: object, horizon: object, setting: object) -> str:
+    identity = f"{root}\0{dataset}\0{horizon}\0{setting}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:10]
+    return f"{dataset}_h{_format_numeric(horizon)}_{setting}_{digest}"
 
 
 def save_figure(figure: plt.Figure, output_stem: Path) -> None:

@@ -122,19 +122,25 @@ class QConditionalCOT(nn.Module):
     def _raw_rho_for_grid(self, time: int, states: Tensor, q_grid: Tensor) -> Tensor:
         """Evaluate a frozen q-family without repeating states through the GRU."""
 
-        normalized_q = ((q_grid - self.q_center) / self.q_scale)[None, :, None]
-        pieces = []
+        normalized_grid = (q_grid - self.q_center) / self.q_scale
+        state_pieces = []
         for state_batch in states.split(self.config.batch_size):
             encoded = self._state_features(state_batch)
-            expanded_state = encoded[:, None, :].expand(-1, len(q_grid), -1)
-            expanded_q = normalized_q.expand(len(state_batch), -1, -1)
-            features = torch.cat((expanded_state, expanded_q), dim=2).reshape(
-                len(state_batch) * len(q_grid), -1
-            )
-            pieces.append(
-                self.heads[time - 1](features).reshape(len(state_batch), len(q_grid))
-            )
-        return torch.cat(pieces, dim=0)
+            # Bound expanded state-q rows by the usual COT batch budget while
+            # retaining one state encoding for every q chunk.
+            q_batch_size = max(1, self.config.batch_size // len(state_batch))
+            q_pieces = []
+            for q_batch in normalized_grid.split(q_batch_size):
+                expanded_state = encoded[:, None, :].expand(-1, len(q_batch), -1)
+                expanded_q = q_batch[None, :, None].expand(len(state_batch), -1, -1)
+                features = torch.cat((expanded_state, expanded_q), dim=2).reshape(
+                    len(state_batch) * len(q_batch), -1
+                )
+                q_pieces.append(
+                    self.heads[time - 1](features).reshape(len(state_batch), len(q_batch))
+                )
+            state_pieces.append(torch.cat(q_pieces, dim=1))
+        return torch.cat(state_pieces, dim=0)
 
 
 @dataclass(frozen=True)
@@ -174,8 +180,11 @@ def fit_cot(
     r"""Fit \(\rho_{t+1}^q(S_{t+1})=E[Z_t^q\mid S_{t+1}]\) stage by stage.
 
     Previously fitted heads are frozen before their predictions form the next
-    stage's pseudo-target.  MSE is the default because it targets the required
-    conditional mean; Huber is exposed only as a practical robustness option.
+    stage's pseudo-target.  The final protocol uses Huber loss for robustness.
+    Since a Huber population minimizer need not equal the conditional mean,
+    the learned continuous-state ratio path is explicitly practical: a formal
+    certificate additionally requires an externally valid L1 transport-error
+    bound.  The finite-MDP audit obtains that bound from exact enumeration.
     """
 
     resolved = torch.device(device)

@@ -164,7 +164,7 @@ patient split 与模型随机性，因此多 seed 不会反复扫描大表。
 |---|---|---:|---|---|
 | `per_step_mimic_iv.yaml` | ICU hemodynamic | 4h / 12 | curated IV fluid × pressor levels | hypotension, tachycardia burden |
 | `per_step_eicu.yaml` | ICU hemodynamic | 4h / 12 | fluid × pressor levels | hypotension, tachycardia burden |
-| `per_step_mimic_cxr.yaml` | ED→ICU multimodal respiratory | 6h / 6 | respiratory-support level | hypoxemia, tachypnea burden |
+| `per_step_mimic_cxr.yaml` | ED→ICU multimodal respiratory | 6h / 6 | none / non-invasive / invasive support | hypoxemia, tachypnea burden |
 | `per_step_inspire.yaml` | intraoperative hemodynamic | 10min / 12 | none / fluid-only / vasopressor-containing | hypotension, hypertension burden |
 
 治疗和结果严格按窗口分开：前半窗定义 treatment exposure，后半窗生成 response。
@@ -180,6 +180,8 @@ ICU 入科之后，episode 的 time zero 推迟到该图像时间，因而所有
 DenseNet-121 只使用 `D_pred ∩` 官方 MIMIC-CXR `train` split 的 CheXpert labels
 fine-tune，然后冻结并产生 256-d embedding。缺失的本地 JPG 会在 cohort 构建时剔除。
 仓库不再提供 label-proxy 图像路径，MIMIC-CXR 结果只能来自真实 DenseNet-121 encoder。
+原始 conventional oxygen 与 HFNC/NIV 在 patient split 前固定合并为 non-invasive support，
+与 invasive ventilation 分开；raw-to-model mapping 会写入每个 seed 的 metadata。
 
 INSPIRE 原始 `pressor+fluid` 在固定的前 5min action window 中约占 0.2%，不满足
 预先声明的 2% support 门槛。因此实现会在划分 patient roles **之前**固定为三类
@@ -240,6 +242,12 @@ transport bias，因此不是 theorem certificate。
 正式主实验统一写入 `results/final/main/`。四个临床任务各运行 20 个 patient-split seeds；
 每个配置显式限制最多 60,000 个候选 episode，使用 50,000 条独立 rollout 评价每个最终规则。
 旧的单 seed、80% 目标、缩小模型或 proxy 图像结果不进入本仓库的结果体系。
+
+当前冻结实现（`source_tree_sha256 = 65a10a938d80d7d69231464adf469bd51ce4382a3af5f62884116ded3f006be1`）
+已经完成四个临床任务共 80 个 seeds、synthetic 200 个 seeds，以及 5 个 exact-tabular
+validation seeds。统一主表见
+[`results/final/main_figures/main_results.md`](results/final/main_figures/main_results.md)，机器可读版本见
+[`results/final/main_figures/main_results.csv`](results/final/main_figures/main_results.csv)。
 
 绘图器会同时导出：
 
@@ -322,8 +330,8 @@ horizon、样本量和 overlap cap，便于审计其它设定未随之变化。
 
 ```bash
 conda run -n ucp python scripts/plot_per_step.py \
-  --input results/final/synthetic \
-  --output results/final/figures/synthetic
+  --input results/final/main \
+  --output results/final/main_figures
 ```
 
 产物包括每 seed 的 `records.csv`、`surfaces.npz`、`metadata.json` 和最后原子发布的
@@ -363,4 +371,3 @@ conda run -n ucp pytest -q
 margin/ESS、tied q-grid、GRU empirical-history shift、patient split 与
 direct-action merge semantics，以及临床 `state→action→response` 对齐、逐观测 burden、
 lab label 排歧和 eICU IV-fluid/urine cell 过滤。
-# sc-pcp

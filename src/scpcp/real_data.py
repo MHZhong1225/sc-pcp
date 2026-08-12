@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import tempfile
 from typing import Callable
@@ -284,6 +284,8 @@ def load_clinical_trajectories(
     """Load one clinical task, fit its action discretization on D_pred, and return trajectories."""
 
     raw = _load_or_build_raw(config, seed=seed)
+    if config.data.dataset == "mimic_cxr":
+        raw = _coarsen_cxr_actions(raw)
     predictor_rows = _predictor_rows(raw, seed)
     if raw.cxr_paths:
         if raw.cxr_labels is None:
@@ -430,10 +432,9 @@ def _discretize_actions(
 ) -> tuple[torch.Tensor, tuple[int, ...], dict[int, int]]:
     if raw.direct_actions is not None:
         actions = raw.direct_actions.to(torch.long)
-        # CXR retains its prespecified four respiratory-support levels.
-        # INSPIRE is pre-coarsened once to three stable levels before any
-        # patient role is drawn.  The D_pred check below never changes either
-        # ontology seed-by-seed.
+        # CXR and INSPIRE are pre-coarsened once to stable three-level
+        # ontologies before any patient role is drawn. The D_pred check below
+        # validates support but never changes either ontology seed-by-seed.
         expected_actions = raw.direct_action_count or 4
         return _merge_rare_actions(actions, predictor_rows, expected_actions=expected_actions, direct=True)
     reference = raw.treatments[predictor_rows]
@@ -502,6 +503,26 @@ def _merge_rare_actions(
         remapped[torch.isin(actions, source)] = new_label
     mapping = {original: new_label for original, target in remap.items() for new_label, stable_action in enumerate(stable) if target == stable_action}
     return remapped, tuple(stable), mapping
+
+
+def _coarsen_cxr_actions(raw: _RawClinicalBatch) -> _RawClinicalBatch:
+    """Merge conventional oxygen and HFNC/NIV before patient-role splitting."""
+
+    if raw.direct_actions is None:
+        raise RuntimeError("MIMIC-CXR is missing respiratory-support actions")
+    if raw.direct_action_count == 3:
+        return raw
+    if raw.direct_action_count != 4:
+        raise RuntimeError("MIMIC-CXR requires the raw four-level respiratory ontology")
+    actions = raw.direct_actions.clone()
+    actions[raw.direct_actions == 2] = 1
+    actions[raw.direct_actions == 3] = 2
+    return replace(
+        raw,
+        direct_actions=actions,
+        direct_action_count=3,
+        original_to_direct_action={0: 0, 1: 1, 2: 1, 3: 2},
+    )
 
 
 def _action_locations(expected_actions: int, *, direct: bool) -> dict[int, tuple[int, int]]:

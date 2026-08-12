@@ -53,7 +53,12 @@ def source_tree_sha256() -> str:
     return digest.hexdigest()
 
 
-def write_study_metadata(output_dir: Path, config: ExperimentConfig) -> None:
+def write_study_metadata(
+    output_dir: Path,
+    config: ExperimentConfig,
+    *,
+    execution: dict[str, Any] | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     _write_text(output_dir / "config.yaml", yaml.safe_dump(config.to_dict(), sort_keys=False))
     metadata = {
@@ -61,6 +66,7 @@ def write_study_metadata(output_dir: Path, config: ExperimentConfig) -> None:
         "source_tree_sha256": source_tree_sha256(),
         "devices": list(config.devices),
         "seeds": list(config.seeds),
+        "execution": _jsonable(execution or {}),
     }
     _write_text(output_dir / "study_metadata.json", json.dumps(metadata, indent=2))
     _write_study_status(output_dir, config.seeds, status="running")

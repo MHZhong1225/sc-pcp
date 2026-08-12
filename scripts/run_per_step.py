@@ -31,37 +31,49 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--devices", default=None, help="comma-separated CUDA devices; default uses both GPUs")
     parser.add_argument("--seeds", default=None, help="seed range such as 0:20 or comma-separated integers")
+    parser.add_argument(
+        "--workers-per-device",
+        type=int,
+        default=1,
+        help="independent persistent seed workers per GPU",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
     config = ExperimentConfig.from_yaml(args.config)
     devices = resolve_devices(args.devices or config.devices)
+    if args.workers_per_device < 1:
+        parser.error("--workers-per-device must be positive")
     seeds = _parse_seeds(args.seeds, config.seeds)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = args.output_dir or config.output_dir / f"{timestamp}_{config.data.dataset}"
     config = config.with_overrides(devices=devices, seeds=seeds, output_dir=output_dir)
-    write_study_metadata(output_dir, config)
-    jobs = [(seed, devices[index % len(devices)]) for index, seed in enumerate(seeds)]
+    write_study_metadata(
+        output_dir,
+        config,
+        execution={"workers_per_device": args.workers_per_device},
+    )
+    worker_devices, jobs = _build_seed_jobs(seeds, devices, args.workers_per_device)
     try:
-        # A separate single-process executor owns each GPU.  A shared executor
-        # may dispatch successive jobs for different devices to one persistent
-        # worker, leaving CUDA contexts allocated on both cards.
+        # Every persistent single-process executor is pinned to one physical
+        # GPU.  Multiple slots may share a GPU, but no worker ever switches
+        # devices and accumulates cross-device CUDA contexts.
         with ExitStack() as stack:
             executors = [
                 stack.enter_context(
                     ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"))
                 )
-                for _ in devices
+                for _ in worker_devices
             ]
             futures = {
-                executors[index % len(executors)].submit(
+                executors[worker_index].submit(
                     _run_and_write,
                     config,
                     seed,
                     device,
                     output_dir,
                 ): seed
-                for index, (seed, device) in enumerate(jobs)
+                for worker_index, seed, device in jobs
             }
             for future in as_completed(futures):
                 print(future.result(), flush=True)
@@ -81,13 +93,40 @@ def _run_and_write(config: ExperimentConfig, seed: int, device: str, output_dir:
             torch.cuda.empty_cache()
 
 
+def _build_seed_jobs(
+    seeds: tuple[int, ...],
+    devices: tuple[str, ...],
+    workers_per_device: int,
+) -> tuple[tuple[str, ...], tuple[tuple[int, int, str], ...]]:
+    """Assign each seed to a persistent worker pinned to one device."""
+
+    if workers_per_device < 1:
+        raise ValueError("workers_per_device must be positive")
+    worker_devices = tuple(
+        device for device in devices for _ in range(workers_per_device)
+    )
+    jobs = tuple(
+        (index % len(worker_devices), seed, worker_devices[index % len(worker_devices)])
+        for index, seed in enumerate(seeds)
+    )
+    return worker_devices, jobs
+
+
 def _parse_seeds(value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
     if value is None:
-        return default
-    if ":" in value:
-        start, stop = (int(part) for part in value.split(":"))
-        return tuple(range(start, stop))
-    return tuple(int(part) for part in value.split(",") if part)
+        result = default
+    elif ":" in value:
+        start, stop = (int(part) for part in value.split(":", maxsplit=1))
+        result = tuple(range(start, stop))
+    else:
+        result = tuple(int(part) for part in value.split(",") if part)
+    if not result:
+        raise ValueError("at least one seed is required")
+    if any(seed < 0 for seed in result):
+        raise ValueError("seeds must be nonnegative")
+    if len(set(result)) != len(result):
+        raise ValueError("seeds must be unique")
+    return result
 
 
 if __name__ == "__main__":
