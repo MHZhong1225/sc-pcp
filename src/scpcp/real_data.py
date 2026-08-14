@@ -334,14 +334,25 @@ def load_clinical_trajectories(
             f"{len(config.policy.action_costs)} costs are configured"
         )
     action_costs = tuple(config.policy.action_costs[index] for index in active_actions)
-    states, static_indices = _history_stack(raw.states, raw.static_indices, config.model.history_length) if config.model.architecture == "gru" else (raw.states, raw.static_indices)
+    # Clinician treatment propensities are strongly stage-dependent even after
+    # conditioning on the measured physiology.  Make decision time an explicit
+    # pre-action covariate instead of asking a pooled nuisance model to infer it
+    # indirectly from padded histories.  This coordinate is deterministic,
+    # outcome-free, and is added before role splitting/model fitting.
+    states = _append_decision_time(raw.states)
+    state_feature_names = raw.state_feature_names + ("decision_time",)
+    states, static_indices = (
+        _history_stack(states, raw.static_indices, config.model.history_length)
+        if config.model.architecture == "gru"
+        else (states, raw.static_indices)
+    )
     return (
         TrajectoryBatch(states, actions, raw.outcomes, raw.patient_ids),
         len(active_actions),
         static_indices,
         action_costs,
         action_mapping,
-        raw.state_feature_names,
+        state_feature_names,
     )
 
 
@@ -1853,6 +1864,24 @@ def _episode_row_indices(values: torch.Tensor | np.ndarray, ordered_ids: np.ndar
     array = values.detach().cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
     lookup = {int(value): index for index, value in enumerate(ordered_ids)}
     return torch.tensor([lookup[int(value)] for value in array], dtype=torch.long)
+
+
+def _append_decision_time(states: torch.Tensor) -> torch.Tensor:
+    """Append normalized pre-action decision time to every base state."""
+
+    if states.ndim != 3 or states.shape[1] < 2:
+        raise ValueError("clinical states must have shape [N,T+1,D] with T >= 1")
+    decision_time = torch.linspace(
+        0.0,
+        1.0,
+        states.shape[1],
+        dtype=states.dtype,
+        device=states.device,
+    )
+    return torch.cat(
+        (states, decision_time[None, :, None].expand(states.shape[0], -1, 1)),
+        dim=2,
+    )
 
 
 def _history_stack(states: torch.Tensor, static_indices: tuple[int, ...], length: int) -> tuple[torch.Tensor, tuple[int, ...]]:

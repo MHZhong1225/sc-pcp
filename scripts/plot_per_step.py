@@ -40,15 +40,14 @@ import yaml
 
 plt.rcParams.update(
     {
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
-        "font.size": 8,
+        "font.family": "serif",
+        "font.serif": ["Times New Roman"],
+        "font.size": 17,
         "axes.linewidth": 0.8,
         "axes.spines.right": False,
         "axes.spines.top": False,
         "legend.frameon": False,
         "pdf.fonttype": 42,
-        "svg.fonttype": "none",
     }
 )
 
@@ -1564,9 +1563,7 @@ def save_figure(figure: plt.Figure, output_stem: Path) -> None:
     # Setting labels legitimately contain decimal values such as ``eta_0.25``.
     # Appending the render extension preserves that value; ``Path.with_suffix``
     # would otherwise mistake ``.25`` for an existing file suffix.
-    figure.savefig(Path(f"{output_stem}.svg"), bbox_inches="tight")
     figure.savefig(Path(f"{output_stem}.pdf"), bbox_inches="tight")
-    figure.savefig(Path(f"{output_stem}.png"), dpi=300, bbox_inches="tight")
     plt.close(figure)
 
 

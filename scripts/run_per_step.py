@@ -48,16 +48,29 @@ def main() -> None:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = args.output_dir or config.output_dir / f"{timestamp}_{config.data.dataset}"
     config = config.with_overrides(devices=devices, seeds=seeds, output_dir=output_dir)
+    run_config(config, output_dir, workers_per_device=args.workers_per_device)
+    print(output_dir)
+
+
+def run_config(
+    config: ExperimentConfig,
+    output_dir: Path,
+    *,
+    workers_per_device: int,
+) -> None:
+    """Run one frozen config for use by the paper-suite scheduler."""
+
     write_study_metadata(
         output_dir,
         config,
-        execution={"workers_per_device": args.workers_per_device},
+        execution={"workers_per_device": workers_per_device},
     )
-    worker_devices, jobs = _build_seed_jobs(seeds, devices, args.workers_per_device)
+    worker_devices, jobs = _build_seed_jobs(
+        config.seeds,
+        config.devices,
+        workers_per_device,
+    )
     try:
-        # Every persistent single-process executor is pinned to one physical
-        # GPU.  Multiple slots may share a GPU, but no worker ever switches
-        # devices and accumulates cross-device CUDA contexts.
         with ExitStack() as stack:
             executors = [
                 stack.enter_context(
@@ -78,10 +91,9 @@ def main() -> None:
             for future in as_completed(futures):
                 print(future.result(), flush=True)
     except BaseException as error:
-        mark_study_failed(output_dir, seeds, error)
+        mark_study_failed(output_dir, config.seeds, error)
         raise
-    mark_study_complete(output_dir, seeds)
-    print(output_dir)
+    mark_study_complete(output_dir, config.seeds)
 
 
 def _run_and_write(config: ExperimentConfig, seed: int, device: str, output_dir: Path) -> str:

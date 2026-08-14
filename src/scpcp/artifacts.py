@@ -40,6 +40,7 @@ def source_tree_sha256() -> str:
     paths = [
         *sorted((root / "src" / "scpcp").rglob("*.py")),
         *sorted((root / "scripts").glob("*.py")),
+        *sorted((root / "tools").glob("*.py")),
         root / "pyproject.toml",
     ]
     digest = hashlib.sha256()
@@ -48,6 +49,28 @@ def source_tree_sha256() -> str:
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def experiment_tree_sha256() -> str:
+    """Hash executable sources and paper configs for a whole-suite freeze."""
+
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        *sorted((root / "src" / "scpcp").rglob("*.py")),
+        *sorted((root / "scripts").glob("*.py")),
+        *sorted((root / "tools").glob("*.py")),
+        *sorted((root / "configs").glob("*.yaml")),
+        root / "pyproject.toml",
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
     return digest.hexdigest()

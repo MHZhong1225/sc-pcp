@@ -34,6 +34,9 @@ baselines:
   aci_gamma: 0.01
   multidim_buffer: 1000
   online_rounds: 3
+  prc_maximum_step: 0.35
+paper:
+  save_mechanism_diagonal: false
 horizon: 12
 q_grid_size: 101
 q_quantile_min: 0.50
@@ -43,7 +46,7 @@ certification:
   delta: 0.05
   ratio_bound_source: none
   practical_bootstrap_resamples: 2000
-output_dir: results/per_step_tabular_validation
+output_dir: results/work/profiled_ordered_tabular_validation
 seeds:
   start: 0
   stop: 200

@@ -101,10 +101,12 @@ def patient_level_splits(
     unique_ids = torch.unique(batch.patient_ids.cpu(), sorted=True)
     generator = torch.Generator().manual_seed(seed)
     shuffled = unique_ids[torch.randperm(len(unique_ids), generator=generator)]
-    if include_environment and not include_behavior:
-        raise ValueError("an empirical clinical environment requires the behavior-policy role")
     if include_environment:
-        fractions = (0.40, 0.15, 0.15, 0.15, 0.15)
+        fractions = (
+            (0.40, 0.15, 0.15, 0.15, 0.15)
+            if include_behavior
+            else (0.40, 0.15, 0.30, 0.15)
+        )
     elif include_behavior:
         fractions = (0.40, 0.20, 0.20, 0.20)
     else:
@@ -117,6 +119,14 @@ def patient_level_splits(
         groups.append(torch.isin(batch.patient_ids.cpu(), ids).nonzero().squeeze(1).to(batch.patient_ids.device))
         cursor += count
     if include_environment:
+        if not include_behavior:
+            return DataSplits(
+                predictor=batch.subset(groups[0]),
+                behavior=None,
+                cot=batch.subset(groups[1]),
+                certification=batch.subset(groups[2]),
+                environment=batch.subset(groups[3]),
+            )
         return DataSplits(
             predictor=batch.subset(groups[0]),
             behavior=batch.subset(groups[1]),

@@ -36,6 +36,9 @@ baselines:
   aci_gamma: 0.01
   multidim_buffer: 1000
   online_rounds: 3
+  prc_maximum_step: 0.35
+paper:
+  save_mechanism_diagonal: false
 horizon: 12
 q_grid_size: 101
 q_quantile_min: 0.50
@@ -44,4 +47,4 @@ seeds:
   start: 0
   stop: 20
 devices: [cuda:0, cuda:1]
-output_dir: results/final/main/mimic_iv
+output_dir: results/work/paper_v2/rq1/mimic_iv

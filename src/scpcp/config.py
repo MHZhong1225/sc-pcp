@@ -93,8 +93,8 @@ class CertificationConfig:
     ratio_bound_source: str = "none"
     ratio_delta: float = 0.0
     # Used only for the explicitly non-theorem practical cluster bootstrap.
-    # One thousand draws keeps the 95% simultaneous max-t quantile stable
-    # enough for the prespecified candidate grid without dominating training.
+    # One thousand draws keeps the marginal patient-cluster quantiles stable
+    # enough for the ordered candidate tests without dominating training.
     practical_bootstrap_resamples: int = 1_000
 
 
@@ -116,6 +116,15 @@ class BaselineConfig:
     aci_gamma: float = 0.01
     multidim_buffer: int = 1_000
     online_rounds: int = 3
+    prc_maximum_step: float = 0.35
+
+
+@dataclass(frozen=True)
+class PaperConfig:
+    """Controls manuscript-only mechanism diagnostics."""
+
+    save_mechanism_diagonal: bool = False
+    mechanism_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,7 @@ class ExperimentConfig:
     certification: CertificationConfig = CertificationConfig()
     samples: SampleConfig = SampleConfig()
     baselines: BaselineConfig = BaselineConfig()
+    paper: PaperConfig = PaperConfig()
     data: DataConfig = DataConfig()
     horizon: int = 12
     q_grid_size: int = 101
@@ -250,11 +260,15 @@ class ExperimentConfig:
             raise ValueError("MultiDimSPCI buffer must be positive")
         if self.baselines.online_rounds < 1:
             raise ValueError("online baseline rounds must be positive")
+        if self.baselines.prc_maximum_step <= 0.0:
+            raise ValueError("PRC maximum grid step must be positive")
         if self.samples.online_rollouts < self.baselines.online_rounds:
             raise ValueError(
                 "online_rollouts must be at least online_rounds so every adaptation round "
                 "receives a trajectory"
             )
+        if self.paper.mechanism_seed < 0:
+            raise ValueError("paper.mechanism_seed must be nonnegative")
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)

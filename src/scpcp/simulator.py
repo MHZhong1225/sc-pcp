@@ -21,6 +21,13 @@ class StochasticPolicy(Protocol):
 
 
 @dataclass(frozen=True)
+class EmpiricalRolloutContext:
+    """Per-trajectory donor identity carried through an empirical rollout."""
+
+    donor_patient_ids: Tensor
+
+
+@dataclass(frozen=True)
 class SyntheticBehaviorPolicy:
     """Known logging policy for synthetic experiments with uniform positivity."""
 
@@ -72,7 +79,12 @@ class SyntheticTreatmentEnvironment:
         )
 
     def step(
-        self, state: Tensor, action: Tensor, generator: torch.Generator
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int | None = None,
     ) -> tuple[Tensor, Tensor]:
         disease, toxicity, z1, z2, z3, z4 = state.unbind(dim=1)
         beta = self.config.feedback_strength
@@ -202,7 +214,12 @@ class TabularTreatmentEnvironment:
         return transition / transition.sum(dim=2, keepdim=True)
 
     def step(
-        self, state: Tensor, action: Tensor, generator: torch.Generator
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int | None = None,
     ) -> tuple[Tensor, Tensor]:
         state_index = state.argmax(dim=1)
         transitions = self.transition_probabilities(state.device, state.dtype)[
@@ -235,7 +252,7 @@ class TabularTreatmentEnvironment:
         self,
         policy: StochasticPolicy,
         logging_policy: StochasticPolicy,
-        q_grid: Tensor,
+        candidate_radii: Tensor,
         horizon: int,
         device: str | torch.device,
     ) -> Tensor:
@@ -247,11 +264,16 @@ class TabularTreatmentEnvironment:
         d_mu = [initial]
         for _ in range(horizon - 1):
             d_mu.append(torch.einsum("s,sa,asr->r", d_mu[-1], mu, transition))
+        resolved_radii = candidate_radii.to(resolved)
+        if resolved_radii.ndim == 1:
+            resolved_radii = resolved_radii[:, None].expand(-1, horizon)
+        if resolved_radii.ndim != 2 or resolved_radii.shape[1] != horizon:
+            raise ValueError("candidate_radii must have shape [K] or [K,T]")
         rows = []
-        for radius in q_grid.to(resolved):
+        for radius_by_time in resolved_radii:
             d_q = [initial]
-            for _ in range(horizon - 1):
-                pi = policy.probabilities(states, radius)
+            for time in range(horizon - 1):
+                pi = policy.probabilities(states, radius_by_time[time])
                 d_q.append(torch.einsum("s,sa,asr->r", d_q[-1], pi, transition))
             rows.append(
                 torch.stack(
@@ -279,8 +301,21 @@ def rollout(
     """Generate a batch from a fixed policy or one radius-induced policy."""
 
     resolved = torch.device(device)
+    if isinstance(q, Tensor) and q.ndim not in {0, 1}:
+        raise ValueError("rollout radius must be scalar or have shape [T]")
+    if isinstance(q, Tensor) and q.ndim == 1 and q.shape != (horizon,):
+        raise ValueError("stagewise rollout radius must have shape [T]")
     generator = torch.Generator(device=resolved).manual_seed(seed)
-    state = environment.initial_state(n, generator, resolved)
+    initial_state_with_context = getattr(
+        environment,
+        "initial_state_with_context",
+        None,
+    )
+    if callable(initial_state_with_context):
+        state, rollout_context = initial_state_with_context(n, generator, resolved)
+    else:
+        state = environment.initial_state(n, generator, resolved)
+        rollout_context = None
     states, actions, outcomes = [state], [], []
     for time in range(horizon):
         step_q = (
@@ -290,7 +325,27 @@ def rollout(
         )
         probabilities = policy.probabilities(state, step_q)
         action = torch.multinomial(probabilities, 1, generator=generator).squeeze(1)
-        next_state, outcome = environment.step(state, action, generator)
+        if rollout_context is None:
+            next_state, outcome = environment.step(
+                state,
+                action,
+                generator,
+                time=time,
+            )
+        else:
+            step_with_context = getattr(environment, "step_with_context", None)
+            if not callable(step_with_context):
+                raise TypeError(
+                    "an environment with contextual initial states must implement "
+                    "step_with_context"
+                )
+            next_state, outcome, rollout_context = step_with_context(
+                state,
+                action,
+                generator,
+                time=time,
+                context=rollout_context,
+            )
         states.append(next_state)
         actions.append(action)
         outcomes.append(outcome)
@@ -318,6 +373,7 @@ class EmpiricalTransitionEnvironment:
         embedding_dim: int = 32,
         static_indices: tuple[int, ...] = (),
         history_length: int = 1,
+        outcome_model: object | None = None,
         query_batch_size: int = DEFAULT_QUERY_BATCH_SIZE,
     ) -> None:
         self.n_actions = n_actions
@@ -326,6 +382,7 @@ class EmpiricalTransitionEnvironment:
         self.neighbors = neighbors
         self.bandwidth = bandwidth
         self.static_indices = static_indices
+        self.outcome_model = outcome_model
         if query_batch_size < 1:
             raise ValueError("query_batch_size must be positive")
         self.query_batch_size = query_batch_size
@@ -335,28 +392,18 @@ class EmpiricalTransitionEnvironment:
             )
         self.history_length = history_length
         self.base_state_dim = batch.state_dim // history_length
-        self.base_static_indices = tuple(
-            sorted({index % self.base_state_dim for index in static_indices})
-        )
-        # For GRU inputs, only the newest base state is a transition-library
-        # key.  A rollout shifts its own history and appends the sampled base
-        # successor below, rather than splicing a donor patient's old history
-        # into the generated episode.
-        current = (
-            batch.current_states()
-            .reshape(-1, batch.state_dim)
-            .cpu()[:, -self.base_state_dim :]
-        )
-        next_states = (
-            batch.states[:, 1:]
-            .reshape(-1, batch.state_dim)
-            .cpu()[:, -self.base_state_dim :]
-        )
-        outcomes = batch.outcomes.reshape(-1, batch.outcome_dim).cpu()
-        actions = batch.actions.reshape(-1).cpu()
-        self.center = current.mean(dim=0)
-        self.scale = current.std(dim=0).clamp_min(1e-4)
-        normalized = ((current - self.center) / self.scale).clamp(-10.0, 10.0)
+        # The stacked history is the predictor's Markov state.  Nearest-neighbor
+        # matching and donor successors must therefore use that complete state;
+        # matching only the newest frame pairs outcomes with histories on which
+        # the frozen GRU was never calibrated and causes rapid rollout drift.
+        current = batch.current_states().cpu()
+        next_states = batch.states[:, 1:].cpu()
+        outcome_payloads = self._outcome_payloads(batch)
+        actions = batch.actions.cpu()
+        flat_current = current.reshape(-1, batch.state_dim)
+        self.center = flat_current.mean(dim=0)
+        self.scale = flat_current.std(dim=0).clamp_min(1e-4)
+        normalized = ((flat_current - self.center) / self.scale).clamp(-10.0, 10.0)
         # The empirical MDP operates in one frozen, D_env-only 32-dimensional
         # state embedding.  A PCA basis is transparent, deterministic, and
         # avoids fitting a transition/outcome model on data that must remain
@@ -365,88 +412,279 @@ class EmpiricalTransitionEnvironment:
         covariance = normalized.T @ normalized / max(1, normalized.shape[0] - 1)
         _, eigenvectors = torch.linalg.eigh(covariance)
         self.embedding = eigenvectors[:, -rank:].contiguous()
-        embedded_current = normalized @ self.embedding
+        embedded_current = (normalized @ self.embedding).reshape(
+            batch.n,
+            batch.horizon,
+            rank,
+        )
         self.initial_states = batch.states[:, 0].cpu()
-        self._libraries: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
-        self._device_libraries: dict[str, dict[int, tuple[Tensor, Tensor, Tensor]]] = {}
+        self.initial_patient_ids = batch.patient_ids.cpu()
+        self.horizon = batch.horizon
+        self._libraries: dict[
+            tuple[int, int],
+            tuple[Tensor, Tensor, Tensor, Tensor],
+        ] = {}
+        self._device_libraries: dict[
+            str,
+            dict[tuple[int, int], tuple[Tensor, Tensor, Tensor, Tensor]],
+        ] = {}
         self._device_transforms: dict[str, tuple[Tensor, Tensor, Tensor]] = {}
-        for action in range(n_actions):
-            rows = actions == action
-            if not rows.any():
-                raise ValueError(f"D_env has no transitions for action {action}")
-            self._libraries[action] = (
-                embedded_current[rows],
-                next_states[rows],
-                outcomes[rows],
-            )
+        for time in range(batch.horizon):
+            for action in range(n_actions):
+                rows = actions[:, time] == action
+                if not rows.any():
+                    raise ValueError(
+                        f"D_env has no transitions for action {action} at stage {time}"
+                    )
+                self._libraries[(time, action)] = (
+                    embedded_current[rows, time],
+                    next_states[rows, time],
+                    outcome_payloads[rows, time],
+                    batch.patient_ids.cpu()[rows],
+                )
 
     def initial_state(
         self, n: int, generator: torch.Generator, device: torch.device
     ) -> Tensor:
-        index = torch.randint(
-            len(self.initial_states), (n,), generator=generator, device=device
-        )
+        index = self._initial_indices(n, generator, device)
         return self.initial_states[index.cpu()].to(device)
 
+    def initial_state_with_context(
+        self,
+        n: int,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> tuple[Tensor, EmpiricalRolloutContext]:
+        """Sample starts and remember which patient supplied each state."""
+
+        index = self._initial_indices(n, generator, device)
+        patient_ids = self.initial_patient_ids[index.cpu()].to(device)
+        return (
+            self.initial_states[index.cpu()].to(device),
+            EmpiricalRolloutContext(donor_patient_ids=patient_ids),
+        )
+
+    def _initial_indices(
+        self,
+        n: int,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> Tensor:
+        return torch.randint(
+            len(self.initial_states),
+            (n,),
+            generator=generator,
+            device=device,
+        )
+
     def step(
-        self, state: Tensor, action: Tensor, generator: torch.Generator
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int | None = None,
     ) -> tuple[Tensor, Tensor]:
+        next_state, outcome, _ = self._step(
+            state,
+            action,
+            generator,
+            time=time,
+            excluded_patient_ids=None,
+        )
+        return next_state, outcome
+
+    def step_with_context(
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int,
+        context: EmpiricalRolloutContext,
+    ) -> tuple[Tensor, Tensor, EmpiricalRolloutContext]:
+        """Advance while excluding every transition from the current donor."""
+
+        if context.donor_patient_ids.shape != (len(state),):
+            raise ValueError("empirical rollout context must have one donor id per row")
+        next_state, outcome, donor_patient_ids = self._step(
+            state,
+            action,
+            generator,
+            time=time,
+            excluded_patient_ids=context.donor_patient_ids,
+        )
+        return (
+            next_state,
+            outcome,
+            EmpiricalRolloutContext(donor_patient_ids=donor_patient_ids),
+        )
+
+    @torch.no_grad()
+    def _step(
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int | None,
+        excluded_patient_ids: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        stage = 0 if time is None else time
+        if not 0 <= stage < self.horizon:
+            raise ValueError("empirical environment stage is out of range")
         next_states = torch.empty_like(state)
         outcomes = torch.empty(
             (len(state), self.outcome_dim), dtype=state.dtype, device=state.device
+        )
+        next_donor_patient_ids = torch.empty(
+            len(state),
+            dtype=self.initial_patient_ids.dtype,
+            device=state.device,
         )
         for action_value in range(self.n_actions):
             rows = (action == action_value).nonzero().squeeze(1)
             if len(rows) == 0:
                 continue
-            candidate_embedding, library_next, library_outcome = (
-                self._library_on_device(action_value, state.device)
-            )
-            latest_state = state[rows][:, -self.base_state_dim :]
+            (
+                candidate_embedding,
+                library_next,
+                library_outcome_payload,
+                library_patient_ids,
+            ) = self._library_on_device(action_value, state.device, time=stage)
             center, scale, embedding = self._transforms_like(state)
-            query = ((latest_state - center) / scale).clamp(-10.0, 10.0) @ embedding
-            k = min(self.neighbors, candidate_embedding.shape[0])
+            query = ((state[rows] - center) / scale).clamp(-10.0, 10.0) @ embedding
+            excluded = (
+                None
+                if excluded_patient_ids is None
+                else excluded_patient_ids[rows].to(
+                    device=state.device,
+                    dtype=library_patient_ids.dtype,
+                )
+            )
+            k = self._available_neighbor_count(
+                library_patient_ids,
+                excluded,
+            )
             nearest_distance, nearest = self._nearest_neighbors(
                 query,
                 candidate_embedding,
                 k,
+                candidate_patient_ids=library_patient_ids,
+                excluded_patient_ids=excluded,
             )
-            logits = -nearest_distance.square() / (2.0 * self.bandwidth**2)
+            local_scale = nearest_distance.median(dim=1).values.clamp_min(1e-6)
+            standardized_distance = nearest_distance / local_scale[:, None]
+            logits = -standardized_distance.square() / (2.0 * self.bandwidth**2)
             draw = torch.multinomial(
                 torch.softmax(logits, dim=1), 1, generator=generator
             ).squeeze(1)
             sampled = nearest[torch.arange(len(rows), device=nearest.device), draw]
-            sampled_next = library_next[sampled].clone()
-            if self.base_static_indices:
-                sampled_next[:, self.base_static_indices] = latest_state[
-                    :, self.base_static_indices
-                ]
-            if self.history_length == 1:
-                next_states[rows] = sampled_next
+            next_states[rows] = library_next[sampled]
+            sampled_payload = library_outcome_payload[sampled]
+            if self.outcome_model is None:
+                outcomes[rows] = sampled_payload
             else:
-                history = state[rows].reshape(
-                    len(rows), self.history_length, self.base_state_dim
+                query_actions = torch.full(
+                    (len(rows),),
+                    action_value,
+                    dtype=action.dtype,
+                    device=state.device,
                 )
-                advanced = torch.cat((history[:, 1:], sampled_next[:, None, :]), dim=1)
-                next_states[rows] = advanced.reshape(len(rows), self.state_dim)
-            outcomes[rows] = library_outcome[sampled]
-        return next_states, outcomes
+                query_mean, query_scale = self.outcome_model(
+                    state[rows],
+                    query_actions,
+                )
+                outcomes[rows] = query_mean + query_scale * sampled_payload
+            next_donor_patient_ids[rows] = library_patient_ids[sampled]
+        return next_states, outcomes, next_donor_patient_ids
+
+    @torch.no_grad()
+    def _outcome_payloads(self, batch: TrajectoryBatch) -> Tensor:
+        """Return raw outcomes or signed residuals under the frozen predictor."""
+
+        if self.outcome_model is None:
+            return batch.outcomes.cpu()
+        model_device = _module_device(self.outcome_model)
+        states = batch.current_states().reshape(-1, batch.state_dim)
+        actions = batch.actions.reshape(-1)
+        outcomes = batch.outcomes.reshape(-1, batch.outcome_dim)
+        residual_parts = []
+        for start in range(0, len(states), self.query_batch_size):
+            stop = start + self.query_batch_size
+            mean, scale = self.outcome_model(
+                states[start:stop].to(model_device),
+                actions[start:stop].to(model_device),
+            )
+            residual_parts.append(
+                (
+                    (outcomes[start:stop].to(model_device) - mean)
+                    / scale.clamp_min(1e-12)
+                ).cpu()
+            )
+        return torch.cat(residual_parts).reshape(
+            batch.n,
+            batch.horizon,
+            batch.outcome_dim,
+        )
+
+    def _available_neighbor_count(
+        self,
+        candidate_patient_ids: Tensor,
+        excluded_patient_ids: Tensor | None,
+    ) -> int:
+        if excluded_patient_ids is None:
+            return min(self.neighbors, len(candidate_patient_ids))
+        unique_ids, counts = torch.unique(
+            candidate_patient_ids,
+            sorted=True,
+            return_counts=True,
+        )
+        positions = torch.searchsorted(unique_ids, excluded_patient_ids)
+        clamped = positions.clamp_max(len(unique_ids) - 1)
+        excluded_counts = torch.where(
+            unique_ids[clamped] == excluded_patient_ids,
+            counts[clamped],
+            torch.zeros_like(clamped),
+        )
+        available = len(candidate_patient_ids) - excluded_counts
+        minimum_available = int(available.min().item())
+        if minimum_available < 1:
+            raise RuntimeError(
+                "no leave-one-patient-out donor remains for this stage/action"
+            )
+        return min(self.neighbors, minimum_available)
 
     def _nearest_neighbors(
         self,
         query: Tensor,
         candidate_embedding: Tensor,
         k: int,
+        *,
+        candidate_patient_ids: Tensor | None = None,
+        excluded_patient_ids: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Return exact top-k neighbors without materializing the full distance matrix."""
+
+        if excluded_patient_ids is not None and candidate_patient_ids is None:
+            raise ValueError(
+                "candidate patient ids are required when excluding rollout donors"
+            )
 
         distance_parts = []
         index_parts = []
         for start in range(0, len(query), self.query_batch_size):
+            stop = start + self.query_batch_size
             distances = torch.cdist(
-                query[start : start + self.query_batch_size],
+                query[start:stop],
                 candidate_embedding,
             )
+            if excluded_patient_ids is not None and candidate_patient_ids is not None:
+                ineligible = (
+                    excluded_patient_ids[start:stop, None]
+                    == candidate_patient_ids[None, :]
+                )
+                distances.masked_fill_(ineligible, float("inf"))
             nearest_distance, nearest = distances.topk(k, largest=False)
             del distances
             distance_parts.append(nearest_distance)
@@ -454,15 +692,22 @@ class EmpiricalTransitionEnvironment:
         return torch.cat(distance_parts, dim=0), torch.cat(index_parts, dim=0)
 
     def _library_on_device(
-        self, action: int, device: torch.device
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        self,
+        action: int,
+        device: torch.device,
+        *,
+        time: int = 0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         key = str(device)
         if key not in self._device_libraries:
             self._device_libraries[key] = {}
         cache = self._device_libraries[key]
-        if action not in cache:
-            cache[action] = tuple(value.to(device) for value in self._libraries[action])
-        return cache[action]
+        key_by_stage = (time, action)
+        if key_by_stage not in cache:
+            cache[key_by_stage] = tuple(
+                value.to(device) for value in self._libraries[key_by_stage]
+            )
+        return cache[key_by_stage]
 
     def _transforms_like(self, state: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         key = f"{state.device}:{state.dtype}"
@@ -473,3 +718,19 @@ class EmpiricalTransitionEnvironment:
                 self.embedding.to(state),
             )
         return self._device_transforms[key]
+
+
+def _module_device(module: object) -> torch.device:
+    parameters = getattr(module, "parameters", None)
+    if callable(parameters):
+        try:
+            return next(parameters()).device
+        except StopIteration:
+            pass
+    buffers = getattr(module, "buffers", None)
+    if callable(buffers):
+        try:
+            return next(buffers()).device
+        except StopIteration:
+            pass
+    return torch.device("cpu")

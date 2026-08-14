@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from scpcp.certification import CertificationResult
@@ -14,6 +15,8 @@ class RadiusSelection:
     radius: float | None
     index: int | None
     status: str
+    certified_indices: tuple[int, ...] = ()
+    stopped_index: int | None = None
 
 
 def select_certified_radius(q_grid: Tensor, certificate: CertificationResult, *, alpha: float) -> RadiusSelection:
@@ -56,3 +59,93 @@ def select_empirical_radius(q_grid: Tensor, estimates: Tensor, *, alpha: float) 
         return RadiusSelection(radius=None, index=None, status="UNAVAILABLE_EMPIRICAL_REFERENCE")
     chosen = int(safe[0].item())
     return RadiusSelection(radius=float(q_grid[chosen].item()), index=chosen, status="EMPIRICAL_REFERENCE")
+
+
+def select_ordered_lcb_radius(
+    candidate_grid: Tensor,
+    certificate: CertificationResult,
+    *,
+    alpha: float,
+    widths: Tensor | None = None,
+    status: str | None = None,
+) -> RadiusSelection:
+    """Select within the widest-to-narrowest continuously certified prefix.
+
+    Candidate tests use an intersection-union rule across stages.  The fixed
+    sequence stops at the first failed candidate; points after that failure are
+    never eligible, even if their individual lower bounds happen to pass.
+    Width may be optimized adaptively inside the certified prefix because the
+    fixed-sequence family-wise event protects every member of that prefix.
+    """
+
+    if candidate_grid.ndim != 1 or len(candidate_grid) == 0:
+        raise ValueError("candidate_grid must be a nonempty vector")
+    if certificate.lower_bounds.ndim != 2 or certificate.lower_bounds.shape[0] != len(candidate_grid):
+        raise ValueError("certificate must have one [T] row per candidate")
+    if not torch.isfinite(candidate_grid).all():
+        raise ValueError("candidate_grid must be finite")
+    if (candidate_grid[1:] < candidate_grid[:-1]).any():
+        raise ValueError("candidate_grid must be nondecreasing")
+    if widths is not None:
+        if widths.shape != candidate_grid.shape or not torch.isfinite(widths).all():
+            raise ValueError("widths must be a finite vector matching candidate_grid")
+
+    target = 1.0 - alpha
+    certified: list[int] = []
+    stopped_index = None
+    for index in range(len(candidate_grid) - 1, -1, -1):
+        if bool((certificate.lower_bounds[index] >= target).all().item()):
+            certified.append(index)
+            continue
+        stopped_index = index
+        break
+    if not certified:
+        return RadiusSelection(
+            radius=None,
+            index=None,
+            status="UNCERTIFIED_ORDERED_IUT",
+            certified_indices=(),
+            stopped_index=stopped_index,
+        )
+
+    if widths is None:
+        chosen = certified[-1]
+    else:
+        chosen = min(
+            certified,
+            key=lambda index: (
+                float(widths[index].item()),
+                float(candidate_grid[index].item()),
+                index,
+            ),
+        )
+    selection_status = status or (
+        "CERTIFIED_ORDERED_IUT" if certificate.formal else "PRACTICAL_ORDERED_IUT_LCB"
+    )
+    return RadiusSelection(
+        radius=float(candidate_grid[chosen].item()),
+        index=chosen,
+        status=selection_status,
+        certified_indices=tuple(certified),
+        stopped_index=stopped_index,
+    )
+
+
+def select_ordered_certified_radius(
+    candidate_grid: Tensor,
+    certificate: CertificationResult,
+    *,
+    alpha: float,
+    widths: Tensor | None = None,
+) -> RadiusSelection:
+    """Formal wrapper that refuses certificates without a transport premise."""
+
+    if not certificate.formal:
+        return RadiusSelection(None, None, "UNCERTIFIED_NO_RATIO_BOUND")
+    return select_ordered_lcb_radius(
+        candidate_grid,
+        certificate,
+        alpha=alpha,
+        widths=widths,
+        status="CERTIFIED_ORDERED_IUT",
+    )

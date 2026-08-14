@@ -1,25 +1,33 @@
 from scpcp.coverage.per_step import (
     OracleSurface,
+    candidate_radius_schedules,
     dcov_surface,
     diagonal_coverage_estimates,
     effective_sample_sizes,
+    estimate_oracle_diagonal,
     estimate_oracle_surface,
     fixed_q_grid,
     per_step_oracle_metrics,
+    profiled_scale_grid,
     response_operator,
     self_normalized_dcov_surface,
     self_normalized_diagonal_coverage_estimates,
+    stage_score_profile,
 )
 
 __all__ = [
     "OracleSurface",
+    "candidate_radius_schedules",
     "dcov_surface",
     "diagonal_coverage_estimates",
     "effective_sample_sizes",
+    "estimate_oracle_diagonal",
     "estimate_oracle_surface",
     "fixed_q_grid",
     "per_step_oracle_metrics",
+    "profiled_scale_grid",
     "response_operator",
     "self_normalized_dcov_surface",
     "self_normalized_diagonal_coverage_estimates",
+    "stage_score_profile",
 ]

@@ -50,18 +50,27 @@ class QConditionalCOT(nn.Module):
         horizon: int,
         outcome_model: GaussianOutcomeModel,
         q_grid: Tensor,
+        stage_profile: Tensor | None = None,
         config: COTConfig,
     ) -> None:
         super().__init__()
         self.horizon = horizon
         self.config = config
         self.outcome_model = outcome_model
+        profile = (
+            torch.ones(horizon, device=q_grid.device, dtype=q_grid.dtype)
+            if stage_profile is None
+            else stage_profile.to(q_grid)
+        )
+        if profile.shape != (horizon,) or not torch.isfinite(profile).all() or (profile <= 0.0).any():
+            raise ValueError("stage_profile must be finite, positive, and have shape [T]")
         representation_dim = outcome_model.config.representation_dim
         self.register_buffer("state_center", torch.zeros(state_dim))
         self.register_buffer("state_scale", torch.ones(state_dim))
         self.register_buffer("q_center", q_grid.float().mean())
         self.register_buffer("q_scale", q_grid.float().std(unbiased=False).clamp_min(1e-4))
         self.register_buffer("q_reference", q_grid.float().clone())
+        self.register_buffer("stage_profile", profile.float().clone())
         self.register_buffer("normalization_scales", torch.ones(max(0, horizon - 1), len(q_grid)))
         self.heads = nn.ModuleList(
             _RatioHead(state_dim + representation_dim + 1, config.hidden_dims, config.rho_cap)
@@ -74,6 +83,13 @@ class QConditionalCOT(nn.Module):
         state_features = self._state_features(states)
         normalized_q = ((q - self.q_center) / self.q_scale)[:, None]
         return torch.cat((state_features, normalized_q), dim=1)
+
+    def radius(self, time: int, scale: Tensor) -> Tensor:
+        """Map the global scale to the policy radius used at one stage."""
+
+        if not 0 <= time < self.horizon:
+            raise ValueError("COT time is out of range")
+        return scale * self.stage_profile[time].to(scale)
 
     def _state_features(self, states: Tensor) -> Tensor:
         """Encode each state once, independently of the candidate radius."""
@@ -170,6 +186,7 @@ def fit_cot(
     batch: TrajectoryBatch,
     *,
     q_grid: Tensor,
+    stage_profile: Tensor | None = None,
     target_policy: BehaviorAnchoredPolicy,
     logging_policy: object,
     outcome_model: GaussianOutcomeModel,
@@ -195,6 +212,7 @@ def fit_cot(
         horizon=batch.horizon,
         outcome_model=outcome_model,
         q_grid=q_grid,
+        stage_profile=stage_profile,
         config=config,
     ).to(resolved)
     model.state_center.copy_(batch.current_states().reshape(-1, batch.state_dim).mean(dim=0))
@@ -329,7 +347,10 @@ def cot_state_action_weights(
     for time in range(batch.horizon):
         states = batch.states[:, time]
         rho = model.rho_for_grid(time, states, q_grid)
-        target_probabilities = target_policy.probabilities_for_grid(states, q_grid)
+        target_probabilities = target_policy.probabilities_for_grid(
+            states,
+            model.radius(time, q_grid),
+        )
         observed_action = batch.actions[:, time, None, None].expand(-1, len(q_grid), 1)
         numerator = target_probabilities.gather(2, observed_action).squeeze(2)
         denominator_all = logging_policy.probabilities(states).clamp_min(1e-12)
@@ -351,6 +372,7 @@ def prefix_importance_weights(
     batch: TrajectoryBatch,
     *,
     q_grid: Tensor,
+    stage_profile: Tensor | None = None,
     target_policy: BehaviorAnchoredPolicy,
     logging_policy: object,
     weight_cap: float,
@@ -360,11 +382,18 @@ def prefix_importance_weights(
     device = next(target_policy.outcome_model.parameters()).device
     batch = batch.to(device)
     q_grid = q_grid.to(device)
+    profile = (
+        torch.ones(batch.horizon, device=device, dtype=q_grid.dtype)
+        if stage_profile is None
+        else stage_profile.to(device=device, dtype=q_grid.dtype)
+    )
+    if profile.shape != (batch.horizon,):
+        raise ValueError("stage_profile must have shape [T]")
     log_weight = torch.zeros((batch.n, len(q_grid)), device=device)
     weights, variances, cap_rates, maxima = [], [], [], []
     for time in range(batch.horizon):
         states = batch.states[:, time]
-        target_probabilities = target_policy.probabilities_for_grid(states, q_grid)
+        target_probabilities = target_policy.probabilities_for_grid(states, q_grid * profile[time])
         action_index = batch.actions[:, time, None, None].expand(-1, len(q_grid), 1)
         numerator = target_probabilities.gather(2, action_index).squeeze(2)
         denominator = logging_policy.probabilities(states).gather(1, batch.actions[:, time, None]).expand(-1, len(q_grid))
@@ -387,6 +416,7 @@ def exact_tabular_state_action_weights(
     batch: TrajectoryBatch,
     *,
     q_grid: Tensor,
+    stage_profile: Tensor | None = None,
     target_policy: BehaviorAnchoredPolicy,
     logging_policy: object,
 ) -> tuple[Tensor, float]:
@@ -400,8 +430,16 @@ def exact_tabular_state_action_weights(
     device = next(target_policy.outcome_model.parameters()).device
     q_grid = q_grid.to(device)
     batch = batch.to(device)
+    profile = (
+        torch.ones(batch.horizon, device=device, dtype=q_grid.dtype)
+        if stage_profile is None
+        else stage_profile.to(device=device, dtype=q_grid.dtype)
+    )
+    if profile.shape != (batch.horizon,):
+        raise ValueError("stage_profile must have shape [T]")
+    candidate_radii = q_grid[:, None] * profile[None, :]
     ratios = environment.exact_state_ratios(
-        target_policy, logging_policy, q_grid, batch.horizon, device
+        target_policy, logging_policy, candidate_radii, batch.horizon, device
     )  # [K,T,S]
     state_index = batch.current_states().argmax(dim=2)
     weights = []
@@ -409,10 +447,11 @@ def exact_tabular_state_action_weights(
     all_states = torch.eye(environment.n_states, device=device)
     mu_all = logging_policy.probabilities(all_states)
     for time in range(batch.horizon):
-        pi_all = target_policy.probabilities_for_grid(all_states, q_grid)  # [S,K,A]
+        radii = q_grid * profile[time]
+        pi_all = target_policy.probabilities_for_grid(all_states, radii)  # [S,K,A]
         all_weight = ratios[:, time].transpose(0, 1)[:, :, None] * pi_all / mu_all[:, None, :]
         bound = max(bound, float(all_weight.max().item()))
-        pi_observed = target_policy.probabilities_for_grid(batch.states[:, time], q_grid)
+        pi_observed = target_policy.probabilities_for_grid(batch.states[:, time], radii)
         action = batch.actions[:, time, None, None].expand(-1, len(q_grid), 1)
         numerator = pi_observed.gather(2, action).squeeze(2)
         denominator = logging_policy.probabilities(batch.states[:, time]).gather(1, batch.actions[:, time, None]).expand(-1, len(q_grid))
@@ -453,6 +492,8 @@ def exact_tabular_cot_l1_error_bound(
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     q_grid = q_grid.to(device=device, dtype=dtype)
+    profile = model.stage_profile.to(device=device, dtype=dtype)
+    candidate_radii = q_grid[:, None] * profile[None, :]
     states = torch.eye(environment.n_states, device=device, dtype=dtype)
     transition = environment.transition_probabilities(device, dtype)
     mu = logging_policy.probabilities(states).clamp_min(1e-12)
@@ -460,11 +501,11 @@ def exact_tabular_cot_l1_error_bound(
     for _ in range(model.horizon - 1):
         d_mu.append(torch.einsum("s,sa,asr->r", d_mu[-1], mu, transition))
     exact_rho = environment.exact_state_ratios(
-        target_policy, logging_policy, q_grid, model.horizon, device
+        target_policy, logging_policy, candidate_radii, model.horizon, device
     ).to(dtype)  # [K,T,S]
     errors = []
     for time in range(model.horizon):
-        pi = target_policy.probabilities_for_grid(states, q_grid)  # [S,K,A]
+        pi = target_policy.probabilities_for_grid(states, q_grid * profile[time])  # [S,K,A]
         learned_rho = model.rho_for_grid(time, states, q_grid)  # [S,K]
         learned_weight = (learned_rho[:, :, None] * pi / mu[:, None, :]).clamp_max(weight_cap)
         exact_weight = exact_rho[:, time].transpose(0, 1)[:, :, None] * pi / mu[:, None, :]
@@ -486,7 +527,10 @@ def _pseudo_target(
 ) -> tuple[Tensor, Tensor]:
     current_state = batch.states[patients, time]
     previous_ratio = model.rho(time, current_state, q_values)
-    target_probabilities = target_policy.probabilities(current_state, q_values)
+    target_probabilities = target_policy.probabilities(
+        current_state,
+        model.radius(time, q_values),
+    )
     observed_actions = batch.actions[patients, time]
     numerator = target_probabilities.gather(1, observed_actions[:, None]).squeeze(1)
     denominator = logging_policy.probabilities(current_state).gather(1, observed_actions[:, None]).squeeze(1)

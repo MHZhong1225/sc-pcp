@@ -13,41 +13,41 @@ from scpcp.baselines import (
     OnlineBaselineResult,
     aci_style_controller,
     finite_depth_mfcs_selection,
-    historical_per_step_radius,
     multidim_spci_style_controller,
-    prc_max_time,
-    repeated_recalibration,
+    prc_profile_scale,
+    standard_cp_stagewise_radii,
 )
 from scpcp.behavior import fit_behavior_policy
 from scpcp.certification import (
     CertificationResult,
-    exact_tabular_l1_lower_bounds,
-    practical_bootstrap_lower_bounds,
-    simultaneous_lower_bounds,
+    exact_tabular_ordered_pointwise_l1_lower_bounds,
+    ordered_pointwise_bootstrap_lower_bounds,
+    ordered_pointwise_ht_lower_bounds,
 )
 from scpcp.config import ExperimentConfig
 from scpcp.cot import (
     cot_state_action_weights,
     exact_tabular_cot_l1_error_bound,
-    exact_tabular_state_action_weights,
     fit_cot,
-    prefix_importance_weights,
 )
 from scpcp.coverage import (
-    dcov_surface,
+    candidate_radius_schedules,
     diagonal_coverage_estimates,
-    effective_sample_sizes,
-    estimate_oracle_surface,
-    fixed_q_grid,
+    estimate_oracle_diagonal,
     per_step_oracle_metrics,
-    self_normalized_dcov_surface,
+    profiled_scale_grid,
     self_normalized_diagonal_coverage_estimates,
+    stage_score_profile,
 )
 from scpcp.data import DataSplits, TrajectoryBatch, concatenate_trajectories, patient_level_splits
 from scpcp.outcome_model import fit_outcome_model
 from scpcp.policy import BehaviorAnchoredPolicy
 from scpcp.scores import fit_conformal_region, score_batch
-from scpcp.selection import RadiusSelection, select_certified_radius, select_empirical_radius, select_lcb_radius
+from scpcp.selection import (
+    RadiusSelection,
+    select_ordered_certified_radius,
+    select_ordered_lcb_radius,
+)
 from scpcp.simulator import (
     EmpiricalTransitionEnvironment,
     SyntheticBehaviorPolicy,
@@ -59,7 +59,6 @@ from scpcp.simulator import (
 
 
 SCPCP_METHOD = "SC-PCP"
-IW_ABLATION_METHOD = "IW-SC-PCP"
 
 
 @dataclass(frozen=True)
@@ -73,7 +72,7 @@ class SeedResult:
 
 @dataclass(frozen=True)
 class _Task:
-    environment: object
+    environment: object | None
     splits: DataSplits
     n_actions: int
     logging_policy: object | None
@@ -84,18 +83,8 @@ class _Task:
     state_feature_names: tuple[str, ...] = ()
 
 
-def _deployment_selection(
-    certificate: CertificationResult,
-    certified_selection: RadiusSelection,
-    practical_selection: RadiusSelection,
-) -> RadiusSelection:
-    """Use one method name while retaining an explicit certificate status."""
-
-    return certified_selection if certificate.formal else practical_selection
-
-
 def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
-    """Fit once on the prespecified roles, then evaluate all frozen methods."""
+    """Run the sole ordered-IUT SC-PCP method and its five baselines."""
 
     torch.manual_seed(seed)
     task = _prepare_task(config, seed=seed, device=device)
@@ -108,17 +97,45 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         seed=seed + 1,
         static_indices=task.static_indices,
     )
+    if splits.environment is not None:
+        task = replace(
+            task,
+            environment=EmpiricalTransitionEnvironment(
+                splits.environment,
+                n_actions=task.n_actions,
+                neighbors=config.data.empirical_neighbors,
+                bandwidth=config.data.empirical_bandwidth,
+                embedding_dim=config.data.empirical_embedding_dim,
+                static_indices=task.static_indices,
+                history_length=(
+                    config.model.history_length
+                    if config.model.architecture == "gru"
+                    else 1
+                ),
+                outcome_model=outcome_model,
+            ),
+        )
     region = fit_conformal_region(outcome_model)
     behavior_model = None
-    if splits.behavior is not None:
+    if task.logging_policy is None:
+        behavior_training = (
+            splits.predictor
+            if splits.behavior is None
+            else concatenate_trajectories(splits.predictor, splits.behavior)
+        )
         behavior_model = fit_behavior_policy(
-            splits.behavior,
+            behavior_training,
             n_actions=task.n_actions,
             model_config=config.model,
             policy_config=task.policy_config,
             device=device,
             seed=seed + 2,
             static_indices=task.static_indices,
+            decision_time_index=(
+                task.state_feature_names.index("decision_time")
+                if "decision_time" in task.state_feature_names
+                else None
+            ),
         )
     reference_policy = task.logging_policy if task.logging_policy is not None else behavior_model
     if reference_policy is None:
@@ -130,24 +147,39 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         region=region,
         tilt=config.policy.tilt,
     )
-    # The policy anchor and the OPE denominator are conceptually distinct.
-    # In observational clinical data both are necessarily the fitted propensity
-    # model.  Synthetic and tabular experiments instead retain the known
-    # data-generating logging policy in the denominator, so COT/IW error is not
-    # conflated with a propensity-estimation error in theorem validation.
     logging_policy = task.logging_policy if task.logging_policy is not None else behavior_model
     if logging_policy is None:
         raise RuntimeError("the OPE denominator is unavailable")
-    cot_scores = score_batch(region, splits.cot.current_states(), splits.cot.actions, splits.cot.outcomes)
-    q_grid = fixed_q_grid(
+
+    outcome_sd = _training_outcome_sd(splits.predictor)
+    cot_scores = score_batch(
+        region,
+        splits.cot.current_states(),
+        splits.cot.actions,
+        splits.cot.outcomes,
+    )
+    stage_profile = stage_score_profile(
         cot_scores,
+        alpha=config.certification.alpha,
+    )
+    scale_grid = profiled_scale_grid(
+        cot_scores,
+        stage_profile,
         size=config.q_grid_size,
         lower_quantile=config.q_quantile_min,
         upper_quantile=config.q_quantile_max,
     )
+    candidate_radii = candidate_radius_schedules(scale_grid, stage_profile)
+    cert_scores = score_batch(
+        region,
+        splits.certification.current_states(),
+        splits.certification.actions,
+        splits.certification.outcomes,
+    )
     fitted_cot = fit_cot(
         splits.cot,
-        q_grid=q_grid,
+        q_grid=scale_grid,
+        stage_profile=stage_profile,
         target_policy=policy,
         logging_policy=logging_policy,
         outcome_model=outcome_model,
@@ -155,237 +187,114 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         device=device,
         seed=seed + 3,
     )
-    cert_scores = score_batch(
-        region, splits.certification.current_states(), splits.certification.actions, splits.certification.outcomes
-    )
-    baseline_batch = concatenate_trajectories(splits.cot, splits.certification)
-    baseline_scores = torch.cat((cot_scores, cert_scores), dim=0)
     cot_weights, cot_weight_diagnostics = cot_state_action_weights(
         fitted_cot,
         splits.certification,
-        q_grid=q_grid,
+        q_grid=scale_grid,
         target_policy=policy,
         logging_policy=logging_policy,
         weight_cap=config.cot.weight_cap,
     )
-    iw_weights, iw_weight_diagnostics = prefix_importance_weights(
+    cot_ht_diagonal = diagonal_coverage_estimates(
+        cot_weights,
+        cert_scores.to(cot_weights),
+        candidate_radii.to(cot_weights),
+    )
+    cot_diagonal = self_normalized_diagonal_coverage_estimates(
+        cot_weights,
+        cert_scores.to(cot_weights),
+        candidate_radii.to(cot_weights),
+    )
+    candidate_widths = _estimated_candidate_normalized_widths(
+        outcome_model,
         splits.certification,
-        q_grid=q_grid,
-        target_policy=policy,
-        logging_policy=logging_policy,
-        weight_cap=config.cot.weight_cap,
-    )
-    cot_diagonal = diagonal_coverage_estimates(cot_weights, cert_scores.to(cot_weights), q_grid.to(cot_weights))
-    iw_diagonal = diagonal_coverage_estimates(iw_weights, cert_scores.to(iw_weights), q_grid.to(iw_weights))
-    cot_practical_diagonal = self_normalized_diagonal_coverage_estimates(
         cot_weights,
-        cert_scores.to(cot_weights),
-        q_grid.to(cot_weights),
+        candidate_radii,
+        outcome_sd,
     )
-    iw_practical_diagonal = self_normalized_diagonal_coverage_estimates(
-        iw_weights,
-        cert_scores.to(iw_weights),
-        q_grid.to(iw_weights),
-    )
-    cot_certificate = simultaneous_lower_bounds(
-        cot_diagonal,
-        n_trajectories=splits.certification.n,
-        weight_cap=config.cot.weight_cap,
-        config=config.certification,
-        cluster_ids=splits.certification.patient_ids,
-    )
-    # A declared occupancy-ratio theorem concerns COT, not the distinct
-    # trajectory-prefix IW estimator.  Until an IW-specific simultaneous error
-    # premise is implemented, keep this ablation practical-only.
-    iw_certification_config = (
-        config.certification
-        if config.certification.ratio_bound_source != "declared"
-        else replace(config.certification, ratio_error_bound=0.0, ratio_bound_source="none", ratio_delta=0.0)
-    )
-    iw_certificate = simultaneous_lower_bounds(
-        iw_diagonal,
-        n_trajectories=splits.certification.n,
-        weight_cap=config.cot.weight_cap,
-        config=iw_certification_config,
-        cluster_ids=splits.certification.patient_ids,
-    )
-    cot_selection = select_certified_radius(q_grid, cot_certificate, alpha=config.certification.alpha)
-    cot_bootstrap_certificate = None if cot_certificate.formal else practical_bootstrap_lower_bounds(
-        cot_weights,
-        cert_scores.to(cot_weights),
-        q_grid.to(cot_weights),
-        lower_tail=config.certification.delta,
-        n_resamples=config.certification.practical_bootstrap_resamples,
-        seed=seed + 31_337,
-        cluster_ids=splits.certification.patient_ids,
-    )
-    cot_practical_selection = (
-        select_lcb_radius(q_grid, cot_certificate, alpha=config.certification.alpha)
-        if cot_bootstrap_certificate is None
-        else select_lcb_radius(
-            q_grid,
-            cot_bootstrap_certificate,
-            alpha=config.certification.alpha,
-            status="PRACTICAL_CLUSTER_MAX_T_LCB",
-        )
-    )
-    iw_selection = select_certified_radius(q_grid, iw_certificate, alpha=config.certification.alpha)
-    iw_bootstrap_certificate = None if iw_certificate.formal else practical_bootstrap_lower_bounds(
-        iw_weights,
-        cert_scores.to(iw_weights),
-        q_grid.to(iw_weights),
-        lower_tail=config.certification.delta,
-        n_resamples=config.certification.practical_bootstrap_resamples,
-        seed=seed + 47_021,
-        cluster_ids=splits.certification.patient_ids,
-    )
-    iw_practical_selection = (
-        select_lcb_radius(q_grid, iw_certificate, alpha=config.certification.alpha)
-        if iw_bootstrap_certificate is None
-        else select_lcb_radius(
-            q_grid,
-            iw_bootstrap_certificate,
-            alpha=config.certification.alpha,
-            status="PRACTICAL_CLUSTER_MAX_T_LCB",
-        )
-    )
-    exact_diagonal = exact_certificate = exact_ess = None
-    learned_cot_oracle_l1_error_bound = learned_cot_oracle_l1_certificate = learned_cot_oracle_l1_selection = None
-    exact_cot_l1_error = exact_cot_cdf_error = exact_iw_cdf_error = None
-    if task.name == "tabular" and hasattr(task.environment, "exact_state_ratios") and task.logging_policy is not None:
-        # This finite-MDP-only branch enumerates the population discrepancy of
-        # the *capped learned* COT weights.  Unlike an empirical D_cert error,
-        # it is a deterministic oracle-validation term and can support the
-        # dedicated formal certificate below.
-        learned_cot_oracle_l1_error_bound = exact_tabular_cot_l1_error_bound(
+    exact_profiled_l1_error = None
+    if task.name == "tabular" and hasattr(task.environment, "exact_state_ratios"):
+        exact_profiled_l1_error = exact_tabular_cot_l1_error_bound(
             fitted_cot,
             task.environment,
-            q_grid=q_grid,
+            q_grid=scale_grid,
             target_policy=policy,
-            logging_policy=task.logging_policy,
+            logging_policy=logging_policy,
             weight_cap=config.cot.weight_cap,
         )
-        learned_cot_oracle_l1_certificate = exact_tabular_l1_lower_bounds(
-            cot_diagonal,
+        cot_certificate = exact_tabular_ordered_pointwise_l1_lower_bounds(
+            cot_ht_diagonal,
             n_trajectories=splits.certification.n,
             weight_cap=config.cot.weight_cap,
-            exact_l1_error_bound=learned_cot_oracle_l1_error_bound,
+            exact_l1_error_bound=exact_profiled_l1_error,
             delta=config.certification.delta,
             cluster_ids=splits.certification.patient_ids,
         )
-        learned_cot_oracle_l1_selection = select_certified_radius(
-            q_grid,
-            learned_cot_oracle_l1_certificate,
+        cot_selection = select_ordered_certified_radius(
+            scale_grid,
+            cot_certificate,
             alpha=config.certification.alpha,
+            widths=candidate_widths,
         )
-        exact_weights, exact_weight_bound = exact_tabular_state_action_weights(
-            task.environment,
-            splits.certification,
-            q_grid=q_grid,
-            target_policy=policy,
-            logging_policy=task.logging_policy,
-        )
-        exact_diagonal = diagonal_coverage_estimates(exact_weights, cert_scores.to(exact_weights), q_grid.to(exact_weights))
-        oracle_certificate_config = replace(
-            config.certification,
-            ratio_error_bound=0.0,
-            ratio_bound_source="oracle",
-            ratio_delta=0.0,
-        )
-        exact_certificate = simultaneous_lower_bounds(
-            exact_diagonal,
+        selection_evidence = "exact_finite_mdp_transport_audit"
+    elif config.certification.ratio_bound_source == "declared":
+        cot_certificate = ordered_pointwise_ht_lower_bounds(
+            cot_ht_diagonal,
             n_trajectories=splits.certification.n,
-            weight_cap=exact_weight_bound,
-            config=oracle_certificate_config,
-            allow_oracle=True,
+            weight_cap=config.cot.weight_cap,
+            config=config.certification,
             cluster_ids=splits.certification.patient_ids,
         )
-        exact_ess = effective_sample_sizes(exact_weights, splits.certification.patient_ids)
-        # Held-out empirical oracle diagnostics for the COT error premise and
-        # the RQ4 CDF comparison.  These are available only in the finite MDP;
-        # they are never recycled into radius selection.
-        exact_cot_l1_error = (cot_weights - exact_weights.to(cot_weights)).abs().mean(dim=0).transpose(0, 1)
-        exact_cot_cdf_error = (cot_diagonal - exact_diagonal.to(cot_diagonal)).abs()
-        exact_iw_cdf_error = (iw_diagonal - exact_diagonal.to(iw_diagonal)).abs()
-    # Baselines that do not fit COT receive the union of the two post-predictor
-    # calibration roles, so they are not disadvantaged in total data access.
-    historical_radius = historical_per_step_radius(baseline_scores, config.certification.alpha)
-    mfcs_method = f"MFCS-style (depth={config.baselines.mfcs_depth})"
-    mfcs_selection, mfcs_diagonal = finite_depth_mfcs_selection(
+        cot_selection = select_ordered_certified_radius(
+            scale_grid,
+            cot_certificate,
+            alpha=config.certification.alpha,
+            widths=candidate_widths,
+        )
+        selection_evidence = "declared_simultaneous_transport_bound"
+    else:
+        cot_certificate = ordered_pointwise_bootstrap_lower_bounds(
+            cot_weights,
+            cert_scores.to(cot_weights),
+            candidate_radii.to(cot_weights),
+            lower_tail=config.certification.delta,
+            n_resamples=config.certification.practical_bootstrap_resamples,
+            seed=seed + 31_337,
+            cluster_ids=splits.certification.patient_ids,
+        )
+        cot_selection = select_ordered_lcb_radius(
+            scale_grid,
+            cot_certificate,
+            alpha=config.certification.alpha,
+            widths=candidate_widths,
+            status="PRACTICAL_CLUSTER_ORDERED_IUT_LCB",
+        )
+        selection_evidence = "practical_patient_cluster_bootstrap"
+
+    baseline_batch = concatenate_trajectories(splits.cot, splits.certification)
+    baseline_scores = torch.cat((cot_scores, cert_scores), dim=0)
+    standard_radii = standard_cp_stagewise_radii(
+        baseline_scores,
+        config.certification.alpha,
+    )
+    mfcs_method = f"MFCS task-adapted (depth={config.baselines.mfcs_depth})"
+    mfcs_selection, _ = finite_depth_mfcs_selection(
         baseline_batch.to(device),
         baseline_scores.to(device),
-        q_grid=q_grid.to(device),
+        q_grid=scale_grid.to(device),
+        stage_profile=stage_profile.to(device),
         target_policy=policy,
         logging_policy=logging_policy,
         depth=config.baselines.mfcs_depth,
         alpha=config.certification.alpha,
         weight_cap=config.cot.weight_cap,
     )
-    # A full on-policy response surface is an internal simulator diagnostic,
-    # not part of SC-PCP.  Clinical configurations cannot expose a true oracle
-    # and previously paid hundreds of thousands of unnecessary rollouts here.
-    oracle_surface = oracle_selection = None
-    if task.name in {"synthetic", "tabular"}:
-        oracle_surface = estimate_oracle_surface(
-            task.environment,
-            policy,
-            region,
-            q_grid=q_grid,
-            horizon=config.horizon,
-            n_rollouts=config.samples.oracle_surface_rollouts,
-            seed=seed + 4,
-            device=device,
-        )
-        oracle_selection = select_empirical_radius(
-            q_grid,
-            oracle_surface.diagonal,
-            alpha=config.certification.alpha,
-        )
-    cot_deployment_selection = _deployment_selection(cot_certificate, cot_selection, cot_practical_selection)
-    iw_deployment_selection = _deployment_selection(iw_certificate, iw_selection, iw_practical_selection)
-    cot_deployment_certificate = cot_certificate if cot_bootstrap_certificate is None else cot_bootstrap_certificate
-    iw_deployment_certificate = iw_certificate if iw_bootstrap_certificate is None else iw_bootstrap_certificate
-    cot_deployment_diagonal = cot_deployment_certificate.estimates
-    iw_deployment_diagonal = iw_deployment_certificate.estimates
-    records = [
-        _evaluate_scalar_method("Historical CP", historical_radius, task, policy, region, config, seed, device),
-        _evaluate_scalar_method(mfcs_method, mfcs_selection.radius, task, policy, region, config, seed + 11, device, selection=mfcs_selection),
-        _evaluate_scalar_method(IW_ABLATION_METHOD, iw_deployment_selection.radius, task, policy, region, config, seed + 22, device, selection=iw_deployment_selection, certificate=iw_deployment_certificate),
-        _evaluate_scalar_method(SCPCP_METHOD, cot_deployment_selection.radius, task, policy, region, config, seed + 44, device, selection=cot_deployment_selection, certificate=cot_deployment_certificate),
-    ]
-    if learned_cot_oracle_l1_selection is not None and learned_cot_oracle_l1_certificate is not None:
-        records.append(
-            _evaluate_scalar_method(
-                "SC-PCP (exact-MDP oracle-bound audit)",
-                learned_cot_oracle_l1_selection.radius,
-                task,
-                policy,
-                region,
-                config,
-                seed + 56,
-                device,
-                selection=learned_cot_oracle_l1_selection,
-                certificate=learned_cot_oracle_l1_certificate,
-                information_regime="internal_oracle_ratio_bound_validation_only",
-            )
-        )
-    if oracle_selection is not None:
-        records.append(
-            _evaluate_scalar_method(
-                "MC-oracle SC-PCP (reference)",
-                oracle_selection.radius,
-                task,
-                policy,
-                region,
-                config,
-                seed + 55,
-                device,
-                selection=oracle_selection,
-                target_deployments=len(q_grid) * config.samples.oracle_surface_rollouts,
-                information_regime="on_policy_oracle_reference",
-            )
-        )
-    online = aci_style_controller(
+
+    adaptation_stream = _paper_seed(seed, 700_001)
+    aci_adaptation_seed = _paper_seed(adaptation_stream, 101)
+    multidim_adaptation_seed = _paper_seed(adaptation_stream, 211)
+    prc_adaptation_seed = _paper_seed(adaptation_stream, 307)
+    aci = aci_style_controller(
         task.environment,
         policy,
         region,
@@ -395,14 +304,10 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
-        seed=seed + 66,
+        seed=aci_adaptation_seed,
         device=device,
     )
-    aci_method = f"ACI-style online (gamma={config.baselines.aci_gamma:g})"
-    records.append(
-        _evaluate_stagewise_method(aci_method, online, task, policy, region, config, seed + 77, device)
-    )
-    spci = multidim_spci_style_controller(
+    multidim = multidim_spci_style_controller(
         task.environment,
         policy,
         region,
@@ -411,164 +316,157 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
-        seed=seed + 82,
+        seed=multidim_adaptation_seed,
         device=device,
         residual_window=config.baselines.multidim_buffer,
     )
-    spci_method = f"MultiDimSPCI-style online (buffer={config.baselines.multidim_buffer})"
-    records.append(
-        _evaluate_stagewise_method(spci_method, spci, task, policy, region, config, seed + 83, device)
-    )
-    repeated = repeated_recalibration(
+    initial_prc_scale = float((standard_radii / stage_profile.to(standard_radii)).max().item())
+    prc = prc_profile_scale(
         task.environment,
         policy,
         region,
-        historical_radius,
-        alpha=config.certification.alpha,
-        rounds=config.baselines.online_rounds,
-        total_rollouts=config.samples.online_rollouts,
-        horizon=config.horizon,
-        seed=seed + 88,
-        device=device,
-    )
-    records.append(
-        _evaluate_stagewise_method("Repeated recalibration", repeated, task, policy, region, config, seed + 99, device)
-    )
-    prc = prc_max_time(
-        task.environment,
-        policy,
-        region,
-        historical_radius,
-        q_grid,
+        initial_prc_scale,
+        scale_grid,
+        stage_profile,
         alpha=config.certification.alpha,
         delta=config.certification.delta,
         rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
         horizon=config.horizon,
-        seed=seed + 103,
+        seed=prc_adaptation_seed,
         device=device,
+        maximum_step=config.baselines.prc_maximum_step,
     )
-    records.append(
+
+    evaluation_seed = _paper_seed(seed, 900_001)
+    records = [
+        _evaluate_radius_method(
+            "Standard CP",
+            standard_radii,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            outcome_sd=outcome_sd,
+        ),
+        _evaluate_radius_method(
+            mfcs_method,
+            None
+            if mfcs_selection.radius is None
+            else mfcs_selection.radius * stage_profile,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            selection=mfcs_selection,
+            selected_scale=mfcs_selection.radius,
+            stage_profile=stage_profile,
+            outcome_sd=outcome_sd,
+        ),
         _evaluate_stagewise_method(
-            "PRC-MaxTime-style online (grid-adapted)",
+            f"ACI stagewise adaptation (gamma={config.baselines.aci_gamma:g})",
+            aci,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            outcome_sd=outcome_sd,
+        ),
+        _evaluate_stagewise_method(
+            f"MultiDimSPCI task-adapted (buffer={config.baselines.multidim_buffer})",
+            multidim,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            outcome_sd=outcome_sd,
+        ),
+        _evaluate_stagewise_method(
+            "PRC grid-adapted",
             prc,
             task,
             policy,
             region,
             config,
-            seed + 104,
+            evaluation_seed,
             device,
-        )
-    )
-    cot_ess = effective_sample_sizes(cot_weights, splits.certification.patient_ids)
-    iw_ess = effective_sample_sizes(iw_weights, splits.certification.patient_ids)
-    records.extend(
-        (
-            _logged_record("Historical CP", historical_radius, cert_scores, None, None, None, policy, logging_policy, splits.certification, config, q_grid),
-            _logged_record(mfcs_method, mfcs_selection.radius, cert_scores, mfcs_diagonal, None, None, policy, logging_policy, splits.certification, config, q_grid, mfcs_selection),
-            _logged_record(IW_ABLATION_METHOD, iw_deployment_selection.radius, cert_scores, iw_deployment_diagonal, iw_deployment_certificate, iw_ess, policy, logging_policy, splits.certification, config, q_grid, iw_deployment_selection),
-            _logged_record(SCPCP_METHOD, cot_deployment_selection.radius, cert_scores, cot_deployment_diagonal, cot_deployment_certificate, cot_ess, policy, logging_policy, splits.certification, config, q_grid, cot_deployment_selection),
-        )
-    )
-    cot_raw_dcov = dcov_surface(cot_weights, cert_scores.to(cot_weights), q_grid.to(cot_weights))
-    iw_raw_dcov = dcov_surface(iw_weights, cert_scores.to(iw_weights), q_grid.to(iw_weights))
-    cot_practical_dcov = self_normalized_dcov_surface(
-        cot_weights,
-        cert_scores.to(cot_weights),
-        q_grid.to(cot_weights),
-    )
-    iw_practical_dcov = self_normalized_dcov_surface(
-        iw_weights,
-        cert_scores.to(iw_weights),
-        q_grid.to(iw_weights),
-    )
+            outcome_sd=outcome_sd,
+            stage_profile=stage_profile,
+        ),
+        _evaluate_radius_method(
+            SCPCP_METHOD,
+            None
+            if cot_selection.radius is None
+            else cot_selection.radius * stage_profile,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            selection=cot_selection,
+            certificate=cot_certificate,
+            selected_scale=cot_selection.radius,
+            stage_profile=stage_profile,
+            outcome_sd=outcome_sd,
+        ),
+    ]
+
     surfaces = {
-        "q_grid": q_grid,
-        "cot_dcov": cot_raw_dcov if cot_certificate.formal else cot_practical_dcov,
-        "iw_dcov": iw_raw_dcov if iw_certificate.formal else iw_practical_dcov,
-        "cot_dcov_raw": cot_raw_dcov,
-        "iw_dcov_raw": iw_raw_dcov,
-        "cot_dcov_self_normalized": cot_practical_dcov,
-        "iw_dcov_self_normalized": iw_practical_dcov,
-        "cot_diagonal": cot_deployment_diagonal,
-        "iw_diagonal": iw_deployment_diagonal,
-        "cot_diagonal_raw": cot_diagonal,
-        "iw_diagonal_raw": iw_diagonal,
-        "cot_diagonal_self_normalized": cot_practical_diagonal,
-        "iw_diagonal_self_normalized": iw_practical_diagonal,
-        "mfcs_diagonal": mfcs_diagonal,
-        "cot_lower_bounds": cot_deployment_certificate.lower_bounds,
-        "iw_lower_bounds": iw_deployment_certificate.lower_bounds,
-        "cot_ht_lower_bounds": cot_certificate.lower_bounds,
-        "iw_ht_lower_bounds": iw_certificate.lower_bounds,
-        "cot_sampling_margin": torch.tensor(cot_deployment_certificate.sampling_margin),
-        "iw_sampling_margin": torch.tensor(iw_deployment_certificate.sampling_margin),
-        "cot_ht_sampling_margin": torch.tensor(cot_certificate.sampling_margin),
-        "iw_ht_sampling_margin": torch.tensor(iw_certificate.sampling_margin),
-        "cot_ratio_error_bound": cot_deployment_certificate.ratio_error_bound,
-        "iw_ratio_error_bound": iw_deployment_certificate.ratio_error_bound,
-        "cot_ht_ratio_error_bound": cot_certificate.ratio_error_bound,
-        "iw_ht_ratio_error_bound": iw_certificate.ratio_error_bound,
-        "cot_ess": cot_ess,
-        "iw_ess": iw_ess,
-        "cot_weight_variance_pre_cap": cot_weight_diagnostics.raw_variance,
-        "iw_weight_variance_pre_cap": iw_weight_diagnostics.raw_variance,
-        "cot_cap_hit_rate": cot_weight_diagnostics.cap_hit_rate,
-        "iw_cap_hit_rate": iw_weight_diagnostics.cap_hit_rate,
-        "cot_weight_maximum_pre_cap": cot_weight_diagnostics.raw_maximum,
-        "iw_weight_maximum_pre_cap": iw_weight_diagnostics.raw_maximum,
+        "q_grid": scale_grid,
+        "scale_grid": scale_grid,
+        "stage_profile": stage_profile,
+        "candidate_radii": candidate_radii,
+        "cot_ht_diagonal": cot_ht_diagonal,
+        "cot_diagonal": cot_diagonal,
+        "cot_lower_bounds": cot_certificate.lower_bounds,
+        "estimated_candidate_widths": candidate_widths,
     }
-    if oracle_surface is not None:
-        surfaces["oracle_dcov"] = oracle_surface.surface
-    if learned_cot_oracle_l1_certificate is not None:
-        surfaces["learned_cot_oracle_l1_error_bound"] = learned_cot_oracle_l1_error_bound
-        surfaces["learned_cot_oracle_l1_lower_bounds"] = learned_cot_oracle_l1_certificate.lower_bounds
-        surfaces["learned_cot_oracle_l1_sampling_margin"] = torch.tensor(
-            learned_cot_oracle_l1_certificate.sampling_margin
+    if cot_selection.radius is not None:
+        surfaces["scpcp_selected_scale"] = torch.tensor(cot_selection.radius)
+        surfaces["scpcp_selected_radii"] = cot_selection.radius * stage_profile
+    if exact_profiled_l1_error is not None:
+        surfaces["exact_profiled_cot_l1_error"] = exact_profiled_l1_error
+    if config.paper.save_mechanism_diagonal and seed == config.paper.mechanism_seed:
+        if task.name not in {"synthetic", "tabular"}:
+            raise ValueError("the mechanism diagonal is available only in known environments")
+        surfaces["oracle_diagonal"] = estimate_oracle_diagonal(
+            task.environment,
+            policy,
+            region,
+            q_grid=candidate_radii,
+            horizon=config.horizon,
+            n_rollouts=config.samples.oracle_surface_rollouts,
+            seed=_paper_seed(seed, 1_100_001),
+            device=device,
         )
-    if exact_diagonal is not None:
-        surfaces["exact_cot_diagonal"] = exact_diagonal
-        surfaces["exact_cot_lower_bounds"] = exact_certificate.lower_bounds
-        surfaces["exact_cot_ess"] = exact_ess
-        surfaces["exact_cot_sampling_margin"] = torch.tensor(exact_certificate.sampling_margin)
-        surfaces["exact_cot_ratio_error_bound"] = exact_certificate.ratio_error_bound
-        surfaces["exact_cot_l1_error_on_dcert"] = exact_cot_l1_error
-        surfaces["exact_cot_cdf_error"] = exact_cot_cdf_error
-        surfaces["exact_iw_cdf_error"] = exact_iw_cdf_error
     diagnostics = {
         "dataset": task.name,
-        "q_grid_size": len(q_grid),
+        "protocol": "four_rq_paper_protocol",
+        "baseline_scope": "task_adapted_common_prediction_set_interface",
+        "matched_evaluation_random_stream": True,
+        "adaptation_seeds": {
+            "aci": aci_adaptation_seed,
+            "multidim_spci": multidim_adaptation_seed,
+            "prc": prc_adaptation_seed,
+        },
+        "evaluation_seed": evaluation_seed,
+        "training_outcome_sd": [float(value) for value in outcome_sd.tolist()],
         "cot": fitted_cot.diagnostics,
         "cot_cap_hit_rate": float(cot_weight_diagnostics.cap_hit_rate.mean().item()),
-        "iw_cap_hit_rate": float(iw_weight_diagnostics.cap_hit_rate.mean().item()),
-        "cot_certificate": cot_certificate.label,
-        "iw_certificate": iw_certificate.label,
-        "cot_practical_certificate": "" if cot_bootstrap_certificate is None else cot_bootstrap_certificate.label,
-        "iw_practical_certificate": "" if iw_bootstrap_certificate is None else iw_bootstrap_certificate.label,
-        "scpcp_deployment_certificate": cot_deployment_certificate.label,
-        "scpcp_deployment_certificate_formal": cot_deployment_certificate.formal,
-        "iw_scpcp_deployment_certificate": iw_deployment_certificate.label,
-        "iw_scpcp_deployment_certificate_formal": iw_deployment_certificate.formal,
-        "learned_cot_oracle_l1_certificate": ""
-        if learned_cot_oracle_l1_certificate is None
-        else learned_cot_oracle_l1_certificate.label,
-        "learned_cot_oracle_l1_error_bound_max": None
-        if learned_cot_oracle_l1_error_bound is None
-        else float(learned_cot_oracle_l1_error_bound.max().item()),
-        "learned_cot_oracle_l1_selection_status": ""
-        if learned_cot_oracle_l1_selection is None
-        else learned_cot_oracle_l1_selection.status,
-        "exact_cot_certificate": "" if exact_certificate is None else exact_certificate.label,
-        "exact_cot_l1_error_max_on_dcert": None if exact_cot_l1_error is None else float(exact_cot_l1_error.max().item()),
-        "exact_cot_cdf_error_max_on_dcert": None if exact_cot_cdf_error is None else float(exact_cot_cdf_error.max().item()),
-        "exact_iw_cdf_error_max_on_dcert": None if exact_iw_cdf_error is None else float(exact_iw_cdf_error.max().item()),
-        "ope_logging_policy": "known" if task.logging_policy is not None else "estimated",
-        "policy_reference": "known_logging" if task.logging_policy is not None else "estimated_behavior",
-        "original_to_model_action": {} if task.action_mapping is None else task.action_mapping,
-        "base_state_feature_names": list(task.state_feature_names),
-        "state_history_length": (
-            config.model.history_length if config.model.architecture == "gru" else 1
-        ),
+        "selection_evidence": selection_evidence,
+        "stage_profile": [float(value) for value in stage_profile.tolist()],
+        "ordered_candidate_count": len(scale_grid),
+        "ordered_certified_indices": list(cot_selection.certified_indices),
+        "ordered_stopped_index": cot_selection.stopped_index,
         "split_sizes": {
             "pred": splits.predictor.n,
             "beh": 0 if splits.behavior is None else splits.behavior.n,
@@ -577,7 +475,56 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             "env": 0 if splits.environment is None else splits.environment.n,
         },
     }
-    return SeedResult(seed=seed, device=device, records=records, surfaces=surfaces, diagnostics=diagnostics)
+    return SeedResult(
+        seed=seed,
+        device=device,
+        records=records,
+        surfaces=surfaces,
+        diagnostics=diagnostics,
+    )
+
+
+def _training_outcome_sd(batch: TrajectoryBatch) -> Tensor:
+    """Outcome normalization scale computed from D_pred only."""
+
+    flat = batch.outcomes.reshape(-1, batch.outcome_dim).float()
+    return flat.std(dim=0, unbiased=True).clamp_min(1e-6)
+
+
+@torch.no_grad()
+def _estimated_candidate_normalized_widths(
+    outcome_model: object,
+    batch: TrajectoryBatch,
+    weights: Tensor,
+    candidate_radii: Tensor,
+    outcome_sd: Tensor,
+) -> Tensor:
+    """Estimate target-policy normalized width for every frozen schedule."""
+
+    if candidate_radii.ndim != 2 or candidate_radii.shape[1] != batch.horizon:
+        raise ValueError("candidate_radii must have shape [K,T]")
+    if weights.shape != (batch.n, batch.horizon, len(candidate_radii)):
+        raise ValueError("weights must have shape [N,T,K]")
+    predictor = outcome_model.outcome_model if hasattr(outcome_model, "outcome_model") else outcome_model
+    device = weights.device
+    resolved = batch.to(device)
+    states = resolved.current_states().reshape(-1, batch.state_dim)
+    actions = resolved.actions.reshape(-1)
+    _, scales = predictor(states, actions)
+    scales = scales.reshape(batch.n, batch.horizon, -1)
+    normalization = outcome_sd.to(scales).clamp_min(1e-6)
+    base_width = (2.0 * scales / normalization[None, None, :]).mean(dim=2)
+    radii_by_time = candidate_radii.to(weights).transpose(0, 1)
+    logged_width = base_width[:, :, None] * radii_by_time[None, :, :]
+    weighted = (weights * logged_width).sum(dim=0)
+    target_width_by_time = weighted / weights.sum(dim=0).clamp_min(1e-12)
+    return target_width_by_time.mean(dim=0)
+
+
+def _paper_seed(seed: int, stream: int) -> int:
+    """Stable disjoint RNG streams shared across methods within a split seed."""
+
+    return int((1_000_003 * seed + stream) % (2**31 - 1))
 
 
 def _prepare_task(config: ExperimentConfig, *, seed: int, device: str) -> _Task:
@@ -627,20 +574,16 @@ def _prepare_task(config: ExperimentConfig, *, seed: int, device: str) -> _Task:
         action_mapping,
         state_feature_names,
     ) = load_clinical_trajectories(config, seed=seed, device=device)
-    splits = patient_level_splits(logged, seed=seed, include_environment=True)
+    splits = patient_level_splits(
+        logged,
+        seed=seed,
+        include_environment=True,
+        include_behavior=False,
+    )
     if splits.environment is None:
         raise RuntimeError("clinical Track A requires D_env")
-    environment = EmpiricalTransitionEnvironment(
-        splits.environment,
-        n_actions=n_actions,
-        neighbors=config.data.empirical_neighbors,
-        bandwidth=config.data.empirical_bandwidth,
-        embedding_dim=config.data.empirical_embedding_dim,
-        static_indices=static_indices,
-        history_length=config.model.history_length if config.model.architecture == "gru" else 1,
-    )
     return _Task(
-        environment,
+        None,
         splits,
         n_actions,
         None,
@@ -652,9 +595,9 @@ def _prepare_task(config: ExperimentConfig, *, seed: int, device: str) -> _Task:
     )
 
 
-def _evaluate_scalar_method(
+def _evaluate_radius_method(
     name: str,
-    radius: float | None,
+    radius: float | Tensor | None,
     task: _Task,
     policy: BehaviorAnchoredPolicy,
     outcome_model: object,
@@ -666,6 +609,9 @@ def _evaluate_scalar_method(
     certificate: CertificationResult | None = None,
     target_deployments: int = 0,
     information_regime: str | None = None,
+    outcome_sd: Tensor | None = None,
+    selected_scale: float | None = None,
+    stage_profile: Tensor | None = None,
 ) -> dict[str, Any]:
     if radius is None:
         return _unavailable_record(
@@ -674,6 +620,8 @@ def _evaluate_scalar_method(
             certificate,
             information_regime=information_regime,
             target_deployments=target_deployments,
+            selected_scale=selected_scale,
+            stage_profile=stage_profile,
         )
     coverage, deployed, scores = per_step_oracle_metrics(
         task.environment,
@@ -698,6 +646,9 @@ def _evaluate_scalar_method(
         certificate,
         target_deployments,
         information_regime,
+        outcome_sd,
+        selected_scale,
+        stage_profile,
     )
 
 
@@ -710,6 +661,9 @@ def _evaluate_stagewise_method(
     config: ExperimentConfig,
     seed: int,
     device: str,
+    *,
+    outcome_sd: Tensor | None = None,
+    stage_profile: Tensor | None = None,
 ) -> dict[str, Any]:
     radii = adaptation.radius_by_time
     coverage, deployed, scores = per_step_oracle_metrics(
@@ -734,6 +688,9 @@ def _evaluate_stagewise_method(
         None,
         None,
         adaptation.target_deployments,
+        outcome_sd=outcome_sd,
+        selected_scale=adaptation.selected_scale,
+        stage_profile=stage_profile,
     )
     per_time = adaptation.adaptation_per_time_coverage
     adaptation_target = 1.0 - config.certification.alpha
@@ -768,6 +725,8 @@ def _metric_placeholders() -> dict[str, float | str]:
     return {
         "mean_log_volume": missing,
         "median_volume": missing,
+        "average_normalized_width": missing,
+        "per_time_normalized_width": "[]",
         "clinical_cost": missing,
         "clinical_utility": missing,
         "logged_descriptive_mean_log_volume": missing,
@@ -785,6 +744,7 @@ def _metric_placeholders() -> dict[str, float | str]:
         "maximum_policy_ratio": missing,
         "prediction_set_mean_score": missing,
         "certified": False,
+        "selection_available": False,
         "adaptation_trajectories": 0,
         "adaptation_rounds": 0,
         "adaptation_target_coverage": missing,
@@ -867,6 +827,9 @@ def _deployment_record(
     certificate: CertificationResult | None,
     target_deployments: int,
     information_regime: str | None = None,
+    outcome_sd: Tensor | None = None,
+    selected_scale: float | None = None,
+    stage_profile: Tensor | None = None,
 ) -> dict[str, Any]:
     action_cost = torch.as_tensor(policy.config.action_costs, device=deployed.actions.device)[deployed.actions]
     realized_cost = (
@@ -889,6 +852,23 @@ def _deployment_record(
     else:
         volumes = 4.0 * step_radius.square() * scales[:, 0] * scales[:, 1]
         log_volumes = (volumes + 1e-12).log()
+    normalized_width = float("nan")
+    per_time_normalized_width = torch.full(
+        (deployed.horizon,),
+        float("nan"),
+        device=scales.device,
+    )
+    if outcome_sd is not None:
+        normalization = outcome_sd.to(scales).clamp_min(1e-6)
+        normalized_coordinate_width = (
+            2.0 * step_radius[:, None] * scales / normalization[None, :]
+        )
+        normalized_width = float(normalized_coordinate_width.mean().item())
+        per_time_normalized_width = (
+            normalized_coordinate_width.mean(dim=1)
+            .reshape(deployed.n, deployed.horizon)
+            .mean(dim=0)
+        )
     selected_index = None if selection is None else selection.index
     has_selected_certificate = certificate is not None and selected_index is not None
     estimated_min = (
@@ -906,7 +886,7 @@ def _deployment_record(
         and certificate is not None
         and certificate.formal
         and selection is not None
-        and selection.status == "CERTIFIED"
+        and selection.status.startswith("CERTIFIED")
     )
     return {
         **_metric_placeholders(),
@@ -918,11 +898,25 @@ def _deployment_record(
         "method": name,
         "information_regime": information_regime or ("on_policy_adaptation" if target_deployments else "offline_logged_data"),
         "selection_estimand": "per_step",
+        "selection_parameter": (
+            "global_scale"
+            if selected_scale is not None
+            else "stagewise_radii"
+            if isinstance(radius, Tensor)
+            else "scalar_radius"
+        ),
         "selected_q": float(radius) if not isinstance(radius, Tensor) else float(radius.mean().item()),
+        "selected_scale": float("nan") if selected_scale is None else float(selected_scale),
+        "stage_profile": (
+            "[]"
+            if stage_profile is None
+            else json.dumps([float(value) for value in stage_profile.tolist()])
+        ),
         "q_by_time": "" if not isinstance(radius, Tensor) else json.dumps([float(value) for value in radius.tolist()]),
         "selection_status": "FIXED" if selection is None else selection.status,
         "certificate_type": "" if certificate is None else certificate.label,
         "certificate_formal": False if certificate is None else certificate.formal,
+        "selection_available": True,
         "worst_coverage": float(coverage.min().item()),
         "average_coverage": float(coverage.mean().item()),
         "pathwise_coverage": float(pathwise_coverage.item()),
@@ -930,6 +924,10 @@ def _deployment_record(
         "per_time_coverage": json.dumps([float(value) for value in coverage.tolist()]),
         "mean_log_volume": float(log_volumes.mean().item()),
         "median_volume": float(volumes.median().item()),
+        "average_normalized_width": normalized_width,
+        "per_time_normalized_width": json.dumps(
+            [float(value) for value in per_time_normalized_width.tolist()]
+        ),
         "clinical_cost": float(realized_cost.item()),
         "clinical_utility": float((-realized_cost).item()),
         "target_policy_trajectories": target_deployments,
@@ -948,6 +946,8 @@ def _unavailable_record(
     *,
     information_regime: str | None = None,
     target_deployments: int = 0,
+    selected_scale: float | None = None,
+    stage_profile: Tensor | None = None,
 ) -> dict[str, Any]:
     return {
         **_metric_placeholders(),
@@ -959,11 +959,19 @@ def _unavailable_record(
         "method": name,
         "information_regime": information_regime or "offline_logged_data",
         "selection_estimand": "per_step",
+        "selection_parameter": "global_scale" if stage_profile is not None else "scalar_radius",
         "selected_q": float("nan"),
+        "selected_scale": float("nan") if selected_scale is None else float(selected_scale),
+        "stage_profile": (
+            "[]"
+            if stage_profile is None
+            else json.dumps([float(value) for value in stage_profile.tolist()])
+        ),
         "q_by_time": "",
         "selection_status": "UNCERTIFIED" if selection is None else selection.status,
         "certificate_type": "" if certificate is None else certificate.label,
         "certificate_formal": False if certificate is None else certificate.formal,
+        "selection_available": False,
         "worst_coverage": float("nan"),
         "average_coverage": float("nan"),
         "pathwise_coverage": float("nan"),
@@ -1010,6 +1018,7 @@ def _logged_record(
         "certificate_type": "" if certificate is None else certificate.label,
         "certificate_formal": False if certificate is None else certificate.formal,
         "certified": bool(radius is not None and certificate is not None and certificate.formal and selection is not None and selection.status == "CERTIFIED"),
+        "selection_available": radius is not None,
         "worst_coverage": float("nan"),
         "average_coverage": float("nan"),
         "pathwise_coverage": float("nan"),

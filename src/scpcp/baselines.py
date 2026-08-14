@@ -15,21 +15,22 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
-from scpcp.coverage import diagonal_coverage_estimates
+from scpcp.coverage import candidate_radius_schedules, diagonal_coverage_estimates
 from scpcp.data import TrajectoryBatch
 from scpcp.policy import BehaviorAnchoredPolicy
 from scpcp.selection import RadiusSelection, select_empirical_radius
 from scpcp.simulator import rollout
 
 
-def historical_per_step_radius(scores: Tensor, alpha: float) -> float:
-    """Conservative split CP radius: the largest of the T stage quantiles."""
+def standard_cp_stagewise_radii(scores: Tensor, alpha: float) -> Tensor:
+    """Ordinary split-CP finite-sample radius at each decision stage."""
 
-    if scores.ndim != 2:
-        raise ValueError("scores must have shape [N,T]")
+    if scores.ndim != 2 or len(scores) == 0:
+        raise ValueError("scores must have shape [N,T] with N > 0")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
     rank = min(scores.shape[0] - 1, math.ceil((scores.shape[0] + 1) * (1.0 - alpha)) - 1)
-    stage_radii = scores.sort(dim=0).values[rank]
-    return float(stage_radii.max().item())
+    return scores.sort(dim=0).values[rank]
 
 
 def finite_depth_mfcs_selection(
@@ -37,6 +38,7 @@ def finite_depth_mfcs_selection(
     scores: Tensor,
     *,
     q_grid: Tensor,
+    stage_profile: Tensor | None = None,
     target_policy: BehaviorAnchoredPolicy,
     logging_policy: object,
     depth: int,
@@ -49,18 +51,30 @@ def finite_depth_mfcs_selection(
         raise ValueError("MFCS depth must be positive")
     device = scores.device
     q_grid = q_grid.to(device)
+    profile = (
+        torch.ones(batch.horizon, device=device, dtype=q_grid.dtype)
+        if stage_profile is None
+        else stage_profile.to(device=device, dtype=q_grid.dtype)
+    )
+    if profile.shape != (batch.horizon,):
+        raise ValueError("stage_profile must have shape [T]")
     weights = []
     for time in range(batch.horizon):
         log_weight = torch.zeros((batch.n, len(q_grid)), device=device)
         for previous in range(max(0, time - depth + 1), time + 1):
             states = batch.states[:, previous]
-            pi = target_policy.probabilities_for_grid(states, q_grid)
+            pi = target_policy.probabilities_for_grid(states, q_grid * profile[previous])
             action = batch.actions[:, previous, None, None].expand(-1, len(q_grid), 1)
             numerator = pi.gather(2, action).squeeze(2)
             denominator = logging_policy.probabilities(states).gather(1, batch.actions[:, previous, None]).expand(-1, len(q_grid))
             log_weight += (numerator.clamp_min(1e-12) / denominator.clamp_min(1e-12)).log()
         weights.append(log_weight.exp().clamp_max(weight_cap))
-    estimates = diagonal_coverage_estimates(torch.stack(weights, dim=1), scores, q_grid)
+    candidate_radii = candidate_radius_schedules(q_grid, profile)
+    estimates = diagonal_coverage_estimates(
+        torch.stack(weights, dim=1),
+        scores,
+        candidate_radii,
+    )
     return select_empirical_radius(q_grid, estimates, alpha=alpha), estimates
 
 
@@ -72,6 +86,7 @@ class OnlineBaselineResult:
     adaptation_per_time_coverage: Tensor
     adaptation_round_worst_coverage: tuple[float, ...]
     adaptation_pathwise_coverage: float
+    selected_scale: float | None = None
 
 
 @dataclass
@@ -95,7 +110,13 @@ class _CoverageAccumulator:
         self.pathwise_hits += int(hits.all(dim=1).sum().item())
         self.round_worst.append(float(per_time.min().item()))
 
-    def finish(self, radii: Tensor, rounds: int) -> OnlineBaselineResult:
+    def finish(
+        self,
+        radii: Tensor,
+        rounds: int,
+        *,
+        selected_scale: float | None = None,
+    ) -> OnlineBaselineResult:
         if self.trajectories < 1:
             raise RuntimeError("online adaptation produced no trajectories")
         return OnlineBaselineResult(
@@ -105,6 +126,7 @@ class _CoverageAccumulator:
             adaptation_per_time_coverage=(self.covered_by_time / self.trajectories).to(torch.float32),
             adaptation_round_worst_coverage=tuple(self.round_worst),
             adaptation_pathwise_coverage=self.pathwise_hits / self.trajectories,
+            selected_scale=selected_scale,
         )
 
 
@@ -150,43 +172,6 @@ def aci_style_controller(
             histories[time] = torch.cat((histories[time], scores[:, time]))[-10_000:]
     radii = torch.stack([_finite_quantile(history, 1.0 - float(alpha_time[t])) for t, history in enumerate(histories)])
     return adaptation.finish(radii, rounds)
-
-
-@torch.no_grad()
-def repeated_recalibration(
-    environment: object,
-    policy: BehaviorAnchoredPolicy,
-    outcome_model: object,
-    initial_radius: float,
-    *,
-    alpha: float,
-    rounds: int,
-    total_rollouts: int,
-    horizon: int,
-    seed: int,
-    device: str | torch.device,
-) -> OnlineBaselineResult:
-    """An on-policy repeated-calibration diagnostic for the DCov off-diagonal."""
-
-    radius = initial_radius
-    round_sizes = _online_round_sizes(total_rollouts, rounds)
-    adaptation = _CoverageAccumulator.create(horizon)
-    for round_index, rollout_size in enumerate(round_sizes):
-        deployed = rollout(
-            environment,
-            policy,
-            n=rollout_size,
-            horizon=horizon,
-            seed=seed + 31_337 * round_index,
-            device=device,
-            q=radius,
-        )
-        from scpcp.scores import score_batch
-
-        scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes)
-        adaptation.update(scores, radius)
-        radius = historical_per_step_radius(scores, alpha)
-    return adaptation.finish(torch.full((horizon,), radius), rounds)
 
 
 @torch.no_grad()
@@ -236,12 +221,13 @@ def multidim_spci_style_controller(
 
 
 @torch.no_grad()
-def prc_max_time(
+def prc_profile_scale(
     environment: object,
     policy: BehaviorAnchoredPolicy,
     outcome_model: object,
-    initial_radius: float,
-    q_grid: Tensor,
+    initial_scale: float,
+    scale_grid: Tensor,
+    stage_profile: Tensor,
     *,
     alpha: float,
     delta: float,
@@ -252,19 +238,19 @@ def prc_max_time(
     device: str | torch.device,
     maximum_step: float = 0.35,
 ) -> OnlineBaselineResult:
-    """PRC-MaxTime adapter with explicit on-policy samples and finite-grid moves.
+    """PRC-MaxTime adapter on the same frozen ``q_t(s)=s b_t`` family."""
 
-    Unlike native PRC's monotone scalar binary-search interface, this wrapper
-    enumerates the fixed grid because performative coverage need not be
-    monotone in q.  It may move only within a declared radius sensitivity guard.
-    """
-
-    radius = float(initial_radius)
-    q_grid = q_grid.detach().cpu()
+    if stage_profile.shape != (horizon,):
+        raise ValueError("stage_profile must have shape [T]")
+    current_scale = float(initial_scale)
+    scale_grid = scale_grid.detach().cpu()
+    profile = stage_profile.detach().cpu()
+    candidate_radii = candidate_radius_schedules(scale_grid, profile)
     round_sizes = _online_round_sizes(total_rollouts, rounds)
     adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
-        margin = math.sqrt(math.log(len(q_grid) * horizon / delta) / (2.0 * rollout_size))
+        margin = math.sqrt(math.log(len(scale_grid) * horizon / delta) / (2.0 * rollout_size))
+        radii = current_scale * profile
         deployed = rollout(
             environment,
             policy,
@@ -272,18 +258,28 @@ def prc_max_time(
             horizon=horizon,
             seed=seed + 61_103 * round_index,
             device=device,
-            q=radius,
+            q=radii.to(device),
         )
         from scpcp.scores import score_batch
 
-        scores = score_batch(outcome_model, deployed.current_states(), deployed.actions, deployed.outcomes).cpu()
-        adaptation.update(scores, radius)
-        coverage = (scores[:, :, None] <= q_grid[None, None, :]).float().mean(dim=0).transpose(0, 1)
+        scores = score_batch(
+            outcome_model,
+            deployed.current_states(),
+            deployed.actions,
+            deployed.outcomes,
+        ).cpu()
+        adaptation.update(scores, radii)
+        coverage = (scores[:, None, :] <= candidate_radii[None, :, :]).float().mean(dim=0)
         safe = (coverage.amin(dim=1) - margin >= 1.0 - alpha).nonzero().squeeze(1)
-        guarded = [index for index in safe.tolist() if abs(float(q_grid[index]) - radius) <= maximum_step]
+        guarded = [
+            index
+            for index in safe.tolist()
+            if abs(float(scale_grid[index]) - current_scale) <= maximum_step
+        ]
         if guarded:
-            radius = float(q_grid[min(guarded)])
-    return adaptation.finish(torch.full((horizon,), radius), rounds)
+            current_scale = float(scale_grid[min(guarded)].item())
+    final_radii = current_scale * profile
+    return adaptation.finish(final_radii, rounds, selected_scale=current_scale)
 
 
 def _finite_quantile(values: Tensor, probability: float) -> Tensor:

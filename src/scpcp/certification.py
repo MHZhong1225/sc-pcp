@@ -82,6 +82,66 @@ def simultaneous_lower_bounds(
     )
 
 
+def ordered_pointwise_ht_lower_bounds(
+    estimates: Tensor,
+    *,
+    n_trajectories: int,
+    weight_cap: float,
+    config: CertificationConfig,
+    allow_oracle: bool = False,
+    cluster_ids: Tensor | None = None,
+) -> CertificationResult:
+    """Pointwise bounded-HT LCBs for widest-to-narrowest fixed-sequence tests.
+
+    The sampling margin deliberately contains neither the candidate count nor
+    the horizon.  At one candidate, the unsafe null is a union over stages, so
+    rejecting it requires every level-``delta`` component test to reject (an
+    intersection-union test).  Across candidates, validity comes from the
+    prespecified fixed sequence and its stop-at-first-failure rule; callers
+    must therefore use the ordered selector rather than arbitrary screening.
+    """
+
+    if estimates.ndim != 2:
+        raise ValueError("estimates must have shape [K,T]")
+    if n_trajectories < 1 or weight_cap <= 0.0:
+        raise ValueError("n_trajectories and weight_cap must be positive")
+    if config.ratio_bound_source not in {"none", "declared", "oracle"}:
+        raise ValueError("unknown ratio bound source")
+    if config.ratio_bound_source == "oracle" and not allow_oracle:
+        raise ValueError("oracle ratio bounds are restricted to exact-tabular validation")
+    if config.ratio_bound_source == "declared" and config.ratio_delta <= 0.0:
+        raise ValueError("declared statistical ratio bounds require positive ratio_delta")
+    sample_delta = config.delta - config.ratio_delta
+    if not 0.0 < sample_delta < 1.0:
+        raise ValueError("delta minus ratio_delta must lie in (0, 1)")
+    effective_n = _cluster_count_effective_sample_size(n_trajectories, cluster_ids)
+    margin = weight_cap * math.sqrt(math.log(1.0 / sample_delta) / (2.0 * effective_n))
+    formal = config.ratio_bound_source != "none"
+    applied_error = (
+        torch.full_like(estimates, config.ratio_error_bound)
+        if formal
+        else torch.zeros_like(estimates)
+    )
+    reported_error = (
+        applied_error if formal else torch.full_like(estimates, float("nan"))
+    )
+    source = (
+        "oracle_transport"
+        if config.ratio_bound_source == "oracle"
+        else "declared_transport"
+        if formal
+        else "no_transport_bound"
+    )
+    return CertificationResult(
+        estimates=estimates,
+        lower_bounds=(estimates - margin - applied_error).clamp(0.0, 1.0),
+        sampling_margin=margin,
+        ratio_error_bound=reported_error,
+        formal=formal,
+        label=f"ordered_iut_pointwise_ht_{source}",
+    )
+
+
 def exact_tabular_l1_lower_bounds(
     estimates: Tensor,
     *,
@@ -120,6 +180,38 @@ def exact_tabular_l1_lower_bounds(
         ratio_error_bound=exact_l1_error_bound.to(estimates),
         formal=True,
         label="tabular_exact_l1_oracle_bound",
+    )
+
+
+def exact_tabular_ordered_pointwise_l1_lower_bounds(
+    estimates: Tensor,
+    *,
+    n_trajectories: int,
+    weight_cap: float,
+    exact_l1_error_bound: Tensor,
+    delta: float,
+    cluster_ids: Tensor | None = None,
+) -> CertificationResult:
+    """Exact finite-MDP transport audit for the ordered pointwise test."""
+
+    if estimates.ndim != 2 or exact_l1_error_bound.shape != estimates.shape:
+        raise ValueError("estimates and exact_l1_error_bound must both have shape [K,T]")
+    if n_trajectories < 1 or weight_cap <= 0.0:
+        raise ValueError("n_trajectories and weight_cap must be positive")
+    if not 0.0 < delta < 1.0:
+        raise ValueError("delta must lie in (0, 1)")
+    if not torch.isfinite(exact_l1_error_bound).all() or (exact_l1_error_bound < 0.0).any():
+        raise ValueError("exact_l1_error_bound must be finite and nonnegative")
+    effective_n = _cluster_count_effective_sample_size(n_trajectories, cluster_ids)
+    margin = weight_cap * math.sqrt(math.log(1.0 / delta) / (2.0 * effective_n))
+    error = exact_l1_error_bound.to(estimates)
+    return CertificationResult(
+        estimates=estimates,
+        lower_bounds=(estimates - margin - error).clamp(0.0, 1.0),
+        sampling_margin=margin,
+        ratio_error_bound=error,
+        formal=True,
+        label="tabular_ordered_iut_pointwise_exact_l1_oracle_bound",
     )
 
 
@@ -168,6 +260,52 @@ def practical_bootstrap_lower_bounds(
         seed=seed,
         resample_batch_size=resample_batch_size,
         cluster_ids=cluster_ids,
+        simultaneous=True,
+    )
+
+
+@torch.no_grad()
+def ordered_pointwise_bootstrap_lower_bounds(
+    weights: Tensor,
+    scores: Tensor,
+    candidate_radii: Tensor,
+    *,
+    lower_tail: float,
+    n_resamples: int,
+    seed: int,
+    resample_batch_size: int = 32,
+    cluster_ids: Tensor | None = None,
+) -> CertificationResult:
+    """Marginal patient-cluster LCBs used by practical ordered-IUT SC-PCP.
+
+    The full cluster is resampled jointly, preserving dependence across stages
+    and candidates.  Quantiles are nevertheless taken cell by cell: candidate
+    multiplicity is handled by the frozen fixed sequence, while stage
+    multiplicity is handled by the intersection-union test.  The result is a
+    practical bootstrap diagnostic, not a theorem-level certificate.
+    """
+
+    if weights.ndim != 3 or scores.ndim != 2:
+        raise ValueError("weights must be [N,T,K] and scores must be [N,T]")
+    thresholds = _candidate_thresholds(candidate_radii, scores)
+    if weights.shape[:2] != scores.shape or weights.shape[2] != thresholds.shape[1]:
+        raise ValueError("bootstrap inputs must share trajectory, time, and candidate dimensions")
+    if not 0.0 < lower_tail < 1.0:
+        raise ValueError("bootstrap lower_tail must lie in (0, 1)")
+    if n_resamples < 1 or resample_batch_size < 1:
+        raise ValueError("bootstrap resample counts must be positive")
+    events = (scores[:, :, None] <= thresholds[None, :, :]).to(weights.dtype)
+    numerator = (weights * events).permute(0, 2, 1).contiguous()
+    denominator = weights.permute(0, 2, 1).contiguous()
+    return _practical_bootstrap_from_ratio_contributions(
+        numerator,
+        denominator,
+        lower_tail=lower_tail,
+        n_resamples=n_resamples,
+        seed=seed,
+        resample_batch_size=resample_batch_size,
+        cluster_ids=cluster_ids,
+        simultaneous=False,
     )
 
 
@@ -181,6 +319,7 @@ def _practical_bootstrap_from_ratio_contributions(
     seed: int,
     resample_batch_size: int,
     cluster_ids: Tensor | None = None,
+    simultaneous: bool = True,
 ) -> CertificationResult:
     """Bootstrap independent clusters with a probability-preserving ratio."""
 
@@ -224,23 +363,28 @@ def _practical_bootstrap_from_ratio_contributions(
         samples.append(bootstrap_numerator / bootstrap_denominator)
     bootstrap = torch.cat(samples, dim=0)
     estimates = cluster_numerator.sum(dim=0) / cluster_denominator.sum(dim=0).clamp_min(1e-12)
-    # Build one band over the complete finite family.  This avoids applying an
-    # ordinary bootstrap to min_t and needs no separate screening failure
-    # budget: the same max-t critical value protects every selectable q and
-    # every per-time constraint.
     standard_errors = bootstrap.std(dim=0, unbiased=False)
     stable_errors = standard_errors.clamp_min(torch.finfo(bootstrap.dtype).eps)
     standardized_error = (bootstrap - estimates[None, :, :]) / stable_errors[None, :, :]
-    maximum_error = standardized_error.amax(dim=(1, 2))
-    critical_value = torch.quantile(maximum_error, 1.0 - lower_tail).clamp_min(0.0)
-    margins = critical_value * standard_errors
+    if simultaneous:
+        maximum_error = standardized_error.amax(dim=(1, 2))
+        critical_value = torch.quantile(maximum_error, 1.0 - lower_tail).clamp_min(0.0)
+        margins = critical_value * standard_errors
+    else:
+        critical_value = torch.quantile(
+            standardized_error,
+            1.0 - lower_tail,
+            dim=0,
+        ).clamp_min(0.0)
+        margins = critical_value * standard_errors
     lower = (estimates - margins).clamp(0.0, 1.0)
 
     denominator_ess = _cluster_denominator_effective_sample_sizes(cluster_denominator)
-    wilson_lower = _simultaneous_wilson_lower_bounds(
+    wilson_lower = _wilson_lower_bounds(
         estimates,
         denominator_ess,
         lower_tail=lower_tail,
+        family_size=estimates.numel() if simultaneous else 1,
     )
     numerical_tolerance = math.sqrt(torch.finfo(standard_errors.dtype).eps)
     unstable_cells = standard_errors <= numerical_tolerance
@@ -252,7 +396,11 @@ def _practical_bootstrap_from_ratio_contributions(
         sampling_margin=float(realized_margins.max().item()),
         ratio_error_bound=torch.full_like(lower, float("nan")),
         formal=False,
-        label="practical_hajek_cluster_bootstrap_max_t_wilson_lcb",
+        label=(
+            "practical_hajek_cluster_bootstrap_max_t_wilson_lcb"
+            if simultaneous
+            else "practical_hajek_patient_cluster_ordered_iut_marginal_bootstrap_wilson_lcb"
+        ),
     )
 
 
@@ -306,15 +454,17 @@ def _cluster_denominator_effective_sample_sizes(cluster_denominator: Tensor) -> 
     return (total.square() / squared).clamp_min(1.0)
 
 
-def _simultaneous_wilson_lower_bounds(
+def _wilson_lower_bounds(
     estimates: Tensor,
     effective_sample_sizes: Tensor,
     *,
     lower_tail: float,
+    family_size: int,
 ) -> Tensor:
-    """One-sided Bonferroni-Wilson guard for degenerate boundary cells."""
+    """One-sided Wilson guard for degenerate boundary cells."""
 
-    family_size = estimates.numel()
+    if family_size < 1:
+        raise ValueError("family_size must be positive")
     cell_tail = lower_tail / family_size
     standard_normal = torch.distributions.Normal(
         torch.tensor(0.0, dtype=torch.float64),
@@ -333,3 +483,14 @@ def _simultaneous_wilson_lower_bounds(
         + z_squared / (4.0 * sample_size.square())
     )
     return (center - half_width).clamp(0.0, 1.0)
+
+
+def _candidate_thresholds(candidate_radii: Tensor, scores: Tensor) -> Tensor:
+    """Resolve scalar or stagewise candidates to thresholds with shape [T,K]."""
+
+    resolved = candidate_radii.to(scores)
+    if resolved.ndim == 1:
+        return resolved[None, :].expand(scores.shape[1], -1)
+    if resolved.ndim == 2 and resolved.shape[1] == scores.shape[1]:
+        return resolved.transpose(0, 1)
+    raise ValueError("candidate_radii must have shape [K] or [K,T]")

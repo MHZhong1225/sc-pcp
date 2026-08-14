@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor
@@ -27,6 +28,60 @@ def fixed_q_grid(scores: Tensor, *, size: int, lower_quantile: float, upper_quan
     return torch.quantile(flat, probabilities)
 
 
+def stage_score_profile(scores: Tensor, *, alpha: float) -> Tensor:
+    """Freeze the relative stage shape from ``D_COT`` only.
+
+    Each component is the ordinary finite-sample split-conformal quantile for
+    that stage.  The subsequent certification step learns only one global
+    scale, so the deployed radii are ``q_t(s) = s * b_t``.
+    """
+
+    if scores.ndim != 2 or len(scores) == 0:
+        raise ValueError("profile scores must have shape [N,T] with N > 0")
+    if not torch.isfinite(scores).all() or (scores < 0.0).any():
+        raise ValueError("profile scores must be finite and nonnegative")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    rank = min(len(scores) - 1, math.ceil((len(scores) + 1) * (1.0 - alpha)) - 1)
+    raw_profile = scores.sort(dim=0).values[rank].clamp_min(torch.finfo(scores.dtype).eps)
+    geometric_mean = raw_profile.log().mean().exp()
+    return raw_profile / geometric_mean
+
+
+def profiled_scale_grid(
+    scores: Tensor,
+    profile: Tensor,
+    *,
+    size: int,
+    lower_quantile: float,
+    upper_quantile: float,
+) -> Tensor:
+    """Freeze a one-dimensional candidate scale grid before certification."""
+
+    if scores.ndim != 2 or profile.shape != (scores.shape[1],):
+        raise ValueError("scores and profile must have shapes [N,T] and [T]")
+    if not torch.isfinite(profile).all() or (profile <= 0.0).any():
+        raise ValueError("profile must be finite and strictly positive")
+    return fixed_q_grid(
+        scores / profile.to(scores)[None, :],
+        size=size,
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+    )
+
+
+def candidate_radius_schedules(scale_grid: Tensor, profile: Tensor) -> Tensor:
+    """Return the frozen candidate radii with shape ``[K,T]``."""
+
+    if scale_grid.ndim != 1 or profile.ndim != 1:
+        raise ValueError("scale_grid and profile must both be one-dimensional")
+    if not torch.isfinite(scale_grid).all() or (scale_grid < 0.0).any():
+        raise ValueError("scale_grid must be finite and nonnegative")
+    if not torch.isfinite(profile).all() or (profile <= 0.0).any():
+        raise ValueError("profile must be finite and strictly positive")
+    return scale_grid[:, None] * profile.to(scale_grid)[None, :]
+
+
 @torch.no_grad()
 def dcov_surface(weights: Tensor, scores: Tensor, q_measure: Tensor) -> Tensor:
     """Estimate F[q_deploy, time, q_measure] from per-step weights.
@@ -42,22 +97,32 @@ def dcov_surface(weights: Tensor, scores: Tensor, q_measure: Tensor) -> Tensor:
 
 
 @torch.no_grad()
-def diagonal_coverage_estimates(weights: Tensor, scores: Tensor, q_grid: Tensor) -> Tensor:
-    """Return F_hat[q, t](q) with shape [K, T]."""
+def diagonal_coverage_estimates(weights: Tensor, scores: Tensor, candidate_radii: Tensor) -> Tensor:
+    """Return self-consistent coverage estimates with shape ``[K,T]``.
 
-    if weights.shape[2] != len(q_grid):
-        raise ValueError("weights and q-grid must use the same number of radii")
-    events = (scores[:, :, None] <= q_grid.to(scores)[None, None, :]).to(weights.dtype)
+    ``candidate_radii`` may be the legacy scalar grid ``[K]`` or a frozen
+    stagewise schedule family ``[K,T]``.
+    """
+
+    thresholds = _candidate_thresholds(candidate_radii, scores)
+    if weights.shape[:2] != scores.shape or weights.shape[2] != thresholds.shape[1]:
+        raise ValueError("weights, scores, and candidate radii must share [N,T,K]")
+    events = (scores[:, :, None] <= thresholds[None, :, :]).to(weights.dtype)
     return (weights * events).mean(dim=0).transpose(0, 1)
 
 
 @torch.no_grad()
-def self_normalized_diagonal_coverage_estimates(weights: Tensor, scores: Tensor, q_grid: Tensor) -> Tensor:
+def self_normalized_diagonal_coverage_estimates(
+    weights: Tensor,
+    scores: Tensor,
+    candidate_radii: Tensor,
+) -> Tensor:
     """Probability-preserving practical coverage estimates of shape [K,T]."""
 
-    if weights.shape[:2] != scores.shape or weights.shape[2] != len(q_grid):
-        raise ValueError("weights, scores, and q-grid must share [N,T,K]")
-    events = (scores[:, :, None] <= q_grid.to(scores)[None, None, :]).to(weights.dtype)
+    thresholds = _candidate_thresholds(candidate_radii, scores)
+    if weights.shape[:2] != scores.shape or weights.shape[2] != thresholds.shape[1]:
+        raise ValueError("weights, scores, and candidate radii must share [N,T,K]")
+    events = (scores[:, :, None] <= thresholds[None, :, :]).to(weights.dtype)
     numerator = (weights * events).sum(dim=0)
     denominator = weights.sum(dim=0).clamp_min(1e-12)
     return (numerator / denominator).transpose(0, 1)
@@ -140,6 +205,41 @@ def estimate_oracle_surface(
 
 
 @torch.no_grad()
+def estimate_oracle_diagonal(
+    environment: object,
+    policy: BehaviorAnchoredPolicy,
+    outcome_model: object,
+    *,
+    q_grid: Tensor,
+    horizon: int,
+    n_rollouts: int,
+    seed: int,
+    device: str | torch.device,
+) -> Tensor:
+    """Estimate only ``P_q(score_t <= q)`` for the RQ4 mechanism figure.
+
+    The old full-surface routine evaluates every deployment radius against
+    every measurement radius.  RQ4 uses only the self-consistent diagonal, so
+    materializing the extra ``K x T x K`` surface wastes memory and arithmetic.
+    """
+
+    rows = []
+    for index, radius in enumerate(q_grid.to(device)):
+        coverage, _, _ = per_step_oracle_metrics(
+            environment,
+            policy,
+            outcome_model,
+            q=radius,
+            horizon=horizon,
+            n_rollouts=n_rollouts,
+            seed=seed + 104_729 * index,
+            device=device,
+        )
+        rows.append(coverage)
+    return torch.stack(rows)
+
+
+@torch.no_grad()
 def per_step_oracle_metrics(
     environment: object,
     policy: BehaviorAnchoredPolicy,
@@ -171,6 +271,17 @@ def per_step_oracle_metrics(
     else:
         raise ValueError("oracle metric radius must be scalar or [T]")
     return coverage, deployed, scores
+
+
+def _candidate_thresholds(candidate_radii: Tensor, scores: Tensor) -> Tensor:
+    """Resolve scalar or stagewise candidates to a ``[T,K]`` threshold matrix."""
+
+    resolved = candidate_radii.to(scores)
+    if resolved.ndim == 1:
+        return resolved[None, :].expand(scores.shape[1], -1)
+    if resolved.ndim == 2 and resolved.shape[1] == scores.shape[1]:
+        return resolved.transpose(0, 1)
+    raise ValueError("candidate radii must have shape [K] or [K,T]")
 
 
 @torch.no_grad()
