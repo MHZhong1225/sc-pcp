@@ -79,6 +79,19 @@ class COTConfig:
 
 
 @dataclass(frozen=True)
+class ProfileConfig:
+    """D_COT-only transport refinement for the SC-PCP schedule shape."""
+
+    refinement_folds: int = 3
+    refinement_strength: float = 0.5
+    maximum_profile_ratio: float = 1.25
+    minimum_effective_size: float = 25.0
+    maximum_cap_hit_rate: float = 0.01
+    grid_focus_fraction: float = 0.80
+    grid_focus_radius: float = 0.075
+
+
+@dataclass(frozen=True)
 class CertificationConfig:
     alpha: float = 0.10
     delta: float = 0.05
@@ -149,6 +162,7 @@ class ExperimentConfig:
     model: ModelConfig = ModelConfig()
     policy: PolicyConfig = PolicyConfig()
     cot: COTConfig = COTConfig()
+    profile: ProfileConfig = ProfileConfig()
     certification: CertificationConfig = CertificationConfig()
     samples: SampleConfig = SampleConfig()
     baselines: BaselineConfig = BaselineConfig()
@@ -235,6 +249,24 @@ class ExperimentConfig:
             raise ValueError("COT loss must be mse or huber")
         if self.cot.rho_cap < 1.0 or self.cot.weight_cap <= 0.0:
             raise ValueError("COT rho_cap must be at least one and weight_cap must be positive")
+        if self.profile.refinement_folds < 2:
+            raise ValueError("profile refinement requires at least two patient folds")
+        if not 0.0 < self.profile.refinement_strength <= 1.0:
+            raise ValueError("profile refinement_strength must lie in (0, 1]")
+        if self.profile.maximum_profile_ratio <= 1.0:
+            raise ValueError("profile maximum_profile_ratio must exceed one")
+        if self.profile.minimum_effective_size <= 0.0:
+            raise ValueError("profile minimum_effective_size must be positive")
+        if not 0.0 <= self.profile.maximum_cap_hit_rate < 1.0:
+            raise ValueError("profile maximum_cap_hit_rate must lie in [0, 1)")
+        if not 0.0 < self.profile.grid_focus_fraction < 1.0:
+            raise ValueError("profile grid_focus_fraction must lie in (0, 1)")
+        if not 0.0 < self.profile.grid_focus_radius < 0.5:
+            raise ValueError("profile grid_focus_radius must lie in (0, .5)")
+        if 2.0 * self.profile.grid_focus_radius >= (
+            self.q_quantile_max - self.q_quantile_min
+        ):
+            raise ValueError("profile grid focus must fit inside the candidate quantile range")
         if self.policy.temperature <= 0.0:
             raise ValueError("policy temperature must be positive")
         if self.policy.tilt < 0.0:

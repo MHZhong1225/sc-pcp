@@ -28,6 +28,14 @@ cot:
   weight_cap: 40.0
   loss: huber
   q_samples_per_batch: 4
+profile:
+  refinement_folds: 3
+  refinement_strength: 0.5
+  maximum_profile_ratio: 1.25
+  minimum_effective_size: 25.0
+  maximum_cap_hit_rate: 0.01
+  grid_focus_fraction: 0.80
+  grid_focus_radius: 0.075
 certification:
   alpha: 0.10
   delta: 0.05
@@ -52,4 +60,4 @@ seeds:
   start: 0
   stop: 20
 devices: [cuda:0, cuda:1]
-output_dir: results/work/paper_v2/rq1/mimic_cxr
+output_dir: results/work/paper_final/rq1/mimic_cxr

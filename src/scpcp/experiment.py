@@ -33,11 +33,16 @@ from scpcp.cot import (
 from scpcp.coverage import (
     candidate_radius_schedules,
     diagonal_coverage_estimates,
+    effective_sample_sizes,
     estimate_oracle_diagonal,
     per_step_oracle_metrics,
+    profiled_local_scale_grid,
     profiled_scale_grid,
     self_normalized_diagonal_coverage_estimates,
     stage_score_profile,
+    stage_score_quantiles,
+    transport_refined_stage_profile,
+    weighted_stage_score_quantiles,
 )
 from scpcp.data import DataSplits, TrajectoryBatch, concatenate_trajectories, patient_level_splits
 from scpcp.outcome_model import fit_outcome_model
@@ -81,6 +86,24 @@ class _Task:
     static_indices: tuple[int, ...] = ()
     action_mapping: dict[int, int] | None = None
     state_feature_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RefinedScheduleFamily:
+    """D_COT-measurable schedule artifacts frozen before certification."""
+
+    initial_quantiles: Tensor
+    initial_profile: Tensor
+    baseline_scale_grid: Tensor
+    profile: Tensor
+    scale_grid: Tensor
+    anchor_scale: Tensor
+    applied_log_correction: Tensor
+    fold_initial_quantiles: Tensor
+    fold_transported_quantiles: Tensor
+    fold_effective_sizes: Tensor
+    fold_refinement_weights: Tensor
+    fold_cap_hit_rates: Tensor
 
 
 def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
@@ -158,24 +181,21 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         splits.cot.actions,
         splits.cot.outcomes,
     )
-    stage_profile = stage_score_profile(
+    schedule_family = _fit_transport_refined_schedule_family(
+        splits.cot,
         cot_scores,
-        alpha=config.certification.alpha,
+        policy=policy,
+        logging_policy=logging_policy,
+        outcome_model=outcome_model,
+        config=config,
+        device=device,
+        seed=seed,
     )
-    scale_grid = profiled_scale_grid(
-        cot_scores,
-        stage_profile,
-        size=config.q_grid_size,
-        lower_quantile=config.q_quantile_min,
-        upper_quantile=config.q_quantile_max,
-    )
+    initial_stage_profile = schedule_family.initial_profile
+    baseline_scale_grid = schedule_family.baseline_scale_grid
+    stage_profile = schedule_family.profile
+    scale_grid = schedule_family.scale_grid
     candidate_radii = candidate_radius_schedules(scale_grid, stage_profile)
-    cert_scores = score_batch(
-        region,
-        splits.certification.current_states(),
-        splits.certification.actions,
-        splits.certification.outcomes,
-    )
     fitted_cot = fit_cot(
         splits.cot,
         q_grid=scale_grid,
@@ -186,6 +206,24 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         config=config.cot,
         device=device,
         seed=seed + 3,
+    )
+    exact_profiled_l1_error = None
+    if task.name == "tabular" and hasattr(task.environment, "exact_state_ratios"):
+        exact_profiled_l1_error = exact_tabular_cot_l1_error_bound(
+            fitted_cot,
+            task.environment,
+            q_grid=scale_grid,
+            target_policy=policy,
+            logging_policy=logging_policy,
+            weight_cap=config.cot.weight_cap,
+        )
+    # The profile, candidate grid, and final transport learner are now frozen.
+    # D_cert is first touched only after this point.
+    cert_scores = score_batch(
+        region,
+        splits.certification.current_states(),
+        splits.certification.actions,
+        splits.certification.outcomes,
     )
     cot_weights, cot_weight_diagnostics = cot_state_action_weights(
         fitted_cot,
@@ -212,16 +250,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         candidate_radii,
         outcome_sd,
     )
-    exact_profiled_l1_error = None
-    if task.name == "tabular" and hasattr(task.environment, "exact_state_ratios"):
-        exact_profiled_l1_error = exact_tabular_cot_l1_error_bound(
-            fitted_cot,
-            task.environment,
-            q_grid=scale_grid,
-            target_policy=policy,
-            logging_policy=logging_policy,
-            weight_cap=config.cot.weight_cap,
-        )
+    if exact_profiled_l1_error is not None:
         cot_certificate = exact_tabular_ordered_pointwise_l1_lower_bounds(
             cot_ht_diagonal,
             n_trajectories=splits.certification.n,
@@ -281,8 +310,8 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     mfcs_selection, _ = finite_depth_mfcs_selection(
         baseline_batch.to(device),
         baseline_scores.to(device),
-        q_grid=scale_grid.to(device),
-        stage_profile=stage_profile.to(device),
+        q_grid=baseline_scale_grid.to(device),
+        stage_profile=initial_stage_profile.to(device),
         target_policy=policy,
         logging_policy=logging_policy,
         depth=config.baselines.mfcs_depth,
@@ -320,14 +349,16 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         device=device,
         residual_window=config.baselines.multidim_buffer,
     )
-    initial_prc_scale = float((standard_radii / stage_profile.to(standard_radii)).max().item())
+    initial_prc_scale = float(
+        (standard_radii / initial_stage_profile.to(standard_radii)).max().item()
+    )
     prc = prc_profile_scale(
         task.environment,
         policy,
         region,
         initial_prc_scale,
-        scale_grid,
-        stage_profile,
+        baseline_scale_grid,
+        initial_stage_profile,
         alpha=config.certification.alpha,
         delta=config.certification.delta,
         rounds=config.baselines.online_rounds,
@@ -355,7 +386,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             mfcs_method,
             None
             if mfcs_selection.radius is None
-            else mfcs_selection.radius * stage_profile,
+            else mfcs_selection.radius * initial_stage_profile,
             task,
             policy,
             region,
@@ -364,7 +395,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             device,
             selection=mfcs_selection,
             selected_scale=mfcs_selection.radius,
-            stage_profile=stage_profile,
+            stage_profile=initial_stage_profile,
             outcome_sd=outcome_sd,
         ),
         _evaluate_stagewise_method(
@@ -399,7 +430,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             evaluation_seed,
             device,
             outcome_sd=outcome_sd,
-            stage_profile=stage_profile,
+            stage_profile=initial_stage_profile,
         ),
         _evaluate_radius_method(
             SCPCP_METHOD,
@@ -424,6 +455,16 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         "q_grid": scale_grid,
         "scale_grid": scale_grid,
         "stage_profile": stage_profile,
+        "initial_stage_quantiles": schedule_family.initial_quantiles,
+        "initial_stage_profile": initial_stage_profile,
+        "baseline_scale_grid": baseline_scale_grid,
+        "profile_anchor_scale": schedule_family.anchor_scale,
+        "profile_applied_log_correction": schedule_family.applied_log_correction,
+        "profile_fold_initial_quantiles": schedule_family.fold_initial_quantiles,
+        "profile_fold_transported_quantiles": schedule_family.fold_transported_quantiles,
+        "profile_fold_effective_sizes": schedule_family.fold_effective_sizes,
+        "profile_fold_refinement_weights": schedule_family.fold_refinement_weights,
+        "profile_fold_cap_hit_rates": schedule_family.fold_cap_hit_rates,
         "candidate_radii": candidate_radii,
         "cot_ht_diagonal": cot_ht_diagonal,
         "cot_diagonal": cot_diagonal,
@@ -450,7 +491,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         )
     diagnostics = {
         "dataset": task.name,
-        "protocol": "four_rq_paper_protocol",
+        "protocol": "transport_refined_four_rq_paper_protocol",
         "baseline_scope": "task_adapted_common_prediction_set_interface",
         "matched_evaluation_random_stream": True,
         "adaptation_seeds": {
@@ -463,7 +504,26 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         "cot": fitted_cot.diagnostics,
         "cot_cap_hit_rate": float(cot_weight_diagnostics.cap_hit_rate.mean().item()),
         "selection_evidence": selection_evidence,
+        "profile_learning": "patient_crossfit_transport_refinement",
+        "initial_stage_profile": [
+            float(value) for value in initial_stage_profile.tolist()
+        ],
         "stage_profile": [float(value) for value in stage_profile.tolist()],
+        "profile_anchor_scale": float(schedule_family.anchor_scale.item()),
+        "profile_applied_log_correction": [
+            float(value) for value in schedule_family.applied_log_correction.tolist()
+        ],
+        "profile_fold_minimum_effective_size": [
+            float(value)
+            for value in schedule_family.fold_effective_sizes.min(dim=1).values.tolist()
+        ],
+        "profile_fold_mean_cap_hit_rate": [
+            float(value) for value in schedule_family.fold_cap_hit_rates.mean(dim=1).tolist()
+        ],
+        "profile_gated_fold_stage_count": int(
+            (schedule_family.fold_refinement_weights == 0.0).sum().item()
+        ),
+        "baseline_candidate_count": len(baseline_scale_grid),
         "ordered_candidate_count": len(scale_grid),
         "ordered_certified_indices": list(cot_selection.certified_indices),
         "ordered_stopped_index": cot_selection.stopped_index,
@@ -482,6 +542,175 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         surfaces=surfaces,
         diagnostics=diagnostics,
     )
+
+
+def _fit_transport_refined_schedule_family(
+    batch: TrajectoryBatch,
+    scores: Tensor,
+    *,
+    policy: object,
+    logging_policy: object,
+    outcome_model: object,
+    config: ExperimentConfig,
+    device: str,
+    seed: int,
+) -> _RefinedScheduleFamily:
+    """Learn the SC-PCP schedule shape using only patient-crossfit D_COT data."""
+
+    alpha = config.certification.alpha
+    initial_quantiles = stage_score_quantiles(scores, alpha=alpha)
+    initial_profile = stage_score_profile(scores, alpha=alpha)
+    baseline_scale_grid = profiled_scale_grid(
+        scores,
+        initial_profile,
+        size=config.q_grid_size,
+        lower_quantile=config.q_quantile_min,
+        upper_quantile=config.q_quantile_max,
+    )
+
+    fold_initial_quantiles = []
+    fold_transported_quantiles = []
+    fold_effective_sizes = []
+    fold_cap_hit_rates = []
+    folds = _patient_crossfit_indices(
+        batch,
+        folds=config.profile.refinement_folds,
+        seed=_paper_seed(seed, 300_001),
+    )
+    for fold, (train_indices, held_indices) in enumerate(folds):
+        train_batch = batch.subset(train_indices)
+        held_batch = batch.subset(held_indices)
+        train_scores = scores[train_indices.to(scores.device)]
+        held_scores = scores[held_indices.to(scores.device)]
+
+        fold_quantiles = stage_score_quantiles(train_scores, alpha=alpha)
+        fold_anchor = fold_quantiles.log().mean().exp()
+        fold_profile = fold_quantiles / fold_anchor
+        # A one-schedule pilot is enough to estimate the transported shape and
+        # is much cheaper than fitting another full K-candidate family.
+        pilot_seed = _paper_seed(seed, 310_001 + fold)
+        resolved_device = torch.device(device)
+        rng_devices = (
+            []
+            if resolved_device.type != "cuda"
+            else [
+                torch.cuda.current_device()
+                if resolved_device.index is None
+                else resolved_device.index
+            ]
+        )
+        # Pilot fitting has a private RNG stream and cannot perturb the final
+        # COT learner or any baseline's random stream.
+        with torch.random.fork_rng(devices=rng_devices):
+            torch.random.default_generator.manual_seed(pilot_seed)
+            if rng_devices:
+                with torch.cuda.device(rng_devices[0]):
+                    torch.cuda.manual_seed(pilot_seed)
+            pilot_cot = fit_cot(
+                train_batch,
+                q_grid=fold_anchor[None],
+                stage_profile=fold_profile,
+                target_policy=policy,
+                logging_policy=logging_policy,
+                outcome_model=outcome_model,
+                config=config.cot,
+                device=device,
+                seed=pilot_seed,
+            )
+        held_weights, held_diagnostics = cot_state_action_weights(
+            pilot_cot,
+            held_batch,
+            q_grid=fold_anchor[None],
+            target_policy=policy,
+            logging_policy=logging_policy,
+            weight_cap=config.cot.weight_cap,
+        )
+        transported = weighted_stage_score_quantiles(
+            held_scores.to(held_weights),
+            held_weights[:, :, 0],
+            alpha=alpha,
+        )
+        effective_sizes = effective_sample_sizes(
+            held_weights,
+            cluster_ids=held_batch.patient_ids,
+        )[0]
+
+        fold_initial_quantiles.append(fold_quantiles.to(scores))
+        fold_transported_quantiles.append(transported.to(scores))
+        fold_effective_sizes.append(effective_sizes.to(scores))
+        fold_cap_hit_rates.append(held_diagnostics.cap_hit_rate[0].to(scores))
+        del pilot_cot, held_weights
+
+    stacked_initial = torch.stack(fold_initial_quantiles)
+    stacked_transported = torch.stack(fold_transported_quantiles)
+    stacked_effective_sizes = torch.stack(fold_effective_sizes)
+    stacked_cap_hit_rates = torch.stack(fold_cap_hit_rates)
+    refinement_weights = torch.where(
+        stacked_cap_hit_rates <= config.profile.maximum_cap_hit_rate,
+        stacked_effective_sizes,
+        torch.zeros_like(stacked_effective_sizes),
+    )
+    refined_profile, applied_log_correction = transport_refined_stage_profile(
+        initial_quantiles,
+        stacked_initial,
+        stacked_transported,
+        refinement_weights,
+        refinement_strength=config.profile.refinement_strength,
+        maximum_profile_ratio=config.profile.maximum_profile_ratio,
+        minimum_effective_size=config.profile.minimum_effective_size,
+    )
+    refined_quantiles = initial_quantiles * applied_log_correction.exp()
+    anchor_scale = refined_quantiles.log().mean().exp()
+    scale_grid = profiled_local_scale_grid(
+        scores,
+        refined_profile,
+        size=config.q_grid_size,
+        lower_quantile=config.q_quantile_min,
+        upper_quantile=config.q_quantile_max,
+        anchor_scale=anchor_scale,
+        focus_fraction=config.profile.grid_focus_fraction,
+        focus_radius=config.profile.grid_focus_radius,
+    )
+    return _RefinedScheduleFamily(
+        initial_quantiles=initial_quantiles,
+        initial_profile=initial_profile,
+        baseline_scale_grid=baseline_scale_grid,
+        profile=refined_profile,
+        scale_grid=scale_grid,
+        anchor_scale=anchor_scale,
+        applied_log_correction=applied_log_correction,
+        fold_initial_quantiles=stacked_initial,
+        fold_transported_quantiles=stacked_transported,
+        fold_effective_sizes=stacked_effective_sizes,
+        fold_refinement_weights=refinement_weights,
+        fold_cap_hit_rates=stacked_cap_hit_rates,
+    )
+
+
+def _patient_crossfit_indices(
+    batch: TrajectoryBatch,
+    *,
+    folds: int,
+    seed: int,
+) -> tuple[tuple[Tensor, Tensor], ...]:
+    """Return deterministic train/held row indices with patient-level isolation."""
+
+    patient_ids = batch.patient_ids.detach().cpu()
+    unique_patients = torch.unique(patient_ids, sorted=True)
+    if folds < 2 or len(unique_patients) < folds:
+        raise ValueError("patient cross-fitting requires at least one patient per fold")
+    generator = torch.Generator().manual_seed(seed)
+    shuffled = unique_patients[
+        torch.randperm(len(unique_patients), generator=generator)
+    ]
+    device = batch.patient_ids.device
+    indices = []
+    for held_patients in torch.tensor_split(shuffled, folds):
+        held_mask = torch.isin(patient_ids, held_patients)
+        held = held_mask.nonzero().squeeze(1).to(device)
+        train = (~held_mask).nonzero().squeeze(1).to(device)
+        indices.append((train, held))
+    return tuple(indices)
 
 
 def _training_outcome_sd(batch: TrajectoryBatch) -> Tensor:

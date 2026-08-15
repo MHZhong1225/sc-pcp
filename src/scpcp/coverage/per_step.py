@@ -28,13 +28,8 @@ def fixed_q_grid(scores: Tensor, *, size: int, lower_quantile: float, upper_quan
     return torch.quantile(flat, probabilities)
 
 
-def stage_score_profile(scores: Tensor, *, alpha: float) -> Tensor:
-    """Freeze the relative stage shape from ``D_COT`` only.
-
-    Each component is the ordinary finite-sample split-conformal quantile for
-    that stage.  The subsequent certification step learns only one global
-    scale, so the deployed radii are ``q_t(s) = s * b_t``.
-    """
+def stage_score_quantiles(scores: Tensor, *, alpha: float) -> Tensor:
+    """Return finite-sample split-conformal quantiles for every stage."""
 
     if scores.ndim != 2 or len(scores) == 0:
         raise ValueError("profile scores must have shape [N,T] with N > 0")
@@ -43,9 +38,186 @@ def stage_score_profile(scores: Tensor, *, alpha: float) -> Tensor:
     if not 0.0 < alpha < 1.0:
         raise ValueError("alpha must lie in (0, 1)")
     rank = min(len(scores) - 1, math.ceil((len(scores) + 1) * (1.0 - alpha)) - 1)
-    raw_profile = scores.sort(dim=0).values[rank].clamp_min(torch.finfo(scores.dtype).eps)
-    geometric_mean = raw_profile.log().mean().exp()
-    return raw_profile / geometric_mean
+    return scores.sort(dim=0).values[rank].clamp_min(torch.finfo(scores.dtype).eps)
+
+
+def stage_score_profile(scores: Tensor, *, alpha: float) -> Tensor:
+    """Freeze a positive unit-geometric-mean stage shape from ``D_COT``."""
+
+    return _unit_geometric_mean(stage_score_quantiles(scores, alpha=alpha))
+
+
+def weighted_stage_score_quantiles(
+    scores: Tensor,
+    weights: Tensor,
+    *,
+    alpha: float,
+) -> Tensor:
+    """Hájek weighted left quantiles for a frozen target-policy schedule."""
+
+    if scores.ndim != 2 or weights.shape != scores.shape or len(scores) == 0:
+        raise ValueError("scores and weights must have the same nonempty [N,T] shape")
+    if not torch.isfinite(scores).all() or (scores < 0.0).any():
+        raise ValueError("scores must be finite and nonnegative")
+    if not torch.isfinite(weights).all() or (weights < 0.0).any():
+        raise ValueError("weights must be finite and nonnegative")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    if (weights.sum(dim=0) <= 0.0).any():
+        raise ValueError("every stage must have positive total weight")
+
+    probability = 1.0 - alpha
+    quantiles = []
+    for time in range(scores.shape[1]):
+        order = torch.argsort(scores[:, time], stable=True)
+        ordered_scores = scores[order, time]
+        ordered_weights = weights[order, time]
+        threshold = probability * ordered_weights.sum()
+        index = torch.searchsorted(
+            ordered_weights.cumsum(dim=0),
+            threshold,
+            right=False,
+        ).clamp_max(len(ordered_scores) - 1)
+        quantiles.append(ordered_scores[index])
+    return torch.stack(quantiles).clamp_min(torch.finfo(scores.dtype).eps)
+
+
+def transport_refined_stage_profile(
+    initial_quantiles: Tensor,
+    fold_initial_quantiles: Tensor,
+    fold_transported_quantiles: Tensor,
+    fold_effective_sizes: Tensor,
+    *,
+    refinement_strength: float,
+    maximum_profile_ratio: float,
+    minimum_effective_size: float,
+) -> tuple[Tensor, Tensor]:
+    """Apply one regularized OOF transport correction to the stage shape.
+
+    Corrections are learned on patient-held-out folds of ``D_COT``.  A global
+    log shift is removed because it belongs to the subsequently certified
+    scalar, while a trust region limits the relative change in stage shape.
+    """
+
+    if initial_quantiles.ndim != 1:
+        raise ValueError("initial_quantiles must have shape [T]")
+    expected = fold_initial_quantiles.shape
+    if (
+        fold_initial_quantiles.ndim != 2
+        or fold_transported_quantiles.shape != expected
+        or fold_effective_sizes.shape != expected
+        or expected[1] != len(initial_quantiles)
+    ):
+        raise ValueError("fold quantities must share shape [F,T]")
+    positive = bool((initial_quantiles > 0.0).all())
+    positive = positive and bool((fold_initial_quantiles > 0.0).all())
+    positive = positive and bool((fold_transported_quantiles > 0.0).all())
+    finite = all(
+        torch.isfinite(value).all()
+        for value in (
+            initial_quantiles,
+            fold_initial_quantiles,
+            fold_transported_quantiles,
+            fold_effective_sizes,
+        )
+    )
+    if not positive or not finite or bool((fold_effective_sizes < 0.0).any()):
+        raise ValueError("profile refinement inputs must be finite with positive quantiles")
+    if not 0.0 < refinement_strength <= 1.0:
+        raise ValueError("refinement_strength must lie in (0, 1]")
+    if maximum_profile_ratio <= 1.0 or minimum_effective_size <= 0.0:
+        raise ValueError("profile ratio and minimum effective size must be valid")
+
+    fold_corrections = (fold_transported_quantiles / fold_initial_quantiles).log()
+    eligible_weights = torch.where(
+        fold_effective_sizes >= minimum_effective_size,
+        fold_effective_sizes,
+        torch.zeros_like(fold_effective_sizes),
+    )
+    weight_sum = eligible_weights.sum(dim=0)
+    mean_correction = (
+        (eligible_weights * fold_corrections).sum(dim=0)
+        / weight_sum.clamp_min(1e-12)
+    )
+    mean_correction = torch.where(weight_sum > 0.0, mean_correction, torch.zeros_like(mean_correction))
+
+    active = weight_sum > 0.0
+    center = mean_correction[active].mean() if bool(active.any()) else mean_correction.new_zeros(())
+    applied = torch.where(
+        active,
+        refinement_strength * (mean_correction - center),
+        torch.zeros_like(mean_correction),
+    )
+    span = applied.max() - applied.min()
+    maximum_span = math.log(maximum_profile_ratio)
+    if float(span.item()) > maximum_span:
+        applied = applied * (maximum_span / span)
+    refined_quantiles = initial_quantiles * applied.exp()
+    return _unit_geometric_mean(refined_quantiles), applied
+
+
+def profiled_local_scale_grid(
+    scores: Tensor,
+    profile: Tensor,
+    *,
+    size: int,
+    lower_quantile: float,
+    upper_quantile: float,
+    anchor_scale: float | Tensor,
+    focus_fraction: float,
+    focus_radius: float,
+) -> Tensor:
+    """Freeze a broad guarded grid with dense knots near a D_COT anchor."""
+
+    if size < 3:
+        raise ValueError("local scale grid needs at least three candidates")
+    if not 0.0 < focus_fraction < 1.0 or focus_radius <= 0.0:
+        raise ValueError("grid focus settings must be positive and nondegenerate")
+    if not 0.0 <= lower_quantile < upper_quantile <= 1.0:
+        raise ValueError("grid quantiles must lie in [0, 1] and be ordered")
+    if 2.0 * focus_radius >= upper_quantile - lower_quantile:
+        raise ValueError("grid focus radius is too large for the quantile range")
+    if scores.ndim != 2 or len(scores) == 0 or profile.shape != (scores.shape[1],):
+        raise ValueError("scores and profile must have shapes [N,T] and [T]")
+    if not torch.isfinite(scores).all() or (scores < 0.0).any():
+        raise ValueError("grid scores must be finite and nonnegative")
+    if not torch.isfinite(profile).all() or (profile <= 0.0).any():
+        raise ValueError("profile must be finite and positive")
+    anchor = torch.as_tensor(anchor_scale, device=scores.device, dtype=scores.dtype)
+    if anchor.ndim != 0 or not bool(torch.isfinite(anchor)) or float(anchor.item()) <= 0.0:
+        raise ValueError("anchor_scale must be finite and positive")
+
+    normalized = (scores / profile.to(scores)[None, :]).reshape(-1)
+    anchor_probability = (normalized <= anchor).to(scores.dtype).mean()
+    focus_low = float(
+        (anchor_probability - focus_radius).clamp(lower_quantile, upper_quantile).item()
+    )
+    focus_high = float(
+        (anchor_probability + focus_radius).clamp(lower_quantile, upper_quantile).item()
+    )
+    if focus_high <= focus_low:
+        midpoint = min(max(float(anchor_probability.item()), lower_quantile), upper_quantile)
+        focus_low = max(lower_quantile, midpoint - focus_radius)
+        focus_high = min(upper_quantile, midpoint + focus_radius)
+
+    focus_count = min(size - 2, max(1, round(size * focus_fraction)))
+    guard_count = size - focus_count
+    lower_count = guard_count // 2
+    upper_count = guard_count - lower_count
+    lower = torch.linspace(lower_quantile, focus_low, lower_count + 1, device=scores.device)[:-1]
+    focus = (
+        torch.tensor([(focus_low + focus_high) / 2.0], device=scores.device)
+        if focus_count == 1
+        else torch.linspace(focus_low, focus_high, focus_count, device=scores.device)
+    )
+    upper = torch.linspace(focus_high, upper_quantile, upper_count + 1, device=scores.device)[1:]
+    probabilities = torch.cat((lower, focus, upper)).to(scores)
+    return torch.quantile(normalized, probabilities)
+
+
+def _unit_geometric_mean(values: Tensor) -> Tensor:
+    positive = values.clamp_min(torch.finfo(values.dtype).eps)
+    return positive / positive.log().mean().exp()
 
 
 def profiled_scale_grid(

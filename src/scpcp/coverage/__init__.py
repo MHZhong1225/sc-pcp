@@ -8,11 +8,15 @@ from scpcp.coverage.per_step import (
     estimate_oracle_surface,
     fixed_q_grid,
     per_step_oracle_metrics,
+    profiled_local_scale_grid,
     profiled_scale_grid,
     response_operator,
     self_normalized_dcov_surface,
     self_normalized_diagonal_coverage_estimates,
     stage_score_profile,
+    stage_score_quantiles,
+    transport_refined_stage_profile,
+    weighted_stage_score_quantiles,
 )
 
 __all__ = [
@@ -25,9 +29,13 @@ __all__ = [
     "estimate_oracle_surface",
     "fixed_q_grid",
     "per_step_oracle_metrics",
+    "profiled_local_scale_grid",
     "profiled_scale_grid",
     "response_operator",
     "self_normalized_dcov_surface",
     "self_normalized_diagonal_coverage_estimates",
     "stage_score_profile",
+    "stage_score_quantiles",
+    "transport_refined_stage_profile",
+    "weighted_stage_score_quantiles",
 ]

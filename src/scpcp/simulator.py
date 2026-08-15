@@ -409,9 +409,18 @@ class EmpiricalTransitionEnvironment:
         # avoids fitting a transition/outcome model on data that must remain
         # external to SC-PCP calibration.
         rank = min(embedding_dim, batch.state_dim, max(1, normalized.shape[0]))
-        covariance = normalized.T @ normalized / max(1, normalized.shape[0] - 1)
+        # Clinical history stacks contain many nearly collinear coordinates.
+        # LAPACK's single-precision symmetric eigensolver can then either fail
+        # to converge or silently return NaNs.  Compute only this small frozen
+        # PCA fit in double precision and cast its basis back for rollouts.
+        normalized_for_pca = normalized.to(torch.float64)
+        covariance = (
+            normalized_for_pca.T @ normalized_for_pca
+            / max(1, normalized.shape[0] - 1)
+        )
+        covariance = (covariance + covariance.T) / 2.0
         _, eigenvectors = torch.linalg.eigh(covariance)
-        self.embedding = eigenvectors[:, -rank:].contiguous()
+        self.embedding = eigenvectors[:, -rank:].to(normalized.dtype).contiguous()
         embedded_current = (normalized @ self.embedding).reshape(
             batch.n,
             batch.horizon,

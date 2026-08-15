@@ -37,7 +37,7 @@ def main() -> None:
     )
     parser.add_argument("--datasets", default=",".join(CONFIGS), help="RQ1 datasets")
     parser.add_argument("--devices", default="cuda:0,cuda:1")
-    parser.add_argument("--output-root", type=Path, default=Path("results/work/paper_v2"))
+    parser.add_argument("--output-root", type=Path, default=Path("results/work/paper_final"))
     args = parser.parse_args()
 
     sections = _parse_choices(args.sections, {"rq1", "rq3"})
@@ -50,8 +50,8 @@ def main() -> None:
             raise FileExistsError(f"paper-suite output already contains files: {root}")
     (root / "rq1").mkdir(parents=True, exist_ok=True)
     manifest = {
-        "protocol": "four_rq_paper_protocol",
-        "method": "profiled_scale_ordered_iut_scpcp",
+        "protocol": "transport_refined_four_rq_paper_protocol",
+        "method": "transport_refined_profiled_scale_ordered_iut_scpcp",
         "experiment_tree_sha256": experiment_tree_sha256(),
         "sections": sections,
         "datasets": datasets,

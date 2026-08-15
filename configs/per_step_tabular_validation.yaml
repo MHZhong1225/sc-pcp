@@ -24,6 +24,14 @@ cot:
   weight_cap: 1.22
   q_samples_per_batch: 4
   loss: huber
+profile:
+  refinement_folds: 3
+  refinement_strength: 0.5
+  maximum_profile_ratio: 1.25
+  minimum_effective_size: 25.0
+  maximum_cap_hit_rate: 0.01
+  grid_focus_fraction: 0.80
+  grid_focus_radius: 0.075
 samples:
   logged: 10000
   oracle_rollouts: 50000

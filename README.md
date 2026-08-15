@@ -1,6 +1,6 @@
 # SC-PCP：逐阶段 Performative Coverage
 
-本仓库实现一套正式方法：**profiled-scale ordered-IUT SC-PCP**。它面向 prediction set 会反过来改变治疗策略、后续状态与结局分布的顺序决策问题，并要求最终部署策略诱导的每个阶段都达到覆盖目标：
+本仓库实现一套正式方法：**transport-refined profiled-scale ordered-IUT SC-PCP**。它面向 prediction set 会反过来改变治疗策略、后续状态与结局分布的顺序决策问题，并要求最终部署策略诱导的每个阶段都达到覆盖目标：
 
 \[
 \min_{0\le t<T}
@@ -9,11 +9,11 @@ P_{P_{\widehat s}}
 \ge 1-\alpha.
 \]
 
-旧的 shared-scalar radius、full-grid max-\(t\) selector 和 \(K\times T\times K\) DCov surface 不属于主方法，也不进入正式结果。完整定义见 [`docs/final_method.md`](docs/final_method.md)，冻结的实验协议见 [`docs/per_step_protocol.md`](docs/per_step_protocol.md)。
+旧的 shared-scalar radius、full-grid max-\(t\) selector 和 \(K\times T\times K\) DCov surface 不属于主方法，也不进入正式结果。完整定义见 [`docs/final_method.md`](docs/final_method.md)，对照方法和冻结设置见 [`docs/baselines_and_settings.md`](docs/baselines_and_settings.md)。
 
 ## 方法概览
 
-SC-PCP 不直接搜索一个任意的 \(T\) 维半径向量。它先在独立的 \(D_{\rm COT}\) 上，从逐阶段 normalized-max scores 得到正的阶段轮廓
+SC-PCP 不直接搜索一个任意的 \(T\) 维半径向量。它先在独立的 \(D_{\rm COT}\) 上得到 logged stage quantiles，再在同一个数据角色内部做患者级三折 cross-fitting：每折只在训练患者上拟合一个 pilot COT，并在 held-out 患者上估计该 pilot schedule 的 target-policy stage quantiles。有效样本量不足或 weight-cap hit rate 超阈值的 fold-stage 不参与更新；其余 log-quantile corrections 经一次预先规定的 0.5 under-relaxation，并限制最大与最小相对修正之比不超过 1.25。最终得到正的阶段轮廓
 
 \[
 b=(b_0,\ldots,b_{T-1}),
@@ -26,6 +26,8 @@ b=(b_0,\ldots,b_{T-1}),
 \[
 \boxed{q_t(s)=s b_t.}
 \]
+
+这里没有再切一个顶层数据集：shape 完全由 \(D_{\rm COT}\) 的 out-of-fold evidence 学习，而安全仍由 untouched \(D_{\rm cert}\) 负责。最终 profile 确定后，代码在全 \(D_{\rm COT}\) 上从头重训 COT；旧 profile 的 transport heads 不会被复用。候选 grid 保留 0.50 和 0.999 empirical-quantile guards，并把 80% 的 101 个 knots 放到 pilot anchor 附近，以减少认证边界处的离散 overshoot。
 
 这保留了阶段难度差异，同时把最终选择限制为一个预先冻结的一维候选族。每个候选尺度都完成以下闭环：
 
@@ -54,7 +56,7 @@ b=(b_0,\ldots,b_{T-1}),
 | Role | 用途 |
 | --- | --- |
 | \(D_{\rm pred}\) | 拟合并冻结 outcome mean/scale model 与 behavior nuisance；两者分别读取结局与动作标签 |
-| \(D_{\rm COT}\) | 冻结 stage profile 和 scale grid；训练并校准 COT |
+| \(D_{\rm COT}\) | 患者级 cross-fit 学习 transport-refined profile；冻结 focused scale grid；在全角色上重训并校准 final COT |
 | \(D_{\rm cert}\) | 计算 coverage evidence、候选宽度并选择最终尺度 |
 | \(D_{\rm env}\) | 只建立 clinical controlled evaluator，不参与选择 |
 
@@ -68,14 +70,14 @@ b=(b_0,\ldots,b_{T-1}),
 | --- | --- |
 | `Standard CP` | 固定历史分布的逐阶段 split conformal baseline |
 | `ACI stagewise adaptation` | 使用额外 on-policy trajectories 的阶段式在线适应 baseline |
-| `MFCS task-adapted` | 适配本任务 score 与冻结 profile family 的有限深度 feedback baseline |
+| `MFCS task-adapted` | 使用 logged-data profile family 的有限深度 feedback baseline |
 | `MultiDimSPCI task-adapted` | 使用额外 on-policy trajectories 的多结局在线适应 baseline |
-| `PRC grid-adapted` | 在相同冻结 profile-scale grid 上运行的 on-policy PRC adapter |
-| `SC-PCP` | 本文方法：marginal COT + profiled global scale + ordered-IUT |
+| `PRC grid-adapted` | 在 logged-data profile-scale grid 上运行的 on-policy PRC adapter |
+| `SC-PCP` | 本文方法：cross-fit transport-refined profile + marginal COT + ordered-IUT |
 
 `baselines/` 中的上游代码用于核对算法来源；无法直接处理本任务的二维 logged clinical trajectories 时，paper record 明确使用 `task-adapted` 或 `grid-adapted` 名称，不声称是未经修改的 native reproduction。主表同时展示六个方法，不只报告 SC-PCP；online baselines 的额外 adaptation budget 与 offline 方法的信息条件分开标注。
 
-## 完整 `paper_v2` 实验
+## 完整正式实验
 
 默认环境为 `ucp`，默认使用两张 GPU。下面的入口运行全部预设 RQ1 与 RQ3 作业；RQ2 和 RQ4 复用 manifest 中指定的冻结产物。它不是 smoke run：synthetic 主实验为 100 seeds，四个 clinical 数据集各 20 seeds，feedback stress 的每个额外 \(\beta\) 设置也使用 100 seeds。
 
@@ -84,15 +86,15 @@ conda run -n ucp python scripts/run_paper_suite.py \
   --sections rq1,rq3 \
   --datasets synthetic,mimic_iv,mimic_cxr,eicu,inspire \
   --devices cuda:0,cuda:1 \
-  --output-root results/work/paper_v2
+  --output-root results/work/paper_final
 ```
 
 runner 会拒绝写入非空 output root，并且只有全部预设 seed 完成后才写 `COMPLETE`。完整运行结束后生成论文主表和图：
 
 ```bash
 conda run -n ucp python tools/render_paper_results.py \
-  --input results/work/paper_v2 \
-  --output results/paper_v2
+  --input results/work/paper_final \
+  --output results/paper_final
 ```
 
 renderer 会 fail closed：缺少数据集、seed、六方法记录或 `COMPLETE` 标记时不会生成正式 PDF。输出包括 synthetic 主表、clinical 主表、逐阶段 coverage、feedback stress 和 self-consistent diagonal 机制图。
@@ -111,7 +113,7 @@ conda run -n ucp python scripts/run_per_step.py \
 conda run -n ucp python tools/summarize_tabular_validation.py \
   --input-root results/work/profiled_ordered_tabular_validation \
   --expected-seeds 0:200 \
-  --output results/paper_v2/tabular_theorem_validation
+  --output results/paper_final/tabular_theorem_validation
 ```
 
 旧的 scalar/max-\(t\) validation artifacts 会被 summarizer 明确拒绝，必须用当前唯一方法的配置重跑。
