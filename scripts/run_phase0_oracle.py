@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 import hashlib
 import json
@@ -190,7 +191,8 @@ def validate_seed_artifact(
         raise RuntimeError(f"seed {seed} metadata.json is unreadable: {error}") from error
     if not isinstance(metadata, dict):
         raise RuntimeError(f"seed {seed} metadata.json must contain an object")
-    if metadata.get("seed") != seed:
+    stored_seed = metadata.get("seed")
+    if type(stored_seed) is not int or stored_seed != seed:
         raise RuntimeError(f"seed {seed} metadata.json has the wrong seed ID")
     if (
         expected_source_hash is not None
@@ -206,7 +208,8 @@ def validate_seed_artifact(
 
     try:
         with np.load(seed_dir / "surfaces.npz", allow_pickle=False) as surfaces:
-            tuple(surfaces.files)
+            for name in surfaces.files:
+                np.asarray(surfaces[name])
     except (OSError, ValueError) as error:
         raise RuntimeError(f"seed {seed} surfaces.npz is unreadable: {error}") from error
 
@@ -226,13 +229,14 @@ def validate_seed_artifact(
             f"seed {seed} records.csv must contain exactly four primary rows: "
             "standard/tail_shift x Current Profiled Oracle/Greedy Sequential Oracle"
         )
-    try:
-        record_seeds = {int(record_seed) for record_seed in records["seed"]}
-    except (TypeError, ValueError) as error:
+    seed_column = records["seed"]
+    if pd.api.types.is_bool_dtype(seed_column.dtype) or not pd.api.types.is_integer_dtype(
+        seed_column.dtype
+    ):
         raise RuntimeError(
-            f"seed {seed} records.csv contains an invalid seed ID"
-        ) from error
-    if record_seeds != {seed}:
+            f"seed {seed} records.csv seed column must have integer dtype"
+        )
+    if not seed_column.eq(seed).all():
         raise RuntimeError(f"seed {seed} records.csv contains a different seed ID")
     return seed_dir
 
@@ -334,6 +338,29 @@ def _run_pending_seeds(
         config.devices,
         workers_per_device,
     )
+    job_calls = tuple(
+        (
+            worker_index,
+            (config, seed, device, output_dir, candidate_chunk_size),
+        )
+        for worker_index, seed, device in jobs
+    )
+    for result in _execute_jobs(
+        worker_devices,
+        job_calls,
+        worker_function=_run_and_write,
+    ):
+        print(result, flush=True)
+
+
+def _execute_jobs(
+    worker_devices: tuple[str, ...],
+    jobs: tuple[tuple[int, tuple[Any, ...]], ...],
+    *,
+    worker_function: Callable[..., Any],
+) -> tuple[Any, ...]:
+    """Execute picklable calls on persistent single-process spawn workers."""
+
     with ExitStack() as stack:
         executors = [
             stack.enter_context(
@@ -344,19 +371,11 @@ def _run_pending_seeds(
             )
             for _ in worker_devices
         ]
-        futures = {
-            executors[worker_index].submit(
-                _run_and_write,
-                config,
-                seed,
-                device,
-                output_dir,
-                candidate_chunk_size,
-            ): seed
-            for worker_index, seed, device in jobs
-        }
-        for future in as_completed(futures):
-            print(future.result(), flush=True)
+        futures = tuple(
+            executors[worker_index].submit(worker_function, *arguments)
+            for worker_index, arguments in jobs
+        )
+        return tuple(future.result() for future in futures)
 
 
 def _run_and_write(
@@ -366,7 +385,7 @@ def _run_and_write(
     output_dir: Path,
     candidate_chunk_size: int,
 ) -> str:
-    try:
+    def run_and_publish() -> str:
         result = run_phase0_seed(
             config,
             seed=seed,
@@ -376,8 +395,15 @@ def _run_and_write(
         seed_dir = write_seed_result(result, output_dir, config)
         validate_seed_artifact(seed_dir, seed)
         return str(seed_dir)
-    finally:
-        if device.startswith("cuda"):
+
+    if not device.startswith("cuda"):
+        return run_and_publish()
+    cuda_device = torch.device(device)
+    torch.cuda.set_device(cuda_device)
+    with torch.cuda.device(cuda_device):
+        try:
+            return run_and_publish()
+        finally:
             torch.cuda.empty_cache()
 
 

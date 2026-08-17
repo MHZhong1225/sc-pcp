@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+import io
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -24,6 +27,14 @@ EXPECTED_PRIMARY_ROWS = {
     ("tail_shift", "Current Profiled Oracle"),
     ("tail_shift", "Greedy Sequential Oracle"),
 }
+
+
+def _spawn_identity(value: int) -> tuple[int, int]:
+    return os.getpid(), value
+
+
+def _spawn_failure(_value: int) -> None:
+    raise RuntimeError("spawn probe failure")
 
 
 def _load_runner():
@@ -151,6 +162,85 @@ def test_cli_defaults_to_one_spawn_worker_per_gpu_and_chunk_16() -> None:
         (1, 3, "cuda:1"),
         (0, 4, "cuda:0"),
     )
+
+
+def test_real_spawn_executor_reuses_one_child_and_propagates_failures() -> None:
+    runner = _load_runner()
+    results = runner._execute_jobs(
+        ("cpu",),
+        ((0, (11,)), (0, (12,))),
+        worker_function=_spawn_identity,
+    )
+
+    assert [value for _, value in results] == [11, 12]
+    assert len({pid for pid, _ in results}) == 1
+
+    with pytest.raises(RuntimeError, match="spawn probe failure"):
+        runner._execute_jobs(
+            ("cpu",),
+            ((0, (13,)),),
+            worker_function=_spawn_failure,
+        )
+
+
+def test_cuda_worker_pins_device_before_oracle_and_cleans_same_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    events: list[tuple[str, ...]] = []
+
+    class DeviceContext:
+        def __init__(self, device: torch.device) -> None:
+            self.device = str(device)
+
+        def __enter__(self) -> None:
+            events.append(("enter", self.device))
+
+        def __exit__(self, *_args: object) -> None:
+            events.append(("exit", self.device))
+
+    class FakeCuda:
+        def set_device(self, device: torch.device) -> None:
+            events.append(("set_device", str(device)))
+
+        def device(self, device: torch.device) -> DeviceContext:
+            events.append(("device_context", str(device)))
+            return DeviceContext(device)
+
+        def empty_cache(self) -> None:
+            events.append(("empty_cache",))
+
+    def fail_after_pin(
+        _config: ExperimentConfig,
+        *,
+        seed: int,
+        device: str,
+        candidate_chunk_size: int,
+    ) -> None:
+        assert (seed, candidate_chunk_size) == (3, 5)
+        events.append(("oracle", device))
+        raise RuntimeError("oracle failed")
+
+    monkeypatch.setattr(runner.torch, "cuda", FakeCuda())
+    monkeypatch.setattr(runner, "run_phase0_seed", fail_after_pin)
+    config = ExperimentConfig(
+        seeds=(3,),
+        devices=("cuda:1",),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="oracle failed"):
+        runner._run_and_write(config, 3, "cuda:1", tmp_path, 5)
+
+    assert events == [
+        ("set_device", "cuda:1"),
+        ("device_context", "cuda:1"),
+        ("enter", "cuda:1"),
+        ("oracle", "cuda:1"),
+        ("empty_cache",),
+        ("exit", "cuda:1"),
+    ]
 
 
 def test_config_hash_is_canonical_across_yaml_key_order() -> None:
@@ -368,6 +458,7 @@ def test_complete_marker_is_insufficient_without_exact_four_row_contract(
         "metadata_shape",
         "bad_surfaces",
         "bad_seed",
+        "truncated_member",
         "seed_source",
         "seed_config",
     ],
@@ -390,8 +481,13 @@ def test_partial_or_malformed_seed_is_actionable_and_never_replaced(
         (seed_dir / "surfaces.npz").write_text("not an npz")
     elif failure == "bad_seed":
         records = pd.read_csv(seed_dir / "records.csv")
-        records["seed"] = "wrong"
+        records["seed"] = 0.5
         records.to_csv(seed_dir / "records.csv", index=False)
+    elif failure == "truncated_member":
+        member = io.BytesIO()
+        np.save(member, np.arange(4))
+        with zipfile.ZipFile(seed_dir / "surfaces.npz", "w") as archive:
+            archive.writestr("truncated.npy", member.getvalue()[:-8])
     elif failure in {"seed_source", "seed_config"}:
         metadata = json.loads((seed_dir / "metadata.json").read_text())
         if failure == "seed_source":
@@ -430,6 +526,49 @@ def test_partial_or_malformed_seed_is_actionable_and_never_replaced(
 
     assert sorted(path.name for path in seed_dir.iterdir()) == before
     assert completed_calls == []
+
+
+@pytest.mark.parametrize(
+    ("expected_seed", "stored_seed"),
+    [(1, True), (0, 0.0)],
+)
+def test_resume_rejects_non_integer_json_metadata_seed_before_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_seed: int,
+    stored_seed: object,
+) -> None:
+    runner = _load_runner()
+    output = tmp_path / f"metadata-{expected_seed}-{stored_seed}"
+    config, _ = _run_fake_study(
+        runner,
+        monkeypatch,
+        output,
+        seeds=(expected_seed,),
+    )
+    seed_dir = output / f"seed_{expected_seed:05d}"
+    (output / "COMPLETE").unlink()
+    metadata_path = seed_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["seed"] = stored_seed
+    metadata_path.write_text(json.dumps(metadata))
+    completion_calls: list[tuple[int, ...]] = []
+    monkeypatch.setattr(
+        runner,
+        "mark_study_complete",
+        lambda _output, seeds: completion_calls.append(seeds),
+    )
+
+    with pytest.raises(RuntimeError, match=f"seed {expected_seed}"):
+        runner.run_config(
+            config,
+            output,
+            workers_per_device=1,
+            candidate_chunk_size=7,
+            resume=True,
+        )
+
+    assert completion_calls == []
 
 
 def test_suite_complete_is_published_only_after_all_100_seeds_revalidate(
