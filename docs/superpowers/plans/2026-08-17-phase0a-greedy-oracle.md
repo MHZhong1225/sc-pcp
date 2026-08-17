@@ -678,7 +678,16 @@ git commit -m "test: add greedy finite-mdp sanity diagnostic"
 
 - [ ] **Step 1: Write synthetic pass/fail fixtures**
 
-Test every gate independently, incomplete/malformed artifacts, selection conditioning labels, deterministic paired bootstrap, and the all-or-nothing decision.
+Test every gate independently, incomplete/malformed artifacts, selection conditioning labels, deterministic paired bootstrap, and the all-or-nothing decision. Validation fails closed before publishing any report unless all of the following hold:
+
+- root `COMPLETE`, complete `study_status.json`, `study_metadata.json`, and the frozen `config.yaml` all agree on seeds `0..99`, source/config/experiment hashes, devices, worker count, and chunk size;
+- exactly 100 seed directories and 400 unique primary rows exist, with the exact two-scenario/two-method balance and no partial or unexpected seed path;
+- every seed passes the runner's deep artifact validator, selected rows have six finite length-12 vectors and 50,000 final rollouts, unavailable rows have empty vectors/NaN widths/zero final rollouts, and selected widths are finite and strictly positive;
+- within each `(seed,scenario)`, the two methods share tuning/evaluation stream IDs, tuning differs from evaluation, all scenario tuning streams and evaluation streams are internally unique, and the two stream sets are disjoint;
+- fixed-length selected rows satisfy micro width, mean stage width, and patient width equality to numerical tolerance;
+- selected primary schedules agree with NPZ surfaces, common-grid NPZ fields agree with metadata diagnostics, and the reduced finite-MDP sanity artifact is valid and explicitly non-gating.
+
+Malformed vectors, non-integral seed identities, corrupted NPZ members, stream collisions, and common-grid disagreements are artifact errors rather than missing observations.
 
 - [ ] **Step 2: Implement the pre-registered coverage band**
 
@@ -691,9 +700,22 @@ lower = mean - critical * sample_sd / math.sqrt(n_selected)
 
 Label it `seed_mean_bonferroni_t_lcb`, report `n_selected`, and never substitute the seed-level Wilson diagnostic.
 
+Coverage is explicitly `conditional_on_successful_selection`; selection rates always use all 100 seeds. Report these four non-interchangeable diagnostics so the prior worst/per-step ambiguity cannot recur:
+
+```text
+minimum_stage_seed_mean_coverage      = min_t mean_s C[s,t]
+minimum_stage_seed_mean_simultaneous_lcb = min_t L[t]   # gate
+mean_seed_minimum_stage_coverage      = mean_s min_t C[s,t]
+minimum_seed_stage_coverage           = min_{s,t} C[s,t]
+```
+
+If fewer than two schedules are selected, the seed-mean interval is unavailable and its gate fails.
+
 - [ ] **Step 3: Implement paired width inference**
 
-On seeds where both methods select, compute the geometric mean ratio from log ratios. Use exactly 10,000 paired seed bootstrap resamples with fixed seed `2_718_281`; record percentile 95% endpoints. Report endpoint/no-feasible rates and common-grid sensitivity separately.
+On seeds where both methods select, sort by seed and compute the geometric mean ratio from the per-seed log width ratios. Use exactly 10,000 paired seed bootstrap resamples with a fresh `np.random.default_rng(2_718_281)` per named comparison; use the same resampled seed-index matrix for micro and patient ratios and record linear-percentile 95% endpoints. Never add an epsilon, impute a selection failure, or bootstrap numerator and denominator independently. Report `n_paired`; fewer than two pairs makes the interval and corresponding gate unavailable. Report endpoint/no-feasible rates and common-grid sensitivity separately.
+
+Lock these numerical fixtures (with tight approximate tolerances): ratios `[0.8,0.9,1.1,1.2]` give geometric mean `0.9873624504488285` and the specified RNG gives a 10,000-resample interval approximately `[0.8239068576,1.1489125293]`. A five-seed coverage fixture `[.89,.90,.91,.92,.93]` with `T=12` gives a Bonferroni-t LCB approximately `0.8756981903`.
 
 - [ ] **Step 4: Encode the gate literally**
 
@@ -709,6 +731,8 @@ and greedy_selection_count >= 95
 
 `standard` additionally requires all greedy stage LCBs `>=0.90` and geometric mean micro ratio `<=1.02`. Any false or unavailable condition yields `NO_GO`; never round before comparison.
 
+Persist the seven primitive gates separately: five tail-shift conditions and two standard conditions. `GO` is their all-or-nothing conjunction. Test strict/non-strict boundary operators, 95 versus 94 selections, and a case whose ratio point estimate passes while its bootstrap upper endpoint fails.
+
 - [ ] **Step 5: Write durable outputs**
 
 Create atomically in the experiment root:
@@ -716,9 +740,31 @@ Create atomically in the experiment root:
 - `phase0_summary.csv`
 - `phase0_decision.json`
 - `phase0_radius_and_coverage.pdf`
+- `phase0_radius_and_coverage.svg`
+- `phase0_radius_and_coverage.png`
 - `phase0_summary.md`
 
 The report says either `GO` or `NO_GO`, never “SOTA”. It may call a result better only when the frozen gate passes.
+
+The long-form CSV is the figure source data and records analysis role, scenario, method/comparator, stage, metric, estimate/interval, total/selected/paired counts, conditioning, interval method, threshold/operator, and unrounded pass state. Common-grid comparisons remain sensitivity-only: report their selection/boundary rates, stagewise coverage band, Greedy/common-grid ratios, and common-grid/exact-current ratios, each with its own paired count.
+
+**Figure contract (Python/matplotlib only):**
+
+```text
+Core conclusion: Determine whether Greedy Sequential Oracle reduces tail-shift width
+  while retaining simultaneous stagewise coverage; expose a failed gate plainly.
+Archetype: quantitative grid, double-column 183 x 120 mm.
+Hero panel: tail-shift per-stage seed mean coverage and simultaneous LCB.
+Validation: width-ratio forest; standard per-stage coverage.
+Robustness/audit: selected q_t profiles; selection and endpoint rates; common-grid sensitivity.
+Statistics: n=100 seeds, selected/paired counts, Bonferroni-t stage LCB,
+  paired 10,000-resample percentile CI.
+Exports: editable-text SVG/PDF plus PNG preview, all drawn and QA-rendered in Python.
+Reviewer risk: never conflate mean curve, mean seedwise minimum, raw minimum, or LCB;
+  show the 0.90 target, conditioning, and all selection denominators.
+```
+
+Use Current Profiled Oracle in neutral gray, Greedy in blue, and common-grid sensitivity in muted gold. Green/red is reserved for small gate markers. Coverage panels share a scale that includes 0.90; solid lines are seed means and dashed lines are simultaneous LCBs. The title is the literal `GO` or `NO_GO`, not a performance slogan. PDF text uses Type 42; visually inspect the final-size render for overlap, legibility, and honest axes.
 
 - [ ] **Step 6: Verify and commit**
 
