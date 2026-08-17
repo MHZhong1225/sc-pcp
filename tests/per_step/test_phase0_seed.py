@@ -279,6 +279,7 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
     grid_calls: list[tuple[torch.Tensor, int, float, float]] = []
     bundle_calls: list[tuple[int, int, int, str]] = []
     tuning_calls: list[tuple[str, str, object]] = []
+    chunk_sizes: list[int] = []
     candidate_evaluation_counts = {"standard": 0, "tail_shift": 0}
     validated_scenarios: list[str] = []
     evaluation_calls: list[
@@ -350,6 +351,7 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
         noise: object,
         chunk_size: int,
     ) -> phase0_oracle.CandidateMetrics:
+        chunk_sizes.append(chunk_size)
         scenario = environment.scenario
         candidate_evaluation_counts[scenario] += 1
         call_kind = (
@@ -392,6 +394,7 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
         target: float,
         chunk_size: int,
     ) -> phase0_oracle.OracleScheduleResult:
+        chunk_sizes.append(chunk_size)
         tuning_calls.append((environment.scenario, "greedy", noise))
         if environment.scenario == "tail_shift":
             return phase0_oracle.OracleScheduleResult(
@@ -471,6 +474,7 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
         config,
         seed=17,
         device="cpu",
+        candidate_chunk_size=7,
     )
 
     assert result.seed == 17
@@ -567,6 +571,7 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
             assert set(schedules) == {"profiled"}
 
     assert len(grid_calls) == 6
+    assert chunk_sizes == [7, 7, 7, 7, 7, 7]
     for scenario_index, scenario in enumerate(("standard", "tail_shift")):
         first = 3 * scenario_index
         assert torch.equal(grid_calls[first][0], scores[scenario][:, 0])
@@ -684,3 +689,24 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
     assert tail_common["n_rollouts"] == 0
     assert result.diagnostics["standard"]["tuning_seed"] == 18_300_052
     assert result.diagnostics["tail_shift"]["evaluation_seed"] == 18_400_053
+
+
+def test_phase0_seed_rejects_nonpositive_candidate_chunk_before_context_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_calls: list[str] = []
+    monkeypatch.setattr(
+        phase0_oracle,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work_calls.append("prepare_context"),
+    )
+
+    with pytest.raises(ValueError, match="candidate_chunk_size must be positive"):
+        phase0_oracle.run_phase0_seed(
+            ExperimentConfig(),
+            seed=17,
+            device="cpu",
+            candidate_chunk_size=0,
+        )
+
+    assert work_calls == []

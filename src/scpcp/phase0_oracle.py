@@ -509,9 +509,12 @@ def run_phase0_seed(
     *,
     seed: int,
     device: str,
+    candidate_chunk_size: int = 16,
 ) -> SeedResult:
     """Build the paired standard/tail-shift oracle result for one base seed."""
 
+    if candidate_chunk_size < 1:
+        raise ValueError("candidate_chunk_size must be positive")
     if config.data.dataset != "synthetic":
         raise ValueError("run_phase0_seed requires data.dataset='synthetic'")
 
@@ -577,7 +580,7 @@ def run_phase0_seed(
             candidate_schedules=profiled_schedules,
             outcome_sd=context.outcome_sd,
             noise=tuning_noise,
-            chunk_size=16,
+            chunk_size=candidate_chunk_size,
         )
         profiled_selection = select_profiled_oracle_schedule(
             profiled_schedules,
@@ -591,7 +594,7 @@ def run_phase0_seed(
             candidate_schedules=common_profiled_schedules,
             outcome_sd=context.outcome_sd,
             noise=tuning_noise,
-            chunk_size=16,
+            chunk_size=candidate_chunk_size,
         )
         common_profiled_selection = select_profiled_oracle_schedule(
             common_profiled_schedules,
@@ -606,7 +609,7 @@ def run_phase0_seed(
             outcome_sd=context.outcome_sd,
             noise=tuning_noise,
             target=target,
-            chunk_size=16,
+            chunk_size=candidate_chunk_size,
         )
 
         frozen_schedules = {}

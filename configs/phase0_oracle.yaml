@@ -1,0 +1,52 @@
+data:
+  dataset: synthetic
+synthetic:
+  feedback_strength: 1.0
+  disease_treatment_effect: 0.75
+  toxicity_treatment_effect: 0.55
+policy:
+  tilt: 1.0
+  temperature: 1.0
+  action_costs: [0.0, 0.05, 0.10]
+  propensity_floor: 0.01
+  policy_ratio_cap: 10.0
+cot:
+  rho_cap: 4.0
+  weight_cap: 40.0
+  loss: huber
+profile:
+  refinement_folds: 3
+  refinement_strength: 0.5
+  maximum_profile_ratio: 1.25
+  minimum_effective_size: 25.0
+  maximum_cap_hit_rate: 0.01
+  grid_focus_fraction: 0.80
+  grid_focus_radius: 0.075
+certification:
+  alpha: 0.10
+  delta: 0.05
+  ratio_error_bound: 0.0
+  ratio_bound_source: none
+  ratio_delta: 0.0
+  practical_bootstrap_resamples: 2000
+samples:
+  logged: 5000
+  oracle_rollouts: 50000
+  oracle_surface_rollouts: 5000
+  online_rollouts: 2000
+baselines:
+  mfcs_depth: 3
+  aci_gamma: 0.01
+  multidim_buffer: 1000
+  online_rounds: 3
+  prc_maximum_step: 0.35
+paper:
+  save_mechanism_diagonal: false
+  mechanism_seed: 0
+horizon: 12
+q_grid_size: 101
+q_quantile_min: 0.50
+q_quantile_max: 0.999
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+devices: [cuda:0, cuda:1]
+output_dir: results/work/phase0a_profiled_vs_greedy
