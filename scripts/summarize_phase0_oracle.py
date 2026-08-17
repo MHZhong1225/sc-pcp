@@ -55,6 +55,13 @@ SCENARIOS = ("standard", "tail_shift")
 CURRENT = "Current Profiled Oracle"
 GREEDY = "Greedy Sequential Oracle"
 METHODS = (CURRENT, GREEDY)
+COVERAGE_LEGEND_ORDER = (
+    "Current mean",
+    "Current simultaneous LCB",
+    "Greedy mean",
+    "Greedy simultaneous LCB",
+    "0.90 target",
+)
 RECORD_COLUMNS = {
     "scenario",
     "method",
@@ -1588,24 +1595,45 @@ def _render_figure(analysis: dict[str, Any], output_base: Path) -> None:
     try:
         layout_engine = fig.get_layout_engine()
         if layout_engine is not None:
-            layout_engine.set(rect=(0.0, 0.08, 1.0, 0.78))
+            layout_engine.set(rect=(0.0, 0.08, 1.0, 0.74))
         coverage_limits = _coverage_limits(analysis)
         _coverage_panel(axes["A"], analysis, "tail_shift", colors, coverage_limits)
         _ratio_panel(axes["B"], analysis, colors)
         _coverage_panel(axes["C"], analysis, "standard", colors, coverage_limits)
         _radius_panel(axes["D"], analysis, colors)
         _selection_panel(axes["E"], analysis, colors)
+        coverage_handles: dict[str, Any] = {}
+        for panel in ("A", "C"):
+            handles, labels = axes[panel].get_legend_handles_labels()
+            for handle, label in zip(handles, labels):
+                coverage_handles.setdefault(label, handle)
+        coverage_labels = [
+            label for label in COVERAGE_LEGEND_ORDER if label in coverage_handles
+        ]
+        coverage_legend = fig.legend(
+            [coverage_handles[label] for label in coverage_labels],
+            coverage_labels,
+            ncol=len(coverage_labels),
+            loc="center",
+            bbox_to_anchor=(0.5, 0.865),
+            bbox_transform=fig.transFigure,
+            columnspacing=1.2,
+            handlelength=2.0,
+        )
+        coverage_legend.set_in_layout(False)
         for label, axis in axes.items():
             axis.text(-0.12, 1.02, label.lower(), transform=axis.transAxes, fontweight="bold", fontsize=8)
+        display_decision = "NO-GO" if analysis["decision"] == "NO_GO" else analysis["decision"]
         fig.suptitle(
-            analysis["decision"], y=0.985, fontsize=9, fontweight="bold", color="#272727"
+            display_decision, y=0.985, fontsize=9, fontweight="bold", color="#272727"
         )
         _draw_gate_strip(fig, analysis)
         fig.text(
             0.5,
             0.018,
+            "Panels a,c: dashed = seed-mean Bonferroni-t simultaneous LCB. "
             "Coverage/width conditional on selection; selection denominator = 100. "
-            "Dashed = seed-mean Bonferroni-t simultaneous LCB; CI = 10,000 paired-seed resamples.",
+            "CI = 10,000 paired-seed resamples.",
             ha="center",
             va="bottom",
             fontsize=5.2,
@@ -1638,7 +1666,7 @@ def _gate_strip_rows(analysis: dict[str, Any]) -> list[dict[str, Any]]:
             value = min(value)
         if type(value) is int:
             return str(value)
-        return f"{float(value):.3f}"
+        return f"{float(value):.4f}"
 
     rows = []
     for gate in analysis["gates"]:
@@ -1756,9 +1784,9 @@ def _coverage_panel(
             fontsize=5.5,
         )
     axis.axhline(0.90, color="#272727", lw=0.8, ls=":", label="0.90 target")
-    axis.set(xlim=(0.7, 12.3), ylim=limits, xlabel="Stage", ylabel="Fresh coverage", title=scenario)
+    title = {"tail_shift": "Tail shift", "standard": "Standard"}[scenario]
+    axis.set(xlim=(0.7, 12.3), ylim=limits, xlabel="Stage", ylabel="Fresh coverage", title=title)
     axis.set_xticks([1, 3, 6, 9, 12])
-    axis.legend(ncol=2, loc="lower left", bbox_to_anchor=(0.0, 0.12))
 
 
 def _ratio_panel(axis: Any, analysis: dict[str, Any], colors: dict[str, str]) -> None:
@@ -1808,7 +1836,7 @@ def _radius_panel(axis: Any, analysis: dict[str, Any], colors: dict[str, str]) -
         axis.plot(stages, result["mean"], color=color, ls=linestyle, lw=1.2, label=f"{label} (n={result['n_selected']})")
         if result["lower"] is not None:
             axis.fill_between(stages, result["lower"], result["upper"], color=color, alpha=0.12, linewidth=0)
-    axis.set(xlabel="Stage", ylabel="Selected radius $q_t$", title="tail_shift radii")
+    axis.set(xlabel="Stage", ylabel="Selected radius $q_t$", title="Tail-shift radii")
     axis.set_xticks([1, 3, 6, 9, 12])
     axis.legend(loc="best")
 

@@ -49,6 +49,13 @@ GATE_IDS = (
     "standard_stage_lcb",
     "standard_micro_ratio",
 )
+COVERAGE_LEGEND_LABELS = (
+    "Current mean",
+    "Current simultaneous LCB",
+    "Greedy mean",
+    "Greedy simultaneous LCB",
+    "0.90 target",
+)
 
 
 def _load_summary():
@@ -67,6 +74,39 @@ def _load_search_sanity():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _capture_rendered_figure(
+    summary,
+    analysis: dict[str, object],
+    output: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    real_close = summary.plt.close
+    captured = []
+    monkeypatch.setattr(summary.plt, "close", captured.append)
+    summary._render_figure(analysis, output)
+    monkeypatch.setattr(summary.plt, "close", real_close)
+    assert len(captured) == 1
+    return captured[0], real_close
+
+
+def _make_crowded_coverage(analysis: dict[str, object]) -> None:
+    for scenario_index, scenario in enumerate(SCENARIOS):
+        for method_index, method in enumerate(METHODS):
+            coverage = analysis["primary"][scenario][method]["coverage"]
+            mean = np.linspace(
+                0.925 + 0.004 * scenario_index + 0.002 * method_index,
+                0.950 - 0.002 * scenario_index + 0.001 * method_index,
+                12,
+            )
+            lower = mean - 0.006 - 0.001 * method_index
+            coverage["mean"] = mean.tolist()
+            coverage["lower"] = lower.tolist()
+            coverage["minimum_stage_seed_mean_coverage"] = float(mean.min())
+            coverage["minimum_stage_seed_mean_simultaneous_lcb"] = float(
+                lower.min()
+            )
 
 
 def _make_complete_study(
@@ -1169,6 +1209,112 @@ def test_figure_gate_strip_names_each_single_failed_gate(
     assert all(gate_id in svg for gate_id in GATE_IDS)
     assert failed_gate in svg
     assert "FAIL" in svg
+
+
+@pytest.mark.parametrize("decision", ["GO", "NO_GO"])
+def test_crowded_coverage_uses_one_shared_legend_above_every_axis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    summary = _load_summary()
+    study = tmp_path / f"crowded-{decision.lower()}"
+    _make_complete_study(study)
+    analysis = summary.load_validate_and_analyze(study)
+    _make_crowded_coverage(analysis)
+    analysis["gates"][0]["value"] = 0.90029
+    if decision == "NO_GO":
+        failed = next(
+            gate for gate in analysis["gates"] if gate["id"] == "tail_selection_count"
+        )
+        failed["value"] = 94
+        failed["passed"] = False
+    analysis["decision"] = decision
+
+    output = tmp_path / f"crowded-{decision.lower()}-figure"
+    fig, real_close = _capture_rendered_figure(
+        summary, analysis, output, monkeypatch
+    )
+    try:
+        coverage_axes = [axis for axis in fig.axes if axis.get_ylabel() == "Fresh coverage"]
+        assert len(coverage_axes) == 2
+        assert all(axis.get_legend() is None for axis in coverage_axes)
+        assert len(fig.legends) == 1
+        legend = fig.legends[0]
+        assert legend.get_in_layout() is False
+        assert legend._ncols == 5
+        assert tuple(text.get_text() for text in legend.get_texts()) == (
+            COVERAGE_LEGEND_LABELS
+        )
+
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        legend_box = legend.get_window_extent(renderer)
+        axis_boxes = [axis.get_window_extent(renderer) for axis in fig.axes]
+        assert legend_box.y0 >= max(box.y1 for box in axis_boxes)
+        assert all(not legend_box.overlaps(box) for box in axis_boxes)
+
+        assert fig._suptitle.get_text() == ("NO-GO" if decision == "NO_GO" else "GO")
+        titles = {axis.get_title() for axis in fig.axes}
+        assert {"Tail shift", "Standard", "Tail-shift radii"} <= titles
+        footer = next(
+            text.get_text() for text in fig.texts if "simultaneous LCB" in text.get_text()
+        )
+        assert footer.startswith(
+            "Panels a,c: dashed = seed-mean Bonferroni-t simultaneous LCB"
+        )
+        gate_row = next(
+            row for row in summary._gate_strip_rows(analysis) if row["id"] == "tail_stage_lcb"
+        )
+        assert "v=0.9003" in gate_row["detail"]
+
+        svg = output.with_suffix(".svg").read_text()
+        for label in COVERAGE_LEGEND_LABELS:
+            assert svg.count(label) == 1
+        assert "Tail shift" in svg
+        assert "Standard" in svg
+        assert "Tail-shift radii" in svg
+        assert "NO-GO" in svg if decision == "NO_GO" else "NO-GO" not in svg
+    finally:
+        real_close(fig)
+
+
+def test_shared_coverage_legend_omits_only_unavailable_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _load_summary()
+    study = tmp_path / "unavailable-coverage-handle"
+    _make_complete_study(study)
+    analysis = summary.load_validate_and_analyze(study)
+    for scenario in SCENARIOS:
+        analysis["primary"][scenario][METHODS[0]]["coverage"]["lower"] = None
+
+    output = tmp_path / "unavailable-coverage-handle-figure"
+    fig, real_close = _capture_rendered_figure(
+        summary, analysis, output, monkeypatch
+    )
+    try:
+        coverage_axes = [axis for axis in fig.axes if axis.get_ylabel() == "Fresh coverage"]
+        assert all(axis.get_legend() is None for axis in coverage_axes)
+        assert len(fig.legends) == 1
+        assert tuple(text.get_text() for text in fig.legends[0].get_texts()) == (
+            "Current mean",
+            "Greedy mean",
+            "Greedy simultaneous LCB",
+            "0.90 target",
+        )
+        svg = output.with_suffix(".svg").read_text()
+        assert "Current simultaneous LCB" not in svg
+        for label in (
+            "Current mean",
+            "Greedy mean",
+            "Greedy simultaneous LCB",
+            "0.90 target",
+        ):
+            assert svg.count(label) == 1
+    finally:
+        real_close(fig)
 
 
 def test_bundle_replace_failure_rolls_back_all_payloads_and_manifest(
