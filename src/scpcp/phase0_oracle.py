@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import NormalDist
 
 import torch
 from torch import Tensor
@@ -17,6 +18,16 @@ class CandidateMetrics:
 
 
 @dataclass(frozen=True)
+class FrozenOracleEvaluation:
+    coverage: Tensor
+    wilson_lower_bound: Tensor
+    normalized_width: Tensor
+    micro_normalized_width: float
+    patient_normalized_width: float
+    n_rollouts: int
+
+
+@dataclass(frozen=True)
 class OracleScheduleResult:
     radii: Tensor | None
     selected_indices: tuple[int, ...]
@@ -25,6 +36,25 @@ class OracleScheduleResult:
     selection_available: bool
     failure_stage: int | None
     selected_endpoint: bool
+
+
+def bonferroni_wilson_lower_bounds(
+    hits: Tensor,
+    *,
+    family_alpha: float = 0.05,
+) -> Tensor:
+    """Return one-sided Wilson lower bounds for patient-by-stage hits."""
+
+    n_rollouts, horizon = hits.shape
+    proportions = hits.float().mean(dim=0)
+    z = NormalDist().inv_cdf(1.0 - family_alpha / horizon)
+    denominator = 1.0 + z**2 / n_rollouts
+    center = proportions + z**2 / (2.0 * n_rollouts)
+    spread = z * torch.sqrt(
+        proportions * (1.0 - proportions) / n_rollouts
+        + z**2 / (4.0 * n_rollouts**2)
+    )
+    return (center - spread) / denominator
 
 
 def _repeat_over_candidates(values: Tensor, count: int) -> Tensor:
@@ -123,6 +153,63 @@ def evaluate_profiled_candidates_crn(
         coverage=torch.cat(coverage_chunks),
         normalized_width=torch.cat(width_chunks),
     )
+
+
+@torch.no_grad()
+def evaluate_frozen_schedules_crn(
+    environment: object,
+    policy: object,
+    outcome_model: object,
+    *,
+    schedules: dict[str, Tensor],
+    noise: SyntheticNoiseBundle,
+    outcome_sd: Tensor,
+) -> dict[str, FrozenOracleEvaluation]:
+    """Evaluate frozen schedules independently on one supplied CRN bundle."""
+
+    evaluations = {}
+    for name, schedule in schedules.items():
+        state = environment.initial_state_from_noise(noise)
+        stage_hits = []
+        stage_widths = []
+        patient_stage_widths = []
+        for stage, radius in enumerate(schedule.to(state)):
+            probabilities = policy.probabilities(state, radius)
+            actions = inverse_cdf_actions(probabilities, noise.action_uniform[stage])
+            next_state, outcomes = environment.step_from_noise(
+                state,
+                actions,
+                shared=noise.shared_normal[stage],
+                independent=noise.independent_normal[stage],
+                innovations=noise.innovation_normal[stage],
+                difficulty_uniform=noise.difficulty_uniform[stage],
+                contamination_uniform=noise.contamination_uniform[stage],
+            )
+            means, scales = outcome_model(state, actions)
+            scores = ((outcomes - means).abs() / scales).amax(dim=1)
+            stage_hits.append(scores <= radius)
+            normalized_width = (
+                2.0 * radius * scales / outcome_sd.to(scales)[None, :]
+            )
+            patient_width = normalized_width.mean(dim=1)
+            stage_widths.append(patient_width.mean())
+            patient_stage_widths.append(patient_width)
+            state = next_state
+
+        hits = torch.stack(stage_hits, dim=1)
+        widths = torch.stack(stage_widths)
+        patient_widths = torch.stack(patient_stage_widths, dim=1)
+        evaluations[name] = FrozenOracleEvaluation(
+            coverage=hits.float().mean(dim=0),
+            wilson_lower_bound=bonferroni_wilson_lower_bounds(hits),
+            normalized_width=widths,
+            micro_normalized_width=float(patient_widths.mean().item()),
+            patient_normalized_width=float(
+                patient_widths.mean(dim=1).mean().item()
+            ),
+            n_rollouts=len(noise.initial_normal),
+        )
+    return evaluations
 
 
 @torch.no_grad()
