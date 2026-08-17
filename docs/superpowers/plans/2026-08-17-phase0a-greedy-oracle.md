@@ -600,6 +600,7 @@ git commit -m "feat: add resumable phase0 GPU runner"
 **Files:**
 
 - Create: `src/scpcp/phase0_search.py`
+- Create: `scripts/run_phase0_search_sanity.py`
 - Create: `tests/per_step/test_phase0_search.py`
 
 - [ ] **Step 1: Write a tiny triangular counterexample**
@@ -624,12 +625,16 @@ def beam_schedule_search(..., *, beam_width: int): ...
 
 Only exact enumeration sets `true_optimality_gap`. Beam output must leave it `None` and use the phrase `best_found_gap`.
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 3: Run one pre-registered finite-grid diagnostic**
+
+`scripts/run_phase0_search_sanity.py` evaluates the existing finite-MDP environment on a reduced `T=4`, `K=5` D_COT-frozen grid. Enumerate all `5^4=625` schedules under one fixed tuning bundle, compare the Greedy Sequential schedule to the exact best feasible grid schedule, and atomically write `finite_mdp_sanity.json`. The JSON must label the result `exact_finite_grid_search`, state that the gap is relative only to the reduced frozen grid, and include coverage, width, chosen indices, and the true finite-grid gap. This diagnostic is run before the 100-seed launch and copied into the Phase 0 study root without entering the Go/No-Go gate.
+
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 /home/ubuntu/anaconda3/envs/ucp/bin/python -m pytest -q tests/per_step/test_phase0_search.py
 /home/ubuntu/anaconda3/envs/ucp/bin/python -m pytest -q
-git add src/scpcp/phase0_search.py tests/per_step/test_phase0_search.py
+git add src/scpcp/phase0_search.py scripts/run_phase0_search_sanity.py tests/per_step/test_phase0_search.py
 git commit -m "test: add greedy finite-mdp sanity diagnostic"
 ```
 
@@ -756,6 +761,14 @@ Use `superpowers:requesting-code-review`, rerun focused tests for each fix, then
 - [ ] **Step 1: Freeze provenance**
 
 Record clean Git revision, source-tree SHA-256, config SHA-256, CUDA/PyTorch versions, devices, chunk size, worker count, and all expected seeds in study metadata.
+
+Run the frozen reduced-grid sanity diagnostic and retain its output:
+
+```bash
+/home/ubuntu/anaconda3/envs/ucp/bin/python scripts/run_phase0_search_sanity.py \
+  --device cuda:0 \
+  --output results/work/phase0a_finite_mdp_sanity.json
+```
 
 - [ ] **Step 2: Launch 100 paired seeds**
 
