@@ -535,6 +535,7 @@ git commit -m "feat: orchestrate paired phase0 oracle seeds"
 
 **Files:**
 
+- Modify: `src/scpcp/phase0_oracle.py`
 - Create: `configs/phase0_oracle.yaml`
 - Create: `scripts/run_phase0_oracle.py`
 - Create: `tests/per_step/test_phase0_runner.py`
@@ -571,6 +572,8 @@ output_dir: results/work/phase0a_profiled_vs_greedy
 ```
 
 The runner constructs both scenarios with `dataclasses.replace`; do not duplicate the full config by scenario.
+
+Expose `candidate_chunk_size: int = 16` as a keyword-only `run_phase0_seed` argument, reject non-positive values before work, and pass it to exact-profiled, common-grid-profiled, and greedy tuning. The runner's CLI value must therefore change real execution rather than merely metadata.
 
 - [ ] **Step 3: Implement the runner**
 
