@@ -1595,7 +1595,7 @@ def _render_figure(analysis: dict[str, Any], output_base: Path) -> None:
     try:
         layout_engine = fig.get_layout_engine()
         if layout_engine is not None:
-            layout_engine.set(rect=(0.0, 0.08, 1.0, 0.74))
+            layout_engine.set(rect=(0.0, 0.08, 1.0, 0.68))
         coverage_limits = _coverage_limits(analysis)
         _coverage_panel(axes["A"], analysis, "tail_shift", colors, coverage_limits)
         _ratio_panel(axes["B"], analysis, colors)
@@ -1621,6 +1621,18 @@ def _render_figure(analysis: dict[str, Any], output_base: Path) -> None:
             handlelength=2.0,
         )
         coverage_legend.set_in_layout(False)
+        radius_handles, radius_labels = axes["D"].get_legend_handles_labels()
+        radius_legend = fig.legend(
+            radius_handles,
+            radius_labels,
+            ncol=len(radius_labels),
+            loc="center",
+            bbox_to_anchor=(0.5, 0.815),
+            bbox_transform=fig.transFigure,
+            columnspacing=1.4,
+            handlelength=2.0,
+        )
+        radius_legend.set_in_layout(False)
         for label, axis in axes.items():
             axis.text(-0.12, 1.02, label.lower(), transform=axis.transAxes, fontweight="bold", fontsize=8)
         display_decision = "NO-GO" if analysis["decision"] == "NO_GO" else analysis["decision"]
@@ -1838,7 +1850,6 @@ def _radius_panel(axis: Any, analysis: dict[str, Any], colors: dict[str, str]) -
             axis.fill_between(stages, result["lower"], result["upper"], color=color, alpha=0.12, linewidth=0)
     axis.set(xlabel="Stage", ylabel="Selected radius $q_t$", title="Tail-shift radii")
     axis.set_xticks([1, 3, 6, 9, 12])
-    axis.legend(loc="best")
 
 
 def _selection_panel(axis: Any, analysis: dict[str, Any], colors: dict[str, str]) -> None:

@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 import torch
 import yaml
+from matplotlib.transforms import Bbox
 
 from scpcp.artifacts import (
     experiment_tree_sha256,
@@ -55,6 +56,11 @@ COVERAGE_LEGEND_LABELS = (
     "Greedy mean",
     "Greedy simultaneous LCB",
     "0.90 target",
+)
+RADIUS_LEGEND_LABELS = (
+    "Current (n=100)",
+    "Greedy (n=100)",
+    "Common-grid (n=100)",
 )
 
 
@@ -107,6 +113,47 @@ def _make_crowded_coverage(analysis: dict[str, object]) -> None:
             coverage["minimum_stage_seed_mean_simultaneous_lcb"] = float(
                 lower.min()
             )
+
+
+def _use_formal_tail_radius_shape(analysis: dict[str, object]) -> None:
+    means = (
+        (
+            2.0320893764, 2.0225879514, 2.0184415221, 2.0069940960,
+            2.0064714372, 2.0066782498, 2.0116266680, 1.9961911988,
+            2.0005699420, 2.0118183100, 2.0157986653, 2.0028690279,
+        ),
+        (
+            1.9584856880, 1.9458727813, 1.9450540543, 1.9425704885,
+            1.9401616681, 1.9371263993, 1.9370309722, 1.9337607622,
+            1.9349528754, 1.9376884282, 1.9335585523, 1.9370600188,
+        ),
+        (
+            2.0393844748, 2.0298803675, 2.0256762576, 2.0142328846,
+            2.0137192249, 2.0139479816, 2.0188743055, 2.0034079647,
+            2.0077713418, 2.0191054070, 2.0230670941, 2.0101090086,
+        ),
+    )
+    radii = (
+        analysis["primary"]["tail_shift"][METHODS[0]]["radius"],
+        analysis["primary"]["tail_shift"][METHODS[1]]["radius"],
+        analysis["sensitivity"]["scenarios"]["tail_shift"][
+            "common_grid_profiled"
+        ]["radius"],
+    )
+    for radius, values, half_width in zip(radii, means, (0.014, 0.011, 0.014)):
+        radius["mean"] = list(values)
+        radius["lower"] = [value - half_width for value in values]
+        radius["upper"] = [value + half_width for value in values]
+        radius["n_selected"] = 100
+
+
+def _collection_window_extent(collection) -> Bbox:
+    return Bbox.union(
+        [
+            path.get_extents(collection.get_transform())
+            for path in collection.get_paths()
+        ]
+    )
 
 
 def _make_complete_study(
@@ -1239,8 +1286,13 @@ def test_crowded_coverage_uses_one_shared_legend_above_every_axis(
         coverage_axes = [axis for axis in fig.axes if axis.get_ylabel() == "Fresh coverage"]
         assert len(coverage_axes) == 2
         assert all(axis.get_legend() is None for axis in coverage_axes)
-        assert len(fig.legends) == 1
-        legend = fig.legends[0]
+        assert len(fig.legends) == 2
+        legend = next(
+            item
+            for item in fig.legends
+            if tuple(text.get_text() for text in item.get_texts())
+            == COVERAGE_LEGEND_LABELS
+        )
         assert legend.get_in_layout() is False
         assert legend._ncols == 5
         assert tuple(text.get_text() for text in legend.get_texts()) == (
@@ -1297,8 +1349,13 @@ def test_shared_coverage_legend_omits_only_unavailable_handles(
     try:
         coverage_axes = [axis for axis in fig.axes if axis.get_ylabel() == "Fresh coverage"]
         assert all(axis.get_legend() is None for axis in coverage_axes)
-        assert len(fig.legends) == 1
-        assert tuple(text.get_text() for text in fig.legends[0].get_texts()) == (
+        assert len(fig.legends) == 2
+        coverage_legend = next(
+            item
+            for item in fig.legends
+            if "0.90 target" in tuple(text.get_text() for text in item.get_texts())
+        )
+        assert tuple(text.get_text() for text in coverage_legend.get_texts()) == (
             "Current mean",
             "Greedy mean",
             "Greedy simultaneous LCB",
@@ -1313,6 +1370,62 @@ def test_shared_coverage_legend_omits_only_unavailable_handles(
             "0.90 target",
         ):
             assert svg.count(label) == 1
+    finally:
+        real_close(fig)
+
+
+def test_formal_radius_legend_is_outside_all_data_axes_and_radius_artists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _load_summary()
+    study = tmp_path / "formal-radius-legend"
+    _make_complete_study(study)
+    analysis = summary.load_validate_and_analyze(study)
+    _use_formal_tail_radius_shape(analysis)
+
+    output = tmp_path / "formal-radius-legend-figure"
+    fig, real_close = _capture_rendered_figure(
+        summary, analysis, output, monkeypatch
+    )
+    try:
+        radius_axis = next(
+            axis for axis in fig.axes if axis.get_ylabel() == "Selected radius $q_t$"
+        )
+        radius_figure_legends = [
+            legend
+            for legend in fig.legends
+            if tuple(text.get_text() for text in legend.get_texts())
+            == RADIUS_LEGEND_LABELS
+        ]
+        radius_axis_legend = radius_axis.get_legend()
+        radius_legends = radius_figure_legends + (
+            [] if radius_axis_legend is None else [radius_axis_legend]
+        )
+        assert len(radius_legends) == 1
+
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        legend_box = radius_legends[0].get_window_extent(renderer)
+        line_boxes = [line.get_window_extent(renderer) for line in radius_axis.lines]
+        band_boxes = [
+            _collection_window_extent(collection)
+            for collection in radius_axis.collections
+        ]
+        assert all(
+            not legend_box.overlaps(artist_box)
+            for artist_box in line_boxes + band_boxes
+        ), "radius legend overlaps a formal-shape radius line or confidence band"
+        assert all(
+            not legend_box.overlaps(axis.get_window_extent(renderer))
+            for axis in fig.axes
+        ), "radius legend must occupy a stable figure-level band outside all data axes"
+        assert radius_axis_legend is None
+        assert len(radius_figure_legends) == 1
+        assert radius_figure_legends[0].get_in_layout() is False
+        assert radius_figure_legends[0]._ncols == 3
+        assert output.with_suffix(".png").read_bytes().startswith(b"\x89PNG")
+        assert output.with_suffix(".pdf").read_bytes().startswith(b"%PDF")
     finally:
         real_close(fig)
 
