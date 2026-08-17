@@ -606,11 +606,24 @@ git commit -m "feat: add resumable phase0 GPU runner"
 
 **Files:**
 
+- Modify: `src/scpcp/simulator.py`
 - Create: `src/scpcp/phase0_search.py`
 - Create: `scripts/run_phase0_search_sanity.py`
 - Create: `tests/per_step/test_phase0_search.py`
 
-- [ ] **Step 1: Write a tiny triangular counterexample**
+- [ ] **Step 1: Lock the tabular simulator and write a tiny triangular counterexample**
+
+Before production changes, capture a fixed-seed legacy `TabularTreatmentEnvironment.step`
+fixture. Add minimal public analytic helpers for the existing finite MDP:
+
+```python
+initial_state_probabilities(device, dtype) -> Tensor       # [S]
+outcome_distribution_parameters(device, dtype) -> tuple[Tensor, Tensor]
+# means [A,S_next,D], independent Gaussian standard deviations [D]
+```
+
+Make the stochastic `step` path consume the same outcome-mean helper and retain the
+legacy fixed-seed fixture exactly. Do not add a second tabular simulator.
 
 Construct a two-stage discrete objective where the locally narrow feasible first radius changes occupancy and forces a much wider second radius. Assert greedy is feasible but globally suboptimal.
 
@@ -632,16 +645,25 @@ def beam_schedule_search(..., *, beam_width: int): ...
 
 Only exact enumeration sets `true_optimality_gap`. Beam output must leave it `None` and use the phrase `best_found_gap`.
 
+The finite-MDP metric is analytic, not a same-seed Monte Carlo approximation. For each
+frozen radius and active state, combine the exact action probabilities, transition
+matrix, predictor mean/scale, and the environment's independent Gaussian outcome law.
+Compute the joint max-residual hit probability with Normal CDF differences, propagate
+the target-policy state occupancy exactly, and compute the expected normalized width.
+Use float64 after the frozen neural predictor outputs are obtained. Tests cover a
+one-stage hand calculation, a two-stage occupancy recursion, tie-breaking, no-feasible
+grids, and the rule that beam search never reports a true optimality gap.
+
 - [ ] **Step 3: Run one pre-registered finite-grid diagnostic**
 
-`scripts/run_phase0_search_sanity.py` evaluates the existing finite-MDP environment on a reduced `T=4`, `K=5` D_COT-frozen grid. Enumerate all `5^4=625` schedules under one fixed tuning bundle, compare the Greedy Sequential schedule to the exact best feasible grid schedule, and atomically write `finite_mdp_sanity.json`. The JSON must label the result `exact_finite_grid_search`, state that the gap is relative only to the reduced frozen grid, and include coverage, width, chosen indices, and the true finite-grid gap. This diagnostic is run before the 100-seed launch and copied into the Phase 0 study root without entering the Go/No-Go gate.
+`scripts/run_phase0_search_sanity.py` evaluates the existing finite-MDP environment on a reduced `T=4`, `K=5` D_COT-frozen grid. Enumerate all `5^4=625` schedules using the analytic population coverage/width recursion, compare the Greedy Sequential schedule to the exact best feasible grid schedule, and atomically write `finite_mdp_sanity.json`. The JSON must label the result `analytic_exact_finite_grid_search`, state that the true gap is relative only to the reduced frozen grid and frozen predictor/policy, and include coverage, width, chosen indices, and the true finite-grid gap. It must not call a same-seed Monte Carlo stream a CRN bundle. This diagnostic is run before the 100-seed launch and copied into the Phase 0 study root without entering the Go/No-Go gate.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
 /home/ubuntu/anaconda3/envs/ucp/bin/python -m pytest -q tests/per_step/test_phase0_search.py
 /home/ubuntu/anaconda3/envs/ucp/bin/python -m pytest -q
-git add src/scpcp/phase0_search.py scripts/run_phase0_search_sanity.py tests/per_step/test_phase0_search.py
+git add src/scpcp/simulator.py src/scpcp/phase0_search.py scripts/run_phase0_search_sanity.py tests/per_step/test_phase0_search.py
 git commit -m "test: add greedy finite-mdp sanity diagnostic"
 ```
 
