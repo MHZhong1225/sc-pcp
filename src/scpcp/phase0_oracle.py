@@ -32,6 +32,10 @@ def _repeat_over_candidates(values: Tensor, count: int) -> Tensor:
     return expanded.reshape(count * len(values), *values.shape[1:])
 
 
+def _allocate_candidate_next_states(state: Tensor, candidate_count: int) -> Tensor:
+    return state.new_empty((candidate_count, *state.shape))
+
+
 def _evaluate_stage(
     environment: object,
     policy: object,
@@ -147,7 +151,10 @@ def greedy_sequential_oracle_schedule(
     selected_endpoint = False
     candidate_count = stage_grids.shape[1]
     for stage, stage_grid in enumerate(stage_grids):
-        candidate_next_states = state.new_empty((candidate_count, *state.shape))
+        candidate_next_states = _allocate_candidate_next_states(
+            state,
+            candidate_count,
+        )
         coverage = state.new_empty(candidate_count)
         width = state.new_empty(candidate_count)
         for start in range(0, candidate_count, chunk_size):
@@ -182,10 +189,11 @@ def greedy_sequential_oracle_schedule(
         index = int(objective.argmin().item())
         selected_indices.append(index)
         selected_radii.append(stage_grid[index])
-        selected_coverage.append(coverage[index])
-        selected_width.append(width[index])
+        selected_coverage.append(coverage[index].clone())
+        selected_width.append(width[index].clone())
         selected_endpoint = selected_endpoint or index in {0, candidate_count - 1}
         state = candidate_next_states[index].clone()
+        del candidate_next_states
     return OracleScheduleResult(
         radii=torch.stack(selected_radii),
         selected_indices=tuple(selected_indices),

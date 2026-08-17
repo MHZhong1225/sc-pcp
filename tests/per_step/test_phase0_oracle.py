@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import weakref
+
 import torch
 from torch import Tensor
 
+import scpcp.phase0_oracle as phase0_oracle
 from scpcp.phase0_oracle import (
     CandidateMetrics,
     evaluate_profiled_candidates_crn,
@@ -57,6 +60,8 @@ class NonMonotoneEnvironment:
 
 
 class ActionScaleOutcomeModel:
+    n_actions = 3
+
     def __init__(self) -> None:
         self.max_batch = 0
 
@@ -64,6 +69,26 @@ class ActionScaleOutcomeModel:
         self.max_batch = max(self.max_batch, len(states))
         scale = torch.tensor([1.0, 1.0, 0.2], device=states.device)[actions]
         return states.new_zeros((len(states), 2)), scale[:, None].expand(-1, 2)
+
+    def predict_all_actions(self, states: Tensor) -> tuple[Tensor, Tensor]:
+        repeated_states = states[:, None, :].expand(-1, self.n_actions, -1)
+        flat_states = repeated_states.reshape(len(states) * self.n_actions, -1)
+        actions = torch.arange(self.n_actions).repeat(len(states)).to(states.device)
+        means, scales = self(flat_states, actions)
+        return (
+            means.reshape(len(states), self.n_actions, -1),
+            scales.reshape(len(states), self.n_actions, -1),
+        )
+
+
+class PredictorMediatedRadiusPolicy(RadiusActionPolicy):
+    def __init__(self, predictor: ActionScaleOutcomeModel) -> None:
+        super().__init__()
+        self.predictor = predictor
+
+    def probabilities(self, states: Tensor, q: float | Tensor | None = None) -> Tensor:
+        self.predictor.predict_all_actions(states)
+        return super().probabilities(states, q)
 
 
 class PrefixPolicy:
@@ -232,6 +257,39 @@ def test_greedy_commits_chosen_prefix_and_minimizes_current_width() -> None:
     assert result.selected_endpoint is True
 
 
+def test_greedy_releases_candidate_state_buffer_before_next_stage(monkeypatch) -> None:
+    stage_buffers: list[weakref.ReferenceType[Tensor]] = []
+
+    def tracked_allocation(state: Tensor, candidate_count: int) -> Tensor:
+        if stage_buffers:
+            assert stage_buffers[-1]() is None
+        allocated = state.new_empty((candidate_count, *state.shape))
+        stage_buffers.append(weakref.ref(allocated))
+        return allocated
+
+    monkeypatch.setattr(
+        phase0_oracle,
+        "_allocate_candidate_next_states",
+        tracked_allocation,
+        raising=False,
+    )
+
+    result = greedy_sequential_oracle_schedule(
+        PrefixSensitiveEnvironment(),
+        PrefixPolicy(),
+        PrefixOutcomeModel(),
+        stage_grids=torch.tensor([[1.0, 3.0], [1.0, 3.0]]),
+        outcome_sd=torch.ones(2),
+        noise=_noise(n=3, horizon=2, shared=torch.zeros(2, 3)),
+        target=0.9,
+        chunk_size=1,
+    )
+
+    assert result.selection_available is True
+    assert len(stage_buffers) == 2
+    assert all(reference() is None for reference in stage_buffers)
+
+
 def test_greedy_tie_uses_lowest_original_candidate_index() -> None:
     result = greedy_sequential_oracle_schedule(
         PrefixSensitiveEnvironment(),
@@ -305,3 +363,21 @@ def test_profiled_metrics_are_invariant_to_candidate_order_and_chunk_size() -> N
         )
         assert policy.max_batch <= chunk_size * 3
         assert outcome_model.max_batch <= chunk_size * 3
+
+
+def test_policy_all_action_prediction_has_chunk_patient_action_inner_bound() -> None:
+    predictor = ActionScaleOutcomeModel()
+    policy = PredictorMediatedRadiusPolicy(predictor)
+
+    evaluate_profiled_candidates_crn(
+        NonMonotoneEnvironment(),
+        policy,
+        predictor,
+        candidate_schedules=torch.tensor([[0.5], [1.0], [1.5], [0.5], [1.0]]),
+        outcome_sd=torch.ones(2),
+        noise=_noise(n=3, horizon=1),
+        chunk_size=2,
+    )
+
+    assert policy.max_batch == 2 * 3
+    assert predictor.max_batch == 2 * 3 * predictor.n_actions
