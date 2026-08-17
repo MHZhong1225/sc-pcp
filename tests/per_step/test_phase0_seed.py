@@ -216,6 +216,40 @@ def test_oracle_context_matches_existing_run_seed_setup(
     )
 
 
+def test_phase0_seed_rejects_non_synthetic_before_any_context_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ExperimentConfig()
+    non_synthetic = replace(
+        config,
+        data=replace(config.data, dataset="tabular"),
+    )
+    work_calls: list[str] = []
+
+    def unexpected_seed(*_args: object, **_kwargs: object) -> None:
+        work_calls.append("manual_seed")
+        raise AssertionError("global RNG must not be touched")
+
+    def unexpected_context(*_args: object, **_kwargs: object) -> None:
+        work_calls.append("prepare_context")
+        raise AssertionError("context/model work must not start")
+
+    monkeypatch.setattr(phase0_oracle.torch, "manual_seed", unexpected_seed)
+    monkeypatch.setattr(
+        phase0_oracle,
+        "_prepare_oracle_context",
+        unexpected_context,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="run_phase0_seed requires data.dataset='synthetic'",
+    ):
+        phase0_oracle.run_phase0_seed(non_synthetic, seed=17, device="cpu")
+
+    assert work_calls == []
+
+
 def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,9 +279,13 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
     grid_calls: list[tuple[torch.Tensor, int, float, float]] = []
     bundle_calls: list[tuple[int, int, int, str]] = []
     tuning_calls: list[tuple[str, str, object]] = []
+    candidate_evaluation_counts = {"standard": 0, "tail_shift": 0}
+    validated_scenarios: list[str] = []
     evaluation_calls: list[
         tuple[str, dict[str, torch.Tensor], object, set[int]]
     ] = []
+    base_synthetic = config.synthetic
+    original_validate = ExperimentConfig.validate
 
     for scenario in ("standard", "tail_shift"):
         family = _schedule_family()
@@ -272,6 +310,12 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
         "manual_seed",
         lambda seed: manual_seeds.append(seed),
     )
+
+    def validate(derived: ExperimentConfig) -> None:
+        original_validate(derived)
+        validated_scenarios.append(derived.synthetic.scenario)
+
+    monkeypatch.setattr(ExperimentConfig, "validate", validate)
 
     def prepare_context(
         scenario_config: ExperimentConfig, *, seed: int, device: str
@@ -307,12 +351,22 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
         chunk_size: int,
     ) -> phase0_oracle.CandidateMetrics:
         scenario = environment.scenario
+        candidate_evaluation_counts[scenario] += 1
         call_kind = (
             "profiled"
-            if torch.equal(candidate_schedules[:, 0], torch.tensor([0.5, 0.75, 1.0]))
+            if candidate_evaluation_counts[scenario] == 1
             else "profiled_common_grid"
         )
         tuning_calls.append((scenario, call_kind, noise))
+        if scenario == "tail_shift" and call_kind == "profiled_common_grid":
+            return phase0_oracle.CandidateMetrics(
+                coverage=torch.tensor(
+                    [[0.80, 0.82], [0.85, 0.86], [0.87, 0.88]]
+                ),
+                normalized_width=torch.tensor(
+                    [[1.0, 1.1], [1.2, 1.3], [1.4, 1.5]]
+                ),
+            )
         offset = 0.01 if scenario == "standard" else 0.02
         return phase0_oracle.CandidateMetrics(
             coverage=torch.tensor(
@@ -422,6 +476,9 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
     assert result.seed == 17
     assert result.device == "cpu"
     assert manual_seeds == [17, 17]
+    assert validated_scenarios == ["standard", "tail_shift"]
+    assert config.synthetic is base_synthetic
+    assert config.synthetic.scenario == "standard"
     assert {(row["scenario"], row["method"]) for row in result.records} == {
         ("standard", "Current Profiled Oracle"),
         ("standard", "Greedy Sequential Oracle"),
@@ -497,7 +554,15 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
             expected_profiled_schedules[scenario],
         )
         if scenario == "standard":
-            assert set(schedules) == {"profiled", "greedy"}
+            assert set(schedules) == {
+                "profiled",
+                "greedy",
+                "profiled_common_grid",
+            }
+            assert torch.equal(
+                schedules["profiled_common_grid"],
+                torch.tensor([0.5, 1.0]),
+            )
         else:
             assert set(schedules) == {"profiled"}
 
@@ -530,9 +595,92 @@ def test_phase0_seed_returns_paired_rows_and_keeps_streams_and_grids_isolated(
             "profiled_common_grid_candidate_schedules",
             "profiled_common_grid_candidate_coverage",
             "profiled_common_grid_candidate_normalized_width",
+            "profiled_common_grid_selected_schedule",
+            "profiled_common_grid_final_coverage",
+            "profiled_common_grid_final_wilson_lcb",
+            "profiled_common_grid_final_stage_width",
+            "profiled_common_grid_micro_normalized_width",
+            "profiled_common_grid_patient_normalized_width",
+            "profiled_common_grid_n_rollouts",
         )
     }
     assert expected_surface_keys <= result.surfaces.keys()
     assert result.surfaces["tail_shift_greedy_selected_schedule"].numel() == 0
+    assert torch.equal(
+        result.surfaces["standard_profiled_common_grid_selected_schedule"],
+        torch.tensor([0.5, 1.0]),
+    )
+    assert torch.equal(
+        result.surfaces["standard_profiled_common_grid_final_coverage"],
+        torch.tensor([0.93, 0.94]),
+    )
+    assert torch.equal(
+        result.surfaces["standard_profiled_common_grid_final_wilson_lcb"],
+        torch.tensor([0.90, 0.91]),
+    )
+    assert torch.equal(
+        result.surfaces["standard_profiled_common_grid_final_stage_width"],
+        torch.tensor([1.3, 1.4]),
+    )
+    assert result.surfaces[
+        "standard_profiled_common_grid_micro_normalized_width"
+    ].item() == pytest.approx(1.35)
+    assert result.surfaces[
+        "standard_profiled_common_grid_patient_normalized_width"
+    ].item() == pytest.approx(1.35)
+    assert result.surfaces[
+        "standard_profiled_common_grid_n_rollouts"
+    ].item() == 13
+
+    assert result.surfaces[
+        "tail_shift_profiled_common_grid_selected_schedule"
+    ].numel() == 0
+    assert result.surfaces[
+        "tail_shift_profiled_common_grid_final_coverage"
+    ].numel() == 0
+    assert result.surfaces[
+        "tail_shift_profiled_common_grid_final_wilson_lcb"
+    ].numel() == 0
+    assert result.surfaces[
+        "tail_shift_profiled_common_grid_final_stage_width"
+    ].numel() == 0
+    assert math.isnan(
+        result.surfaces[
+            "tail_shift_profiled_common_grid_micro_normalized_width"
+        ].item()
+    )
+    assert math.isnan(
+        result.surfaces[
+            "tail_shift_profiled_common_grid_patient_normalized_width"
+        ].item()
+    )
+    assert result.surfaces[
+        "tail_shift_profiled_common_grid_n_rollouts"
+    ].item() == 0
+
+    standard_common = result.diagnostics["standard"]["profiled_common_grid"]
+    assert standard_common["selection_available"] is True
+    assert standard_common["failure_stage"] is None
+    assert standard_common["selected_endpoint"] is False
+    assert standard_common["selected_indices"] == [1]
+    assert standard_common["selected_schedule"] == pytest.approx([0.5, 1.0])
+    assert standard_common["final_coverage"] == pytest.approx([0.93, 0.94])
+    assert standard_common["final_wilson_lcb"] == pytest.approx([0.90, 0.91])
+    assert standard_common["final_stage_width"] == pytest.approx([1.3, 1.4])
+    assert standard_common["micro_normalized_width"] == pytest.approx(1.35)
+    assert standard_common["patient_normalized_width"] == pytest.approx(1.35)
+    assert standard_common["n_rollouts"] == 13
+    tail_common = result.diagnostics["tail_shift"]["profiled_common_grid"]
+    assert tail_common["selection_available"] is False
+    assert tail_common["failure_stage"] == 0
+    assert tail_common["selected_endpoint"] is False
+    assert tail_common["selected_indices"] == []
+    assert tail_common["selected_schedule"] == []
+    assert tail_common["final_coverage"] == []
+    assert tail_common["final_wilson_lcb"] == []
+    assert tail_common["final_stage_width"] == []
+    assert math.isnan(tail_common["micro_normalized_width"])
+    assert math.isnan(tail_common["patient_normalized_width"])
+    assert tail_common["n_rollouts"] == 0
     assert result.diagnostics["standard"]["tuning_seed"] == 18_300_052
     assert result.diagnostics["tail_shift"]["evaluation_seed"] == 18_400_053

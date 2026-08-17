@@ -432,6 +432,78 @@ def _selection_diagnostics(selection: OracleScheduleResult) -> dict[str, object]
     }
 
 
+def _fresh_evaluation_diagnostics(
+    selection: OracleScheduleResult,
+    evaluation: FrozenOracleEvaluation | None,
+) -> dict[str, object]:
+    missing = float("nan")
+    return {
+        **_selection_diagnostics(selection),
+        "selected_schedule": (
+            []
+            if selection.radii is None
+            else [float(value) for value in selection.radii.detach().cpu().tolist()]
+        ),
+        "final_coverage": (
+            []
+            if evaluation is None
+            else [float(value) for value in evaluation.coverage.detach().cpu().tolist()]
+        ),
+        "final_wilson_lcb": (
+            []
+            if evaluation is None
+            else [
+                float(value)
+                for value in evaluation.wilson_lower_bound.detach().cpu().tolist()
+            ]
+        ),
+        "final_stage_width": (
+            []
+            if evaluation is None
+            else [
+                float(value)
+                for value in evaluation.normalized_width.detach().cpu().tolist()
+            ]
+        ),
+        "micro_normalized_width": (
+            missing if evaluation is None else evaluation.micro_normalized_width
+        ),
+        "patient_normalized_width": (
+            missing if evaluation is None else evaluation.patient_normalized_width
+        ),
+        "n_rollouts": 0 if evaluation is None else evaluation.n_rollouts,
+    }
+
+
+def _fresh_evaluation_surfaces(
+    prefix: str,
+    evaluation: FrozenOracleEvaluation | None,
+    like: Tensor,
+) -> dict[str, Tensor]:
+    if evaluation is None:
+        empty = like.new_empty(0)
+        return {
+            f"{prefix}final_coverage": empty,
+            f"{prefix}final_wilson_lcb": empty,
+            f"{prefix}final_stage_width": empty,
+            f"{prefix}micro_normalized_width": like.new_tensor(float("nan")),
+            f"{prefix}patient_normalized_width": like.new_tensor(float("nan")),
+            f"{prefix}n_rollouts": like.new_tensor(0),
+        }
+    return {
+        f"{prefix}final_coverage": evaluation.coverage,
+        f"{prefix}final_wilson_lcb": evaluation.wilson_lower_bound,
+        f"{prefix}final_stage_width": evaluation.normalized_width,
+        f"{prefix}micro_normalized_width": like.new_tensor(
+            evaluation.micro_normalized_width
+        ),
+        f"{prefix}patient_normalized_width": like.new_tensor(
+            evaluation.patient_normalized_width
+        ),
+        f"{prefix}n_rollouts": like.new_tensor(evaluation.n_rollouts),
+    }
+
+
 def run_phase0_seed(
     config: ExperimentConfig,
     *,
@@ -439,6 +511,9 @@ def run_phase0_seed(
     device: str,
 ) -> SeedResult:
     """Build the paired standard/tail-shift oracle result for one base seed."""
+
+    if config.data.dataset != "synthetic":
+        raise ValueError("run_phase0_seed requires data.dataset='synthetic'")
 
     records = []
     surfaces = {}
@@ -451,6 +526,7 @@ def run_phase0_seed(
             config,
             synthetic=replace(config.synthetic, scenario=scenario),
         )
+        scenario_config.validate()
         context = _prepare_oracle_context(
             scenario_config,
             seed=seed,
@@ -517,6 +593,11 @@ def run_phase0_seed(
             noise=tuning_noise,
             chunk_size=16,
         )
+        common_profiled_selection = select_profiled_oracle_schedule(
+            common_profiled_schedules,
+            common_profiled_metrics,
+            target=target,
+        )
         greedy_selection = greedy_sequential_oracle_schedule(
             context.task.environment,
             context.policy,
@@ -533,6 +614,10 @@ def run_phase0_seed(
             frozen_schedules["profiled"] = profiled_selection.radii
         if greedy_selection.radii is not None:
             frozen_schedules["greedy"] = greedy_selection.radii
+        if common_profiled_selection.radii is not None:
+            frozen_schedules["profiled_common_grid"] = (
+                common_profiled_selection.radii
+            )
         evaluation_noise = make_synthetic_noise_bundle(
             n=config.samples.oracle_rollouts,
             horizon=config.horizon,
@@ -552,6 +637,7 @@ def run_phase0_seed(
             if frozen_schedules
             else {}
         )
+        common_profiled_evaluation = evaluations.get("profiled_common_grid")
 
         records.extend(
             (
@@ -605,7 +691,17 @@ def run_phase0_seed(
                 f"{prefix}profiled_common_grid_candidate_normalized_width": (
                     common_profiled_metrics.normalized_width
                 ),
+                f"{prefix}profiled_common_grid_selected_schedule": (
+                    _selected_schedule_surface(common_profiled_selection, profile)
+                ),
             }
+        )
+        surfaces.update(
+            _fresh_evaluation_surfaces(
+                f"{prefix}profiled_common_grid_",
+                common_profiled_evaluation,
+                profile,
+            )
         )
         diagnostics[scenario] = {
             "tuning_seed": tuning_seed,
@@ -614,7 +710,10 @@ def run_phase0_seed(
             "evaluation_rollouts": config.samples.oracle_rollouts,
             "profiled": _selection_diagnostics(profiled_selection),
             "greedy": _selection_diagnostics(greedy_selection),
-            "profiled_common_grid": "surface_only_same_quantile_probability_vector",
+            "profiled_common_grid": _fresh_evaluation_diagnostics(
+                common_profiled_selection,
+                common_profiled_evaluation,
+            ),
         }
 
     return SeedResult(
