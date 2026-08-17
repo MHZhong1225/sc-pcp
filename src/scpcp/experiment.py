@@ -107,10 +107,26 @@ class _RefinedScheduleFamily:
     fold_cap_hit_rates: Tensor
 
 
-def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
-    """Run the sole ordered-IUT SC-PCP method and its five baselines."""
+@dataclass(frozen=True)
+class _OracleContext:
+    task: _Task
+    outcome_model: object
+    region: object
+    policy: object
+    logging_policy: object
+    outcome_sd: Tensor
+    cot_scores: Tensor
+    schedule_family: _RefinedScheduleFamily
 
-    torch.manual_seed(seed)
+
+def _prepare_oracle_context(
+    config: ExperimentConfig,
+    *,
+    seed: int,
+    device: str,
+) -> _OracleContext:
+    """Prepare the predictor, policy, and D_COT-frozen schedule family."""
+
     task = _prepare_task(config, seed=seed, device=device)
     splits = task.splits
     outcome_model = fit_outcome_model(
@@ -192,6 +208,32 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         device=device,
         seed=seed,
     )
+    return _OracleContext(
+        task=task,
+        outcome_model=outcome_model,
+        region=region,
+        policy=policy,
+        logging_policy=logging_policy,
+        outcome_sd=outcome_sd,
+        cot_scores=cot_scores,
+        schedule_family=schedule_family,
+    )
+
+
+def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
+    """Run the sole ordered-IUT SC-PCP method and its five baselines."""
+
+    torch.manual_seed(seed)
+    context = _prepare_oracle_context(config, seed=seed, device=device)
+    task = context.task
+    splits = task.splits
+    outcome_model = context.outcome_model
+    region = context.region
+    policy = context.policy
+    logging_policy = context.logging_policy
+    outcome_sd = context.outcome_sd
+    cot_scores = context.cot_scores
+    schedule_family = context.schedule_family
     initial_stage_profile = schedule_family.initial_profile
     baseline_scale_grid = schedule_family.baseline_scale_grid
     stage_profile = schedule_family.profile

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import NormalDist
 
 import torch
 from torch import Tensor
 
-from scpcp.simulator import SyntheticNoiseBundle, inverse_cdf_actions
+from scpcp.config import ExperimentConfig
+from scpcp.coverage import candidate_radius_schedules, fixed_q_grid
+from scpcp.experiment import SeedResult, _paper_seed, _prepare_oracle_context
+from scpcp.simulator import (
+    SyntheticNoiseBundle,
+    inverse_cdf_actions,
+    make_synthetic_noise_bundle,
+)
 
 
 @dataclass(frozen=True)
@@ -351,4 +359,268 @@ def select_profiled_oracle_schedule(
         selection_available=True,
         failure_stage=None,
         selected_endpoint=index in {0, len(candidate_schedules) - 1},
+    )
+
+
+def _json_vector(values: Tensor | None) -> str:
+    if values is None:
+        return "[]"
+    return json.dumps([float(value) for value in values.detach().cpu().tolist()])
+
+
+def _selected_schedule_surface(selection: OracleScheduleResult, like: Tensor) -> Tensor:
+    if selection.radii is None:
+        return like.new_empty(0)
+    return selection.radii
+
+
+def _phase0_record(
+    *,
+    scenario: str,
+    method: str,
+    seed: int,
+    selection: OracleScheduleResult,
+    evaluation: FrozenOracleEvaluation | None,
+    tuning_seed: int,
+    evaluation_seed: int,
+) -> dict[str, object]:
+    missing = float("nan")
+    return {
+        "scenario": scenario,
+        "method": method,
+        "seed": seed,
+        "selection_status": (
+            "SELECTED" if selection.selection_available else "UNAVAILABLE"
+        ),
+        "selection_available": selection.selection_available,
+        "failure_stage": selection.failure_stage,
+        "selected_endpoint": selection.selected_endpoint,
+        "q_by_time": _json_vector(selection.radii),
+        "tuning_coverage": _json_vector(selection.tuning_coverage),
+        "tuning_width": _json_vector(selection.tuning_width),
+        "final_coverage": (
+            "[]" if evaluation is None else _json_vector(evaluation.coverage)
+        ),
+        "final_wilson_lcb": (
+            "[]"
+            if evaluation is None
+            else _json_vector(evaluation.wilson_lower_bound)
+        ),
+        "final_stage_width": (
+            "[]"
+            if evaluation is None
+            else _json_vector(evaluation.normalized_width)
+        ),
+        "micro_normalized_width": (
+            missing if evaluation is None else evaluation.micro_normalized_width
+        ),
+        "patient_normalized_width": (
+            missing if evaluation is None else evaluation.patient_normalized_width
+        ),
+        "tuning_seed": tuning_seed,
+        "evaluation_seed": evaluation_seed,
+        "n_rollouts": 0 if evaluation is None else evaluation.n_rollouts,
+    }
+
+
+def _selection_diagnostics(selection: OracleScheduleResult) -> dict[str, object]:
+    return {
+        "selection_available": selection.selection_available,
+        "failure_stage": selection.failure_stage,
+        "selected_endpoint": selection.selected_endpoint,
+        "selected_indices": list(selection.selected_indices),
+    }
+
+
+def run_phase0_seed(
+    config: ExperimentConfig,
+    *,
+    seed: int,
+    device: str,
+) -> SeedResult:
+    """Build the paired standard/tail-shift oracle result for one base seed."""
+
+    records = []
+    surfaces = {}
+    diagnostics = {}
+    target = 1.0 - config.certification.alpha
+
+    for scenario_index, scenario in enumerate(("standard", "tail_shift")):
+        torch.manual_seed(seed)
+        scenario_config = replace(
+            config,
+            synthetic=replace(config.synthetic, scenario=scenario),
+        )
+        context = _prepare_oracle_context(
+            scenario_config,
+            seed=seed,
+            device=device,
+        )
+        profile = context.schedule_family.profile
+        profiled_scale_grid = context.schedule_family.scale_grid
+        profiled_schedules = candidate_radius_schedules(
+            profiled_scale_grid,
+            profile,
+        )
+        stage_grids = torch.stack(
+            [
+                fixed_q_grid(
+                    context.cot_scores[:, stage],
+                    size=config.q_grid_size,
+                    lower_quantile=config.q_quantile_min,
+                    upper_quantile=config.q_quantile_max,
+                )
+                for stage in range(config.horizon)
+            ]
+        )
+        common_scale_grid = fixed_q_grid(
+            context.cot_scores / profile[None, :],
+            size=config.q_grid_size,
+            lower_quantile=config.q_quantile_min,
+            upper_quantile=config.q_quantile_max,
+        )
+        common_profiled_schedules = candidate_radius_schedules(
+            common_scale_grid,
+            profile,
+        )
+
+        tuning_seed = _paper_seed(seed, 1_300_001 + scenario_index)
+        evaluation_seed = _paper_seed(seed, 1_400_001 + scenario_index)
+        if tuning_seed == evaluation_seed:
+            raise RuntimeError("phase0 tuning and evaluation streams must differ")
+        tuning_noise = make_synthetic_noise_bundle(
+            n=config.samples.oracle_surface_rollouts,
+            horizon=config.horizon,
+            seed=tuning_seed,
+            device=device,
+        )
+        profiled_metrics = evaluate_profiled_candidates_crn(
+            context.task.environment,
+            context.policy,
+            context.outcome_model,
+            candidate_schedules=profiled_schedules,
+            outcome_sd=context.outcome_sd,
+            noise=tuning_noise,
+            chunk_size=16,
+        )
+        profiled_selection = select_profiled_oracle_schedule(
+            profiled_schedules,
+            profiled_metrics,
+            target=target,
+        )
+        common_profiled_metrics = evaluate_profiled_candidates_crn(
+            context.task.environment,
+            context.policy,
+            context.outcome_model,
+            candidate_schedules=common_profiled_schedules,
+            outcome_sd=context.outcome_sd,
+            noise=tuning_noise,
+            chunk_size=16,
+        )
+        greedy_selection = greedy_sequential_oracle_schedule(
+            context.task.environment,
+            context.policy,
+            context.outcome_model,
+            stage_grids=stage_grids,
+            outcome_sd=context.outcome_sd,
+            noise=tuning_noise,
+            target=target,
+            chunk_size=16,
+        )
+
+        frozen_schedules = {}
+        if profiled_selection.radii is not None:
+            frozen_schedules["profiled"] = profiled_selection.radii
+        if greedy_selection.radii is not None:
+            frozen_schedules["greedy"] = greedy_selection.radii
+        evaluation_noise = make_synthetic_noise_bundle(
+            n=config.samples.oracle_rollouts,
+            horizon=config.horizon,
+            seed=evaluation_seed,
+            device=device,
+        )
+        evaluations = (
+            evaluate_frozen_schedules_crn(
+                context.task.environment,
+                context.policy,
+                context.outcome_model,
+                schedules=frozen_schedules,
+                noise=evaluation_noise,
+                outcome_sd=context.outcome_sd,
+                forbidden_noise_seeds={tuning_seed},
+            )
+            if frozen_schedules
+            else {}
+        )
+
+        records.extend(
+            (
+                _phase0_record(
+                    scenario=scenario,
+                    method="Current Profiled Oracle",
+                    seed=seed,
+                    selection=profiled_selection,
+                    evaluation=evaluations.get("profiled"),
+                    tuning_seed=tuning_seed,
+                    evaluation_seed=evaluation_seed,
+                ),
+                _phase0_record(
+                    scenario=scenario,
+                    method="Greedy Sequential Oracle",
+                    seed=seed,
+                    selection=greedy_selection,
+                    evaluation=evaluations.get("greedy"),
+                    tuning_seed=tuning_seed,
+                    evaluation_seed=evaluation_seed,
+                ),
+            )
+        )
+
+        prefix = f"{scenario}_"
+        surfaces.update(
+            {
+                f"{prefix}profiled_scale_grid": profiled_scale_grid,
+                f"{prefix}profile": profile,
+                f"{prefix}profiled_candidate_schedules": profiled_schedules,
+                f"{prefix}profiled_candidate_coverage": profiled_metrics.coverage,
+                f"{prefix}profiled_candidate_normalized_width": (
+                    profiled_metrics.normalized_width
+                ),
+                f"{prefix}profiled_selected_schedule": _selected_schedule_surface(
+                    profiled_selection,
+                    profile,
+                ),
+                f"{prefix}greedy_stage_grids": stage_grids,
+                f"{prefix}greedy_selected_schedule": _selected_schedule_surface(
+                    greedy_selection,
+                    profile,
+                ),
+                f"{prefix}profiled_common_grid_scale_grid": common_scale_grid,
+                f"{prefix}profiled_common_grid_candidate_schedules": (
+                    common_profiled_schedules
+                ),
+                f"{prefix}profiled_common_grid_candidate_coverage": (
+                    common_profiled_metrics.coverage
+                ),
+                f"{prefix}profiled_common_grid_candidate_normalized_width": (
+                    common_profiled_metrics.normalized_width
+                ),
+            }
+        )
+        diagnostics[scenario] = {
+            "tuning_seed": tuning_seed,
+            "evaluation_seed": evaluation_seed,
+            "tuning_rollouts": config.samples.oracle_surface_rollouts,
+            "evaluation_rollouts": config.samples.oracle_rollouts,
+            "profiled": _selection_diagnostics(profiled_selection),
+            "greedy": _selection_diagnostics(greedy_selection),
+            "profiled_common_grid": "surface_only_same_quantile_probability_vector",
+        }
+
+    return SeedResult(
+        seed=seed,
+        device=device,
+        records=records,
+        surfaces=surfaces,
+        diagnostics=diagnostics,
     )
