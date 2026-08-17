@@ -31,6 +31,14 @@ class SyntheticConfig:
     toxicity_noise: float = 0.25
     state_persistence: float = 0.78
     nonlinear_strength: float = 0.25
+    scenario: str = "standard"
+    difficulty_initial_probability: float = 0.15
+    difficulty_intercept: float = -2.0
+    difficulty_state_effect: float = 0.35
+    difficulty_persistence: float = 2.0
+    difficulty_treatment_effect: float = 1.25
+    tail_contamination_probability: float = 0.10
+    tail_scale: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -202,6 +210,15 @@ class ExperimentConfig:
         return result
 
     def validate(self) -> None:
+        if self.synthetic.scenario not in {"standard", "tail_shift"}:
+            raise ValueError("synthetic scenario must be standard or tail_shift")
+        if not (
+            0.0 <= self.synthetic.difficulty_initial_probability <= 1.0
+            and 0.0 <= self.synthetic.tail_contamination_probability <= 1.0
+        ):
+            raise ValueError("tail-shift probabilities must lie in [0, 1]")
+        if self.synthetic.tail_scale <= 0.0:
+            raise ValueError("tail_scale must be positive")
         if self.data.dataset not in {"synthetic", "tabular", "mimic_iv", "eicu", "mimic_cxr", "inspire"}:
             raise ValueError("unknown dataset")
         if self.data.cxr_encoder != "densenet121":

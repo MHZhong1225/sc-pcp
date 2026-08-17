@@ -57,6 +57,7 @@ from scpcp.simulator import (
     EmpiricalTransitionEnvironment,
     SyntheticBehaviorPolicy,
     SyntheticTreatmentEnvironment,
+    TailShiftTreatmentEnvironment,
     TabularBehaviorPolicy,
     TabularTreatmentEnvironment,
     rollout,
@@ -758,7 +759,11 @@ def _paper_seed(seed: int, stream: int) -> int:
 
 def _prepare_task(config: ExperimentConfig, *, seed: int, device: str) -> _Task:
     if config.data.dataset == "synthetic":
-        environment = SyntheticTreatmentEnvironment(config.synthetic)
+        environment = (
+            TailShiftTreatmentEnvironment(config.synthetic)
+            if config.synthetic.scenario == "tail_shift"
+            else SyntheticTreatmentEnvironment(config.synthetic)
+        )
         logging = SyntheticBehaviorPolicy()
         logged = rollout(
             environment,

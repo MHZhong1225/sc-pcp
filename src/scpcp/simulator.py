@@ -140,6 +140,124 @@ class SyntheticTreatmentEnvironment:
 
 
 @dataclass(frozen=True)
+class TailShiftTreatmentEnvironment:
+    """Seven-state treatment environment with observed residual-tail difficulty."""
+
+    config: SyntheticConfig
+
+    state_dim: int = 7
+    outcome_dim: int = 2
+    n_actions: int = 3
+
+    def initial_state(
+        self, n: int, generator: torch.Generator, device: torch.device
+    ) -> Tensor:
+        continuous = torch.stack(
+            (
+                1.3 + 0.6 * torch.randn(n, generator=generator, device=device),
+                0.4 + 0.3 * torch.randn(n, generator=generator, device=device),
+                torch.randn(n, generator=generator, device=device),
+                torch.randn(n, generator=generator, device=device),
+                torch.randn(n, generator=generator, device=device),
+                torch.randn(n, generator=generator, device=device),
+            ),
+            dim=1,
+        )
+        difficulty = (
+            torch.rand(n, generator=generator, device=device)
+            < self.config.difficulty_initial_probability
+        ).to(continuous.dtype)
+        return torch.cat((continuous, difficulty[:, None]), dim=1)
+
+    def difficulty_probability(self, state: Tensor, action: Tensor) -> Tensor:
+        intensity = action.to(state.dtype) / (self.n_actions - 1)
+        logit = (
+            self.config.difficulty_intercept
+            + self.config.difficulty_state_effect * state[:, 0]
+            + self.config.difficulty_persistence * state[:, 6]
+            - self.config.difficulty_treatment_effect * intensity
+        )
+        return torch.sigmoid(logit)
+
+    def step(
+        self,
+        state: Tensor,
+        action: Tensor,
+        generator: torch.Generator,
+        *,
+        time: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        disease, toxicity, z1, z2, z3, z4, difficulty = state.unbind(dim=1)
+        beta = self.config.feedback_strength
+        intensity = action.to(state.dtype) / max(self.n_actions - 1, 1)
+        nonlinear_disease = self.config.nonlinear_strength * (
+            0.20 * torch.sin(disease)
+            + 0.12 * disease * z1.tanh()
+            + 0.08 * toxicity.square()
+        )
+        nonlinear_toxicity = self.config.nonlinear_strength * (
+            0.15 * torch.tanh(disease * toxicity) + 0.10 * z2.square() - 0.08 * z3
+        )
+        disease_mean = (
+            self.config.state_persistence * disease
+            + 0.10 * toxicity
+            + 0.12 * z1
+            + nonlinear_disease
+            - beta * self.config.disease_treatment_effect * intensity
+        )
+        toxicity_mean = (
+            0.82 * toxicity
+            + 0.06 * disease
+            - 0.08 * z1
+            + nonlinear_toxicity
+            + beta * self.config.toxicity_treatment_effect * intensity
+        )
+        disease_scale = self.config.disease_noise * (
+            1.0 + 0.10 * disease.abs() + 0.22 * z4.abs() + beta * 0.20 * intensity
+        )
+        toxicity_scale = self.config.toxicity_noise * (
+            1.0 + 0.10 * toxicity.abs() + 0.15 * z3.abs() + beta * 0.25 * intensity
+        )
+        contaminated = (
+            torch.rand(len(state), generator=generator, device=state.device)
+            < self.config.tail_contamination_probability
+        ) & (difficulty == 1.0)
+        residual_multiplier = torch.where(
+            contaminated,
+            torch.full_like(difficulty, self.config.tail_scale),
+            torch.ones_like(difficulty),
+        )
+        shared = torch.randn(len(state), generator=generator, device=state.device)
+        independent = torch.randn(len(state), generator=generator, device=state.device)
+        disease_noise = disease_scale * shared * residual_multiplier
+        toxicity_noise = (
+            toxicity_scale
+            * (0.30 * shared + 0.954 * independent)
+            * residual_multiplier
+        )
+        next_disease = disease_mean + disease_noise
+        next_toxicity = toxicity_mean + toxicity_noise
+        innovations = torch.randn(
+            (len(state), 4), generator=generator, device=state.device
+        ) * residual_multiplier[:, None]
+        next_z1 = 0.75 * z1 + 0.25 * innovations[:, 0] + beta * 0.12 * intensity
+        next_z2 = 0.70 * z2 + 0.30 * innovations[:, 1] - beta * 0.10 * intensity
+        next_z3 = 0.68 * z3 + 0.32 * innovations[:, 2]
+        next_z4 = 0.72 * z4 + 0.28 * innovations[:, 3] + beta * 0.10 * intensity
+        continuous = torch.stack(
+            (next_disease, next_toxicity, next_z1, next_z2, next_z3, next_z4),
+            dim=1,
+        ).clamp(-self.config.state_clip, self.config.state_clip)
+        outcome = continuous[:, : self.outcome_dim]
+        next_difficulty = (
+            torch.rand(len(state), generator=generator, device=state.device)
+            < self.difficulty_probability(state, action)
+        ).to(state.dtype)
+        next_state = torch.cat((continuous, next_difficulty[:, None]), dim=1)
+        return next_state, outcome
+
+
+@dataclass(frozen=True)
 class TabularBehaviorPolicy:
     """Known positive logging policy for exact occupancy-transport tests."""
 
