@@ -38,6 +38,10 @@
 - Create: `tests/per_step/test_study_artifacts.py`
 - Create: `tests/per_step/test_tabular_oracle_validation.py`
 - Create: `tests/per_step/test_tabular_validation_reporting.py`
+- Create: `tools/render_paper_results.py`
+- Create: `tools/summarize_tabular_validation.py`
+- Create: `tools/select_baseline_hyperparameters.py`
+- Create: `tools/run_full200_shards.py`
 
 - [ ] **Step 1: Demonstrate the branch has no runnable tracked tests**
 
@@ -52,7 +56,7 @@ Expected: pytest reports no tests, and `source_tree_sha256()` cannot safely supp
 
 - [ ] **Step 2: Import the known 102-test harness without importing user outputs**
 
-Copy only `.gitignore`, `pyproject.toml`, and `tests/per_step/*.py` from the main checkout. Replace `.gitignore` with a tracked minimal version that continues to ignore generated data/results/caches but does not ignore `.gitignore`, `pyproject.toml`, `docs/`, or `tests/`:
+Copy only `.gitignore`, `pyproject.toml`, `tests/per_step/*.py`, and the four test-required modules `tools/render_paper_results.py`, `tools/summarize_tabular_validation.py`, `tools/select_baseline_hyperparameters.py`, and `tools/run_full200_shards.py` from the main checkout. These modules are the complete transitive in-repository dependency/path-load set of the imported regression harness; do not copy any other untracked tool or output. Replace `.gitignore` with a tracked minimal version that continues to ignore generated data/results/caches but does not ignore `.gitignore`, `pyproject.toml`, `docs/`, `tests/`, or `tools/`:
 
 ```gitignore
 __pycache__/
@@ -88,7 +92,7 @@ Expected: `102 passed`.
 - [ ] **Step 4: Commit the harness**
 
 ```bash
-git add .gitignore pyproject.toml tests/per_step
+git add .gitignore pyproject.toml tests/per_step tools/render_paper_results.py tools/summarize_tabular_validation.py tools/select_baseline_hyperparameters.py tools/run_full200_shards.py
 git commit -m "chore: track phase0 test harness"
 ```
 
