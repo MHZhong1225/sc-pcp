@@ -463,6 +463,20 @@ class TabularTreatmentEnvironment:
         )
         return torch.nn.functional.one_hot(index, self.n_states).to(torch.float32)
 
+    def initial_state_probabilities(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Return the exact initial-state law for analytic finite-MDP work."""
+
+        return torch.full(
+            (self.n_states,),
+            1.0 / self.n_states,
+            device=device,
+            dtype=dtype,
+        )
+
     def transition_probabilities(
         self, device: torch.device, dtype: torch.dtype
     ) -> Tensor:
@@ -488,6 +502,35 @@ class TabularTreatmentEnvironment:
         transition[0] = (1.0 - 0.10 * beta) * transition[0] + 0.10 * beta * harmful
         return transition / transition.sum(dim=2, keepdim=True)
 
+    def outcome_distribution_parameters(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """Return exact Gaussian means ``[A,S_next,D]`` and standard deviations."""
+
+        severity = torch.arange(self.n_states, device=device, dtype=dtype) / (
+            self.n_states - 1
+        )
+        intensity = torch.arange(self.n_actions, device=device, dtype=dtype) / (
+            self.n_actions - 1
+        )
+        beta = self.config.feedback_strength
+        means = torch.stack(
+            (
+                severity[None, :] - 0.15 * beta * intensity[:, None],
+                0.20 * severity[None, :] + 0.18 * beta * intensity[:, None],
+            ),
+            dim=2,
+        )
+        standard_deviations = torch.full(
+            (self.outcome_dim,),
+            0.08,
+            device=device,
+            dtype=dtype,
+        )
+        return means, standard_deviations
+
     def step(
         self,
         state: Tensor,
@@ -504,22 +547,14 @@ class TabularTreatmentEnvironment:
         next_state = torch.nn.functional.one_hot(next_index, self.n_states).to(
             state.dtype
         )
-        severity = next_index.to(state.dtype) / (self.n_states - 1)
-        intensity = action.to(state.dtype) / (self.n_actions - 1)
-        beta = self.config.feedback_strength
+        outcome_means, _ = self.outcome_distribution_parameters(
+            state.device,
+            state.dtype,
+        )
         noise = 0.08 * torch.randn(
             (len(state), 2), generator=generator, device=state.device
         )
-        outcome = (
-            torch.stack(
-                (
-                    severity - 0.15 * beta * intensity,
-                    0.20 * severity + 0.18 * beta * intensity,
-                ),
-                dim=1,
-            )
-            + noise
-        )
+        outcome = outcome_means[action, next_index] + noise
         return next_state, outcome
 
     @torch.no_grad()
@@ -534,7 +569,7 @@ class TabularTreatmentEnvironment:
         resolved = torch.device(device)
         states = torch.eye(self.n_states, device=resolved)
         transition = self.transition_probabilities(resolved, torch.float32)
-        initial = torch.full((self.n_states,), 1.0 / self.n_states, device=resolved)
+        initial = self.initial_state_probabilities(resolved, torch.float32)
         mu = logging_policy.probabilities(states)
         d_mu = [initial]
         for _ in range(horizon - 1):
