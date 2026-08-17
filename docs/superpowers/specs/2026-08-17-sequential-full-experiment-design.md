@@ -189,6 +189,18 @@ For every seed:
 
 Oracle tuning uses point-estimated coverage rather than a lower confidence bound. This isolates structural efficiency from finite-sample statistical conservatism. Simultaneous lower bands are computed only on the independent 50,000-rollout final evaluation.
 
+For seed \(s\), the fresh batch yields \(\widehat c_{s,t}\) at every stage. A one-sided Wilson lower bound at Bonferroni level \(0.05/12\) is stored as a seed-level Monte Carlo diagnostic, but it is not the algorithm-level Go statistic: requiring every independently tuned schedule to clear a per-seed lower bound after selecting at the 0.90 point threshold would confound the structural comparison with an unintended second safety margin. The primary coverage statistic is the mean of \(\widehat c_{s,t}\) over independent selected seeds. Its pre-registered simultaneous lower band is
+
+\[
+L_t^{\mathrm{seed}}
+=\bar c_t
+-t_{1-0.05/12,\,|\mathcal S|-1}
+\frac{\operatorname{sd}_{s\in\mathcal S}(\widehat c_{s,t})}
+{\sqrt{|\mathcal S|}},
+\]
+
+where \(\mathcal S\) is the set of seeds with an available frozen schedule. This band therefore addresses variation across independently trained schedules, while the Wilson diagnostic isolates finite fresh-rollout Monte Carlo error. Coverage is explicitly labeled conditional on successful selection and is always reported next to the unconditional selection rate.
+
 The Phase 0 simulator exposes a pure `step_from_noise()` path with inverse-CDF action sampling. Initial-state noise, action uniforms, transition noise, and tail-shift mixture/Bernoulli noise are explicit. Candidates reuse the same patient-level noise and are processed in bounded chunks; merely reusing a Torch seed with `multinomial` is not labeled CRN. The legacy simulator path remains unchanged.
 
 Phase 0 uses 100 paired synthetic seeds. The existing standard synthetic scenario and a separately labeled `tail_shift` scenario are both run. `tail_shift` retains the observed difficulty state and makes that state control residual tail shape; it does not replace the original simulator.
@@ -223,13 +235,13 @@ without hiding \(H_t\) or replacing the standard scenario.
 
 Go requires all of the following on the `tail_shift` 100-seed paired experiment:
 
-1. every supported stage has a simultaneous one-sided 95% lower bound at least 0.90;
+1. every one of the 12 stages has algorithm-level simultaneous lower bound \(L_t^{\mathrm{seed}}\ge0.90\) for the Greedy Sequential Oracle;
 2. the paired geometric mean ratio
    \(W_{\rm micro}^{\rm seq}/W_{\rm micro}^{\rm profiled}\le0.90\);
 3. the 95% paired confidence interval for that ratio has upper endpoint below 1.00;
 4. the patient-weighted width ratio is at most 0.92;
 5. selection succeeds for at least 95 of 100 seeds;
-6. on the standard scenario, the sequential oracle retains coverage and its micro width is no more than 2% worse than the profiled oracle.
+6. on the standard scenario, all 12 algorithm-level simultaneous lower bounds remain at least 0.90 and the sequential oracle's micro width is no more than 2% worse than the profiled oracle.
 
 Any failure is No-Go. Improvements between 0% and 10% are not promoted to the full clinical route. No-Go preserves the current best method and records the oracle result as a negative experiment.
 
@@ -366,7 +378,7 @@ For a frozen practical schedule, construct patient-cluster bootstrap max-statist
 
 In continuous-state and clinical experiments these are labeled **practical transported lower confidence bounds**. They control sampling uncertainty of the frozen transported estimate but do not automatically control bias from learned COT, fitted propensities, clipping, continuation modeling, or outcome observation. Exceeding 0.90 is not described as a finite-sample guarantee. A formal guarantee additionally requires a valid transport-error bound; that claim is restricted to the finite-MDP branch or a future setting with externally validated error bounds.
 
-For Phase 0 oracle fresh rollouts, construct the simultaneous band over all 12 pre-registered stages with one-sided Wilson lower bounds at Bonferroni level \(0.05/12\), then take the supported prefix; the support decision cannot inspect coverage hits. The union-bound validity does not require independence across stages, while trajectories are independent within a seed. Across 100 seeds, report paired seed bootstrap intervals for width ratios and seed-level variation. Candidate multiplicity does not enter this fresh band because the schedule is already frozen. Candidate curves used during schedule construction are not presented as formal guarantees.
+For Phase 0 oracle fresh rollouts, store per-seed one-sided Wilson lower bounds at Bonferroni level \(0.05/12\) over all 12 stages as Monte Carlo diagnostics. The primary Go band is the one-sided Bonferroni-\(t\) band over the independent seed-level fresh coverage estimates defined in Section 6.2. The union-bound construction does not require independence across stages. Across 100 seeds, report paired seed bootstrap intervals for width ratios and seed-level variation. Candidate multiplicity does not enter either fresh band because the schedule is already frozen. Candidate curves used during schedule construction are not presented as formal guarantees.
 
 An unbounded or data-selected horizon is outside the first implementation. All claims are for the pre-registered finite \(T_{\max}\). An anytime-valid extension requires a separate design.
 
