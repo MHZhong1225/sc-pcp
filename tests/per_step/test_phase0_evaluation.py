@@ -137,6 +137,53 @@ def test_wilson_lower_bound_is_monotone_in_hits() -> None:
     assert torch.all(bounds[1:] >= bounds[:-1])
 
 
+@pytest.mark.parametrize(
+    "invalid_schedule",
+    (torch.ones(11), torch.ones(13), torch.ones(2, 6)),
+    ids=("short", "long", "two-dimensional"),
+)
+def test_frozen_evaluation_rejects_non_horizon_schedule_before_rollout(
+    invalid_schedule: Tensor,
+) -> None:
+    horizon = 12
+    noise = _noise(n=4, horizon=horizon, seed=41)
+    environment = AuditedEnvironment(horizon)
+
+    with pytest.raises(ValueError, match=r"schedule 'invalid' must have shape \(12,\)"):
+        phase0_oracle.evaluate_frozen_schedules_crn(
+            environment,
+            RadiusProbabilityPolicy(),
+            TwoCoordinateOutcomeModel(),
+            schedules={
+                "valid": torch.ones(horizon),
+                "invalid": invalid_schedule,
+            },
+            noise=noise,
+            outcome_sd=torch.ones(2),
+        )
+
+    assert environment.initial_calls == []
+
+
+def test_frozen_evaluation_rejects_forbidden_noise_seed_before_rollout() -> None:
+    horizon = 12
+    noise = _noise(n=4, horizon=horizon, seed=1_300_001)
+    environment = AuditedEnvironment(horizon)
+
+    with pytest.raises(ValueError, match="evaluation noise seed 1300001 is forbidden"):
+        phase0_oracle.evaluate_frozen_schedules_crn(
+            environment,
+            RadiusProbabilityPolicy(),
+            TwoCoordinateOutcomeModel(),
+            schedules={"profiled": torch.ones(horizon)},
+            noise=noise,
+            outcome_sd=torch.ones(2),
+            forbidden_noise_seeds={1_200_001, 1_300_001},
+        )
+
+    assert environment.initial_calls == []
+
+
 def test_frozen_schedules_use_one_fresh_50000_bundle_and_restart_each_schedule() -> None:
     horizon = 12
     tuning_stream_id = 1_300_001
@@ -155,9 +202,9 @@ def test_frozen_schedules_use_one_fresh_50000_bundle_and_restart_each_schedule()
         },
         noise=noise,
         outcome_sd=torch.tensor([1.0, 4.0]),
+        forbidden_noise_seeds={tuning_stream_id},
     )
 
-    assert tuning_stream_id != evaluation_stream_id
     assert [call[0] for call in environment.initial_calls] == [id(noise), id(noise)]
     assert [call[1] for call in environment.initial_calls] == [evaluation_stream_id] * 2
     assert [call[2] for call in environment.initial_calls] == [50_000, 50_000]

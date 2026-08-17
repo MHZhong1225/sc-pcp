@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from statistics import NormalDist
 
@@ -164,8 +165,22 @@ def evaluate_frozen_schedules_crn(
     schedules: dict[str, Tensor],
     noise: SyntheticNoiseBundle,
     outcome_sd: Tensor,
+    forbidden_noise_seeds: Collection[int] = (),
 ) -> dict[str, FrozenOracleEvaluation]:
     """Evaluate frozen schedules independently on one supplied CRN bundle."""
+
+    if noise.seed in forbidden_noise_seeds:
+        raise ValueError(
+            f"evaluation noise seed {noise.seed} is forbidden by "
+            "tuning/construction streams"
+        )
+    horizon = noise.action_uniform.shape[0]
+    for name, schedule in schedules.items():
+        if schedule.ndim != 1 or schedule.shape[0] != horizon:
+            raise ValueError(
+                f"schedule {name!r} must have shape ({horizon},), "
+                f"got {tuple(schedule.shape)}"
+            )
 
     evaluations = {}
     for name, schedule in schedules.items():
