@@ -633,10 +633,10 @@ Construct a two-stage discrete objective where the locally narrow feasible first
 @dataclass(frozen=True)
 class SearchDiagnostic:
     search_type: str  # "exact" or "beam"
-    greedy_width: float
+    greedy_width: float | None
     best_found_width: float
     true_optimality_gap: float | None
-    best_found_gap: float
+    best_found_gap: float | None
 
 
 def exact_schedule_search(...): ...
@@ -644,6 +644,9 @@ def beam_schedule_search(..., *, beam_width: int): ...
 ```
 
 Only exact enumeration sets `true_optimality_gap`. Beam output must leave it `None` and use the phrase `best_found_gap`.
+If the global grid contains a feasible schedule but greedy becomes prefix-infeasible,
+record greedy availability as false and use JSON `null` for its width and both gaps;
+never serialize `Infinity`/`NaN`. A wholly infeasible grid remains an explicit error.
 
 The finite-MDP metric is analytic, not a same-seed Monte Carlo approximation. For each
 frozen radius and active state, combine the exact action probabilities, transition
