@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import scpcp.phase0c_study as study
+import scpcp.phase0c_joint_search as joint_search
 from scpcp.config import ExperimentConfig, SampleConfig
 from scpcp.experiment import _RefinedScheduleFamily, _paper_seed
 from scpcp.phase0_oracle import (
@@ -196,6 +197,24 @@ def _checkpoint(
     )
 
 
+def _canonical_parent_states() -> dict[str, tuple[SearchState, ...]]:
+    names = ("profiled", "greedy", "upper_endpoint")
+    indices = ((None,) * 12, (40,) * 12, (100,) * 12)
+    states = tuple(
+        SearchState(
+            start_name=name,
+            radii=torch.ones(12),
+            stage_grid_indices=stage_indices,
+            coverage=torch.full((12,), 0.95),
+            normalized_width=torch.ones(12),
+            completed_sweep_pairs=4,
+            converged_at_pair=None,
+        )
+        for name, stage_indices in zip(names, indices, strict=True)
+    )
+    return {scenario: states for scenario in SCENARIOS}
+
+
 def _frozen(schedule: torch.Tensor) -> FrozenOracleEvaluation:
     width = schedule.float() / 10.0
     return FrozenOracleEvaluation(
@@ -249,7 +268,7 @@ def _install_happy_path(
         nonlocal grid_calls
         assert size == 101
         grid_calls += 1
-        return torch.linspace(0.5 + grid_calls / 1000.0, 2.5, size)
+        return torch.linspace(0.5 + float(values[0]) / 1000.0, 2.5, size)
 
     def make_noise(
         *, n: int, horizon: int, seed: int, device: str
@@ -468,6 +487,17 @@ def test_seed_contract_uses_shared_crn_nested_search_and_one_fresh_evaluation(
             result.surfaces[f"{scenario}_pair4_profiled_stage_grid_indices"],
             torch.full((12,), -1, dtype=torch.int64),
         )
+        assert result.diagnostics[scenario]["active_start_names"] == [
+            "profiled",
+            "greedy",
+            "upper_endpoint",
+        ]
+        assert result.diagnostics[scenario]["extension_eligible"] is True
+        assert torch.equal(
+            result.surfaces[f"{scenario}_active_start_names"],
+            torch.tensor([0, 1, 2]),
+        )
+        assert bool(result.surfaces[f"{scenario}_extension_eligible"].item())
 
     expected_columns = {
         "schema_version",
@@ -640,11 +670,14 @@ def test_unavailable_starts_stay_canonical_and_missing_rows_are_json_safe(
     for row in result.records:
         assert row["selection_status"] == "NO_FEASIBLE_START"
         assert not row["selection_available"]
+        assert row["selected_stage_grid_indices_json"] == "[]"
         assert row["q_by_time_json"] == "[]"
         assert row["final_stage_width_json"] == "[]"
         assert math.isnan(row["micro_normalized_width"])
         safe = {key: (None if isinstance(value, float) and math.isnan(value) else value) for key, value in row.items()}
         json.dumps(safe, allow_nan=False)
+    for scenario in SCENARIOS:
+        assert result.diagnostics[scenario]["greedy_partial_indices"] == [2]
 
 
 def test_prepare_context_matches_direct_phase0_selectors(
@@ -747,6 +780,8 @@ def test_pair2_survives_pair4_deadline_rollback(
         assert rows["joint_B"]["selection_status"] == "SELECTED"
         assert rows["joint_2B"]["selection_status"] == "WALL_TIME_CAP"
         assert rows["joint_2B"]["q_by_time_json"] == "[]"
+        assert result.diagnostics[scenario]["extension_eligible"] is False
+        assert not bool(result.surfaces[f"{scenario}_extension_eligible"].item())
 
 
 def test_both_scenarios_share_one_seed_wall_deadline(
@@ -844,6 +879,72 @@ def test_seed_rejects_noncanonical_scientific_shape_before_model_work(
     assert calls == []
 
 
+@pytest.mark.parametrize("candidate_chunk_size", (True, 1.5))
+def test_seed_rejects_non_integer_chunk_before_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_chunk_size: object,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: calls.append("model"),
+    )
+    with pytest.raises(ValueError, match="candidate_chunk_size"):
+        study.run_phase0c_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            candidate_chunk_size=candidate_chunk_size,  # type: ignore[arg-type]
+            max_seed_wall_seconds=60.0,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("checkpoints", ((2.0, 4.0), [2, 4], (True, 4)))
+def test_seed_rejects_non_exact_checkpoint_tuple_before_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoints: object,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: calls.append("model"),
+    )
+    with pytest.raises(ValueError, match="checkpoints"):
+        study.run_phase0c_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            sweep_pair_checkpoints=checkpoints,  # type: ignore[arg-type]
+            max_seed_wall_seconds=60.0,
+        )
+    assert calls == []
+
+
+def test_extension_rejects_boolean_wall_cap_before_stream_or_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work: list[str] = []
+    monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work.append("model"),
+    )
+    with pytest.raises(ValueError, match="max_seed_wall_seconds"):
+        study.run_phase0c_extension_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            pair4_states=_canonical_parent_states(),
+            extension_eligible={scenario: True for scenario in SCENARIOS},
+            max_seed_wall_seconds=True,
+        )
+    assert work == []
+
+
 def test_joint_endpoint_count_is_derived_from_all_twelve_stage_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -888,6 +989,33 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
     )
     parent_states = fixture.initial_pair4
     resumed: list[tuple[str, tuple[SearchState, ...]]] = []
+    original_replay = study.evaluate_profiled_candidates_crn
+
+    def replay(
+        environment: object,
+        policy: object,
+        outcome_model: object,
+        *,
+        candidate_schedules: torch.Tensor,
+        outcome_sd: torch.Tensor,
+        noise: object,
+        chunk_size: int,
+    ) -> CandidateMetrics:
+        states = parent_states[environment.scenario]
+        if torch.equal(candidate_schedules, torch.stack([state.radii for state in states])):
+            return CandidateMetrics(
+                coverage=torch.stack([state.coverage for state in states]),
+                normalized_width=torch.stack([state.normalized_width for state in states]),
+            )
+        return original_replay(
+            environment,
+            policy,
+            outcome_model,
+            candidate_schedules=candidate_schedules,
+            outcome_sd=outcome_sd,
+            noise=noise,
+            chunk_size=chunk_size,
+        )
 
     def resume(
         states: tuple[SearchState, ...],
@@ -921,6 +1049,7 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
             elapsed_seconds=2.0,
         )
 
+    monkeypatch.setattr(study, "evaluate_profiled_candidates_crn", replay)
     monkeypatch.setattr(study, "resume_cyclic_joint_coordinate_search", resume)
     fixture.evaluation_calls.clear()
     extension = study.run_phase0c_extension_seed(
@@ -928,6 +1057,7 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
         seed=17,
         device="cpu",
         pair4_states=parent_states,
+        extension_eligible={scenario: True for scenario in SCENARIOS},
         candidate_chunk_size=16,
         max_seed_wall_seconds=60.0,
     )
@@ -952,11 +1082,333 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
     changed = first.radii.clone()
     changed.view(torch.uint8)[0] ^= 1
     mutated["standard"] = (replace(first, radii=changed), *mutated["standard"][1:])
-    with pytest.raises(ValueError, match="parent pair-4 state"):
+    with pytest.raises(ValueError, match="parent pair-4"):
         study.run_phase0c_extension_seed(
             fixture.config,
             seed=17,
             device="cpu",
             pair4_states=mutated,
+            extension_eligible={scenario: True for scenario in SCENARIOS},
             max_seed_wall_seconds=60.0,
         )
+
+
+def test_extension_validates_both_parents_before_any_continuation_or_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _install_happy_path(monkeypatch)
+    study.run_phase0c_seed(
+        fixture.config,
+        seed=17,
+        device="cpu",
+        max_seed_wall_seconds=60.0,
+    )
+    parents = dict(fixture.initial_pair4)
+    original_replay = study.evaluate_profiled_candidates_crn
+    events: list[str] = []
+    remaining_budgets: list[float] = []
+
+    def replay(
+        environment: object,
+        policy: object,
+        outcome_model: object,
+        *,
+        candidate_schedules: torch.Tensor,
+        outcome_sd: torch.Tensor,
+        noise: object,
+        chunk_size: int,
+    ) -> CandidateMetrics:
+        scenario = environment.scenario
+        parent_schedules = torch.stack([state.radii for state in parents[scenario]])
+        if torch.equal(candidate_schedules.cpu(), parent_schedules.cpu()):
+            events.append(f"validate:{scenario}")
+            return CandidateMetrics(
+                coverage=torch.stack([state.coverage for state in parents[scenario]]),
+                normalized_width=torch.stack(
+                    [state.normalized_width for state in parents[scenario]]
+                ),
+            )
+        return original_replay(
+            environment,
+            policy,
+            outcome_model,
+            candidate_schedules=candidate_schedules,
+            outcome_sd=outcome_sd,
+            noise=noise,
+            chunk_size=chunk_size,
+        )
+
+    def forbidden_initial_search(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("extension must not rerun pair1-4 search")
+
+    def resume(
+        states: tuple[SearchState, ...],
+        stage_grids: torch.Tensor,
+        evaluator: object,
+        *,
+        target: float,
+        max_wall_seconds: float,
+    ) -> JointSearchOutcome:
+        scenario = next(name for name, value in parents.items() if states is value)
+        events.append(f"continue:{scenario}")
+        remaining_budgets.append(max_wall_seconds)
+        checkpoint = _checkpoint(
+            8,
+            tuple(
+                SearchStart(
+                    name=state.start_name,
+                    radii=state.radii,
+                    stage_grid_indices=state.stage_grid_indices,
+                    coverage=state.coverage,
+                    normalized_width=state.normalized_width,
+                )
+                for state in states
+            ),
+        )
+        return JointSearchOutcome(
+            status="SELECTED",
+            checkpoints={8: checkpoint},
+            elapsed_seconds=1.0,
+        )
+
+    original_frozen = study.evaluate_frozen_schedules_crn
+
+    def frozen(*args: object, **kwargs: object) -> dict[str, FrozenOracleEvaluation]:
+        environment = args[0]
+        events.append(f"eval:{environment.scenario}")
+        return original_frozen(*args, **kwargs)
+
+    ticks = iter(float(value) for value in range(100, 140))
+    monkeypatch.setattr(study.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(study, "evaluate_profiled_candidates_crn", replay)
+    monkeypatch.setattr(study, "cyclic_joint_coordinate_search", forbidden_initial_search)
+    monkeypatch.setattr(study, "resume_cyclic_joint_coordinate_search", resume)
+    monkeypatch.setattr(study, "evaluate_frozen_schedules_crn", frozen)
+
+    result = study.run_phase0c_extension_seed(
+        fixture.config,
+        seed=17,
+        device="cpu",
+        pair4_states=parents,
+        extension_eligible={scenario: True for scenario in SCENARIOS},
+        max_seed_wall_seconds=60.0,
+    )
+
+    assert events == [
+        "validate:standard",
+        "validate:tail_shift",
+        "continue:standard",
+        "continue:tail_shift",
+        "eval:standard",
+        "eval:tail_shift",
+    ]
+    assert remaining_budgets[1] < remaining_budgets[0] < 60.0
+    assert len(result.records) == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "scenario_keys",
+        "states_list",
+        "state_count",
+        "duplicate_name",
+        "completed_pair",
+        "radii_shape",
+        "bool_index",
+        "nonfinite_coverage",
+        "mixed_convergence",
+    ),
+)
+def test_extension_rejects_structurally_bad_parent_before_stream_or_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    parents = _canonical_parent_states()
+    if mutation == "scenario_keys":
+        parents.pop("tail_shift")
+    elif mutation == "states_list":
+        parents["standard"] = list(parents["standard"])  # type: ignore[assignment]
+    elif mutation == "state_count":
+        parents["standard"] = parents["standard"][:2]
+    elif mutation == "duplicate_name":
+        states = parents["standard"]
+        parents["standard"] = (states[0], replace(states[1], start_name="profiled"), states[2])
+    elif mutation == "completed_pair":
+        states = parents["standard"]
+        parents["standard"] = (replace(states[0], completed_sweep_pairs=3), *states[1:])
+    elif mutation == "radii_shape":
+        states = parents["standard"]
+        parents["standard"] = (replace(states[0], radii=torch.ones(11)), *states[1:])
+    elif mutation == "bool_index":
+        states = parents["standard"]
+        parents["standard"] = (
+            replace(states[0], stage_grid_indices=(True,) + (None,) * 11),
+            *states[1:],
+        )
+    elif mutation == "nonfinite_coverage":
+        states = parents["standard"]
+        bad = states[0].coverage.clone()
+        bad[0] = torch.nan
+        parents["standard"] = (replace(states[0], coverage=bad), *states[1:])
+    else:
+        states = parents["standard"]
+        parents["standard"] = (
+            replace(states[0], converged_at_pair=2),
+            states[1],
+            states[2],
+        )
+
+    work: list[str] = []
+    monkeypatch.setattr(
+        study,
+        "_paper_seed",
+        lambda *_args, **_kwargs: work.append("stream"),
+    )
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work.append("model"),
+    )
+    with pytest.raises((TypeError, ValueError), match="parent pair-4"):
+        study.run_phase0c_extension_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            pair4_states=parents,
+            extension_eligible={scenario: True for scenario in SCENARIOS},
+            max_seed_wall_seconds=60.0,
+        )
+    assert work == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "radii_raw_bytes",
+        "coverage_dtype",
+        "width_raw_bytes",
+        "name",
+        "indices",
+        "completed_pair",
+        "convergence",
+    ),
+)
+def test_parent_state_comparison_is_byte_and_metadata_exact(mutation: str) -> None:
+    base = _canonical_parent_states()["standard"][0]
+    if mutation == "radii_raw_bytes":
+        base = replace(base, radii=torch.zeros(12))
+        changed = base.radii.clone()
+        changed[0] = -0.0
+        candidate = replace(base, radii=changed)
+    elif mutation == "coverage_dtype":
+        candidate = replace(base, coverage=base.coverage.double())
+    elif mutation == "width_raw_bytes":
+        base = replace(base, normalized_width=torch.zeros(12))
+        changed = base.normalized_width.clone()
+        changed[0] = -0.0
+        candidate = replace(base, normalized_width=changed)
+    elif mutation == "name":
+        candidate = replace(base, start_name="greedy")
+    elif mutation == "indices":
+        candidate = replace(base, stage_grid_indices=(0,) + (None,) * 11)
+    elif mutation == "completed_pair":
+        candidate = replace(base, completed_sweep_pairs=3)
+    else:
+        candidate = replace(base, converged_at_pair=2)
+    assert not study._states_equal(base, candidate)
+
+
+def test_real_task1_partial_active_search_is_available_but_not_extension_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _install_happy_path(monkeypatch)
+    original_candidates = study.evaluate_profiled_candidates_crn
+    monkeypatch.setattr(
+        study,
+        "select_profiled_oracle_schedule",
+        lambda *_args, **_kwargs: _selection(None, indices=(), width=1.0),
+    )
+
+    def candidates(*args: object, **kwargs: object) -> CandidateMetrics:
+        schedules = kwargs["candidate_schedules"]
+        if len(schedules) == 1:
+            return CandidateMetrics(
+                coverage=torch.full((1, 12), 0.80),
+                normalized_width=torch.full((1, 12), 1.5),
+            )
+        return original_candidates(*args, **kwargs)
+
+    class PartialEvaluator:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __call__(
+            self,
+            start_name: str,
+            incumbent: torch.Tensor,
+            stage: int,
+            grid: torch.Tensor,
+        ) -> CandidateMetrics:
+            assert start_name == "greedy"
+            return CandidateMetrics(
+                coverage=torch.full((len(grid), 12), 0.95),
+                normalized_width=torch.full((len(grid), 12), 1.1),
+            )
+
+    monkeypatch.setattr(study, "evaluate_profiled_candidates_crn", candidates)
+    monkeypatch.setattr(study, "CRNCoordinateEvaluator", PartialEvaluator)
+    monkeypatch.setattr(
+        study,
+        "cyclic_joint_coordinate_search",
+        joint_search.cyclic_joint_coordinate_search,
+    )
+    result = study.run_phase0c_seed(
+        fixture.config,
+        seed=17,
+        device="cpu",
+        max_seed_wall_seconds=60.0,
+    )
+
+    for scenario in SCENARIOS:
+        rows = {row["method_id"]: row for row in result.records if row["scenario"] == scenario}
+        assert rows["joint_B"]["selection_status"] == "SELECTED"
+        assert rows["joint_2B"]["selection_status"] == "SELECTED"
+        assert result.diagnostics[scenario]["active_start_names"] == ["greedy"]
+        assert result.diagnostics[scenario]["extension_eligible"] is False
+        assert torch.equal(
+            result.surfaces[f"{scenario}_active_start_names"],
+            torch.tensor([1]),
+        )
+        assert not bool(result.surfaces[f"{scenario}_extension_eligible"].item())
+
+
+@pytest.mark.parametrize(
+    "eligibility",
+    (
+        {"standard": True},
+        {"standard": True, "tail_shift": False},
+        {"standard": True, "tail_shift": 1},
+    ),
+)
+def test_extension_rejects_ineligible_parent_before_stream_or_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    eligibility: dict[str, object],
+) -> None:
+    work: list[str] = []
+    monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work.append("model"),
+    )
+    with pytest.raises((TypeError, ValueError), match="extension_eligible"):
+        study.run_phase0c_extension_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            pair4_states=_canonical_parent_states(),
+            extension_eligible=eligibility,  # type: ignore[arg-type]
+            max_seed_wall_seconds=60.0,
+        )
+    assert work == []

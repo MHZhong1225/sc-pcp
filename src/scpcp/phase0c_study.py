@@ -44,6 +44,7 @@ METHOD_METADATA = {
 }
 
 _SCENARIOS = ("standard", "tail_shift")
+_START_NAMES = ("profiled", "greedy", "upper_endpoint")
 _SCHEMA_VERSION = "phase0c_seed_v1"
 _VALID_STATUSES = {"SELECTED", "NO_FEASIBLE_START", "WALL_TIME_CAP"}
 
@@ -89,9 +90,14 @@ def _validate_common_inputs(
 ) -> None:
     if config.data.dataset != "synthetic":
         raise ValueError("Phase 0C requires data.dataset='synthetic'")
-    if candidate_chunk_size < 1:
-        raise ValueError("candidate_chunk_size must be positive")
-    if not math.isfinite(max_seed_wall_seconds) or max_seed_wall_seconds <= 0.0:
+    if type(candidate_chunk_size) is not int or candidate_chunk_size < 1:
+        raise ValueError("candidate_chunk_size must be a positive non-bool integer")
+    if (
+        isinstance(max_seed_wall_seconds, bool)
+        or not isinstance(max_seed_wall_seconds, (int, float))
+        or not math.isfinite(max_seed_wall_seconds)
+        or max_seed_wall_seconds <= 0.0
+    ):
         raise ValueError("max_seed_wall_seconds must be finite and positive")
     if config.horizon != 12 or config.q_grid_size != 101:
         raise ValueError("Phase 0C protocol requires horizon=12 and q_grid_size=101")
@@ -193,8 +199,8 @@ def prepare_phase0c_scenario_context(
         scenario_index = expected_index
     if scenario_index != expected_index:
         raise ValueError("scenario_index does not match scenario")
-    if candidate_chunk_size < 1:
-        raise ValueError("candidate_chunk_size must be positive")
+    if type(candidate_chunk_size) is not int or candidate_chunk_size < 1:
+        raise ValueError("candidate_chunk_size must be a positive non-bool integer")
 
     torch.manual_seed(seed)
     scenario_config = replace(config, synthetic=replace(config.synthetic, scenario=scenario))
@@ -428,7 +434,9 @@ def _record(
         "failure_reason": "" if available else result.status,
         "chosen_initialization": result.chosen_initialization,
         "selected_endpoint_stage_count": result.endpoint_count,
-        "selected_stage_grid_indices_json": "[]" if not result.indices else _json_indices(result.indices),
+        "selected_stage_grid_indices_json": (
+            _json_indices(result.indices) if available and result.indices else "[]"
+        ),
         "q_by_time_json": _json_vector(result.radii if available else None),
         "tuning_coverage_json": _json_vector(result.tuning_coverage if available else None),
         "tuning_stage_width_json": _json_vector(result.tuning_width if available else None),
@@ -641,7 +649,11 @@ def run_phase0c_seed(
         candidate_chunk_size=candidate_chunk_size,
         max_seed_wall_seconds=max_seed_wall_seconds,
     )
-    if sweep_pair_checkpoints != (2, 4):
+    if (
+        type(sweep_pair_checkpoints) is not tuple
+        or any(type(value) is not int for value in sweep_pair_checkpoints)
+        or sweep_pair_checkpoints != (2, 4)
+    ):
         raise ValueError("sweep-pair checkpoints must be exactly (2, 4)")
     streams = _stream_ids(seed)
     started_at = time.monotonic()
@@ -734,10 +746,36 @@ def run_phase0c_seed(
             scenario=scenario,
             checkpoint=outcome.checkpoints.get(4),
         )
+        checkpoint4 = outcome.checkpoints.get(4)
+        active_start_names = (
+            tuple(state.start_name for state in checkpoint4.per_start)
+            if checkpoint4 is not None
+            else tuple(
+                start.name
+                for start in context.starts
+                if bool((start.coverage >= 1.0 - config.certification.alpha).all().item())
+            )
+        )
+        extension_eligible = checkpoint4 is not None and active_start_names == _START_NAMES
+        surfaces[f"{scenario}_active_start_names"] = torch.tensor(
+            [_START_NAMES.index(name) for name in active_start_names],
+            dtype=torch.int64,
+        )
+        surfaces[f"{scenario}_extension_eligible"] = torch.tensor(
+            extension_eligible,
+            dtype=torch.bool,
+        )
         diagnostics[scenario] = {
             "tuning_stream_id": tuning_stream_id,
             "evaluation_stream_id": evaluation_stream_id,
             "start_order": [start.name for start in context.starts],
+            "active_start_names": list(active_start_names),
+            "extension_eligible": extension_eligible,
+            "greedy_partial_indices": (
+                []
+                if context.greedy_selection.selection_available
+                else list(context.greedy_selection.selected_indices)
+            ),
             "search_status": outcome.status,
             "checkpoints": {
                 str(pair): _checkpoint_diagnostics(checkpoint)
@@ -755,28 +793,160 @@ def run_phase0c_seed(
     )
 
 
+def _tensor_fingerprint(tensor: Tensor) -> tuple[tuple[int, ...], torch.dtype, bytes]:
+    canonical = tensor.detach().cpu().contiguous()
+    raw_bytes = canonical.reshape(-1).view(torch.uint8).numpy().tobytes()
+    return tuple(canonical.shape), canonical.dtype, raw_bytes
+
+
 def _states_equal(left: SearchState, right: SearchState) -> bool:
     return (
         left.start_name == right.start_name
-        and torch.equal(left.radii, right.radii)
+        and _tensor_fingerprint(left.radii) == _tensor_fingerprint(right.radii)
         and left.stage_grid_indices == right.stage_grid_indices
-        and torch.equal(left.coverage, right.coverage)
-        and torch.equal(left.normalized_width, right.normalized_width)
+        and _tensor_fingerprint(left.coverage) == _tensor_fingerprint(right.coverage)
+        and _tensor_fingerprint(left.normalized_width)
+        == _tensor_fingerprint(right.normalized_width)
         and left.completed_sweep_pairs == right.completed_sweep_pairs
         and left.converged_at_pair == right.converged_at_pair
     )
 
 
-def _validate_parent_states(
-    supplied: tuple[SearchState, ...],
-    expected: tuple[SearchState, ...],
+def _preflight_parent_states(
+    pair4_states: object,
+    *,
+    horizon: int,
+    grid_size: int,
+) -> dict[str, tuple[SearchState, ...]]:
+    if not isinstance(pair4_states, dict) or set(pair4_states) != set(_SCENARIOS):
+        raise ValueError("parent pair-4 states must contain both scenarios")
+    for scenario in _SCENARIOS:
+        states = pair4_states[scenario]
+        if not isinstance(states, tuple) or len(states) != len(_START_NAMES):
+            raise TypeError("parent pair-4 states must be a three-state tuple")
+        if any(not isinstance(state, SearchState) for state in states):
+            raise TypeError("parent pair-4 tuple must contain SearchState values")
+        if tuple(state.start_name for state in states) != _START_NAMES:
+            raise ValueError("parent pair-4 states must have canonical unique names")
+        for state in states:
+            vectors = (state.radii, state.coverage, state.normalized_width)
+            if any(
+                not isinstance(vector, Tensor)
+                or vector.ndim != 1
+                or len(vector) != horizon
+                or not vector.is_floating_point()
+                or not bool(torch.isfinite(vector).all().item())
+                for vector in vectors
+            ):
+                raise ValueError("parent pair-4 tensors must be finite horizon vectors")
+            if not isinstance(state.stage_grid_indices, tuple) or len(
+                state.stage_grid_indices
+            ) != horizon:
+                raise TypeError("parent pair-4 indices must be a horizon tuple")
+            if any(
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value < grid_size
+                )
+                for value in state.stage_grid_indices
+            ):
+                raise ValueError("parent pair-4 indices must be integer grid positions or None")
+            if (
+                isinstance(state.completed_sweep_pairs, bool)
+                or not isinstance(state.completed_sweep_pairs, int)
+                or state.completed_sweep_pairs != 4
+            ):
+                raise ValueError("parent pair-4 state must have completed pair 4")
+            converged = state.converged_at_pair
+            if converged is not None and (
+                isinstance(converged, bool)
+                or not isinstance(converged, int)
+                or not 1 <= converged <= 4
+            ):
+                raise ValueError("parent pair-4 convergence metadata is invalid")
+        convergence = tuple(state.converged_at_pair for state in states)
+        if any(value is not None for value in convergence) and len(set(convergence)) != 1:
+            raise ValueError("parent pair-4 convergence metadata must be consistent")
+    return pair4_states
+
+
+def _preflight_extension_eligibility(extension_eligible: object) -> None:
+    if not isinstance(extension_eligible, dict) or set(extension_eligible) != set(
+        _SCENARIOS
+    ):
+        raise ValueError("extension_eligible must contain both scenarios")
+    if any(type(extension_eligible[scenario]) is not bool for scenario in _SCENARIOS):
+        raise TypeError("extension_eligible values must be bool")
+    if any(not extension_eligible[scenario] for scenario in _SCENARIOS):
+        raise ValueError("extension_eligible must be true for both scenarios")
+
+
+def _validate_parent_against_context(
+    context: Phase0CScenarioContext,
+    states: tuple[SearchState, ...],
+    *,
+    candidate_chunk_size: int,
 ) -> None:
-    if len(supplied) != 3 or len(expected) != 3:
-        raise ValueError("parent pair-4 state must contain all three starts")
-    if any(state.completed_sweep_pairs != 4 for state in supplied):
-        raise ValueError("parent pair-4 state has an invalid completed-pair count")
-    if any(not _states_equal(left, right) for left, right in zip(supplied, expected, strict=True)):
-        raise ValueError("parent pair-4 state does not match the reconstructed state")
+    profiled_radii = context.profiled_selection.radii
+    for state in states:
+        for stage, index in enumerate(state.stage_grid_indices):
+            if index is None:
+                if state.start_name != "profiled" or profiled_radii is None:
+                    raise ValueError("parent pair-4 off-grid index is not canonical")
+                expected_radius = profiled_radii[stage]
+            else:
+                expected_radius = context.stage_grids[stage, index]
+            if _tensor_fingerprint(state.radii[stage]) != _tensor_fingerprint(
+                expected_radius
+            ):
+                raise ValueError("parent pair-4 indices and radii do not match")
+
+    metrics = evaluate_profiled_candidates_crn(
+        context.environment,
+        context.policy,
+        context.outcome_model,
+        candidate_schedules=torch.stack([state.radii for state in states]),
+        outcome_sd=context.outcome_sd,
+        noise=context.tuning_noise,
+        chunk_size=candidate_chunk_size,
+    )
+    for row, state in enumerate(states):
+        if (
+            _tensor_fingerprint(state.coverage)
+            != _tensor_fingerprint(metrics.coverage[row])
+            or _tensor_fingerprint(state.normalized_width)
+            != _tensor_fingerprint(metrics.normalized_width[row])
+        ):
+            raise ValueError("parent pair-4 metrics do not match tuning replay")
+
+
+def _resume_evaluator(
+    context: Phase0CScenarioContext,
+    states: tuple[SearchState, ...],
+    *,
+    candidate_chunk_size: int,
+) -> CRNCoordinateEvaluator:
+    starts = tuple(
+        SearchStart(
+            name=state.start_name,
+            radii=state.radii,
+            stage_grid_indices=state.stage_grid_indices,
+            coverage=state.coverage,
+            normalized_width=state.normalized_width,
+        )
+        for state in states
+    )
+    return CRNCoordinateEvaluator(
+        context.environment,
+        context.policy,
+        context.outcome_model,
+        starts=starts,
+        outcome_sd=context.outcome_sd,
+        noise=context.tuning_noise,
+        chunk_size=candidate_chunk_size,
+    )
 
 
 def run_phase0c_extension_seed(
@@ -785,75 +955,99 @@ def run_phase0c_extension_seed(
     seed: int,
     device: str,
     pair4_states: dict[str, tuple[SearchState, ...]],
+    extension_eligible: dict[str, bool],
     candidate_chunk_size: int = 16,
     max_seed_wall_seconds: float,
 ) -> SeedResult:
     """Validate pair-four parents and continue both scenarios through 8SP."""
 
+    started_at = time.monotonic()
     _validate_common_inputs(
         config,
         candidate_chunk_size=candidate_chunk_size,
         max_seed_wall_seconds=max_seed_wall_seconds,
     )
-    if set(pair4_states) != set(_SCENARIOS):
-        raise ValueError("parent pair-4 states must contain both scenarios")
+    _preflight_extension_eligibility(extension_eligible)
+    parents = _preflight_parent_states(
+        pair4_states,
+        horizon=config.horizon,
+        grid_size=config.q_grid_size,
+    )
     streams = _stream_ids(seed)
-    started_at = time.monotonic()
-    records: list[dict[str, object]] = []
-    surfaces: dict[str, Tensor] = {}
-    diagnostics: dict[str, object] = {}
 
+    contexts: dict[str, Phase0CScenarioContext] = {}
     for scenario_index, scenario in enumerate(_SCENARIOS):
         tuning_stream_id, evaluation_stream_id = streams[scenario_index]
-        context, evaluator = _prepare_search_context(
+        if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+            raise TimeoutError("seed wall-time cap expired during parent validation")
+        context = prepare_phase0c_scenario_context(
             config,
             seed=seed,
             scenario=scenario,
             scenario_index=scenario_index,
             device=device,
             candidate_chunk_size=candidate_chunk_size,
-            stream_ids=(tuning_stream_id, evaluation_stream_id),
         )
+        if (context.tuning_noise.seed, context.evaluation_noise.seed) != (
+            tuning_stream_id,
+            evaluation_stream_id,
+        ):
+            raise RuntimeError("Phase 0C context stream identity changed")
+        _validate_parent_against_context(
+            context,
+            parents[scenario],
+            candidate_chunk_size=candidate_chunk_size,
+        )
+        contexts[scenario] = context
+
+    outcomes: dict[str, JointSearchOutcome] = {}
+    results: dict[str, _MethodResult] = {}
+    for scenario in _SCENARIOS:
+        context = contexts[scenario]
         remaining = _remaining_seconds(started_at, max_seed_wall_seconds)
         if remaining <= 0.0:
-            raise ValueError("seed wall-time cap expired before parent validation")
-        parent_outcome = cyclic_joint_coordinate_search(
-            context.starts,
+            raise TimeoutError("seed wall-time cap expired before continuation")
+        evaluator = _resume_evaluator(
+            context,
+            parents[scenario],
+            candidate_chunk_size=candidate_chunk_size,
+        )
+        outcome = resume_cyclic_joint_coordinate_search(
+            parents[scenario],
             context.stage_grids,
             evaluator,
             target=1.0 - config.certification.alpha,
-            sweep_pair_checkpoints=(2, 4),
             max_wall_seconds=remaining,
         )
-        parent_checkpoint = parent_outcome.checkpoints.get(4)
-        if parent_checkpoint is None:
-            raise ValueError("parent pair-4 state cannot be reconstructed")
-        _validate_parent_states(pair4_states[scenario], parent_checkpoint.per_start)
-
-        remaining = _remaining_seconds(started_at, max_seed_wall_seconds)
-        if remaining <= 0.0:
-            outcome = JointSearchOutcome(
-                status="WALL_TIME_CAP",
-                checkpoints={},
-                elapsed_seconds=time.monotonic() - started_at,
-            )
-        else:
-            outcome = resume_cyclic_joint_coordinate_search(
-                parent_checkpoint.per_start,
-                context.stage_grids,
-                evaluator,
-                target=1.0 - config.certification.alpha,
-                max_wall_seconds=remaining,
-            )
         checkpoint = outcome.checkpoints.get(8)
-        result = _joint_payload("joint_8SP", outcome, checkpoint)
+        outcomes[scenario] = outcome
+        results[scenario] = _joint_payload("joint_8SP", outcome, checkpoint)
+
+    evaluations_by_scenario: dict[str, FrozenOracleEvaluation | None] = {}
+    for scenario in _SCENARIOS:
+        if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+            raise TimeoutError("seed wall-time cap expired before fresh evaluation")
+        result = results[scenario]
         schedules = (
             {"joint_8SP": result.radii}
             if result.status == "SELECTED" and result.radii is not None
             else {}
         )
-        evaluations = _evaluate_methods(context, schedules)
-        evaluation = evaluations.get("joint_8SP")
+        evaluations = _evaluate_methods(contexts[scenario], schedules)
+        if set(evaluations) != set(schedules):
+            raise RuntimeError("fresh evaluation did not return every frozen schedule")
+        evaluations_by_scenario[scenario] = evaluations.get("joint_8SP")
+
+    records: list[dict[str, object]] = []
+    surfaces: dict[str, Tensor] = {}
+    diagnostics: dict[str, object] = {}
+    for scenario_index, scenario in enumerate(_SCENARIOS):
+        context = contexts[scenario]
+        outcome = outcomes[scenario]
+        result = results[scenario]
+        evaluation = evaluations_by_scenario[scenario]
+        tuning_stream_id, evaluation_stream_id = streams[scenario_index]
+        checkpoint = outcome.checkpoints.get(8)
         surfaces[f"{scenario}_stage_grids"] = context.stage_grids
         _materialize_method(
             config=config,
