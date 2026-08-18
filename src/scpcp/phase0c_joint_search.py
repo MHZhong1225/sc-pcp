@@ -10,7 +10,8 @@ from typing import TypeVar
 import torch
 from torch import Tensor
 
-from scpcp.phase0_oracle import CandidateMetrics
+from scpcp.phase0_oracle import CandidateMetrics, _evaluate_stage
+from scpcp.simulator import SyntheticNoiseBundle
 
 
 _CANONICAL_START_NAMES = ("profiled", "greedy", "upper_endpoint")
@@ -22,6 +23,13 @@ class SearchStart:
     name: str
     radii: Tensor
     stage_grid_indices: tuple[int | None, ...]
+    coverage: Tensor
+    normalized_width: Tensor
+
+
+@dataclass(frozen=True)
+class ScheduleCache:
+    states_before: tuple[Tensor, ...]
     coverage: Tensor
     normalized_width: Tensor
 
@@ -87,6 +95,198 @@ def coordinate_candidate_schedules(
     schedules = incumbent.unsqueeze(0).expand(len(stage_grid), -1).clone()
     schedules[:, stage] = stage_grid.to(incumbent)
     return schedules
+
+
+@torch.no_grad()
+def build_schedule_cache(
+    environment: object,
+    policy: object,
+    outcome_model: object,
+    *,
+    schedule: Tensor,
+    outcome_sd: Tensor,
+    noise: SyntheticNoiseBundle,
+) -> ScheduleCache:
+    """Replay one schedule and retain each committed stage boundary."""
+
+    horizon = noise.action_uniform.shape[0]
+    if schedule.ndim != 1 or len(schedule) != horizon:
+        raise ValueError(f"schedule must have shape ({horizon},)")
+
+    state = environment.initial_state_from_noise(noise)
+    schedule = schedule.to(state)
+    states_before = [state.clone()]
+    coverage = []
+    normalized_width = []
+    for stage in range(horizon):
+        next_states, stage_coverage, stage_width = _evaluate_stage(
+            environment,
+            policy,
+            outcome_model,
+            states=state.unsqueeze(0),
+            radii=schedule[stage : stage + 1],
+            outcome_sd=outcome_sd,
+            noise=noise,
+            stage=stage,
+        )
+        state = next_states[0]
+        states_before.append(state.clone())
+        coverage.append(stage_coverage[0])
+        normalized_width.append(stage_width[0])
+
+    return ScheduleCache(
+        states_before=tuple(states_before),
+        coverage=torch.stack(coverage),
+        normalized_width=torch.stack(normalized_width),
+    )
+
+
+def _allocate_candidate_states(state: Tensor, candidate_count: int) -> Tensor:
+    return state.new_empty((candidate_count, *state.shape))
+
+
+@torch.no_grad()
+def evaluate_coordinate_candidates_crn(
+    environment: object,
+    policy: object,
+    outcome_model: object,
+    *,
+    cache: ScheduleCache,
+    incumbent_schedule: Tensor,
+    stage: int,
+    stage_grid: Tensor,
+    outcome_sd: Tensor,
+    noise: SyntheticNoiseBundle,
+    chunk_size: int,
+) -> CandidateMetrics:
+    """Evaluate one coordinate from its cached incumbent boundary state."""
+
+    horizon = len(incumbent_schedule)
+    if (
+        incumbent_schedule.ndim != 1
+        or len(cache.states_before) != horizon + 1
+        or len(cache.coverage) != horizon
+        or len(cache.normalized_width) != horizon
+        or noise.action_uniform.shape[0] != horizon
+    ):
+        raise ValueError("cache and incumbent schedule horizons must match")
+    if not 0 <= stage < horizon:
+        raise ValueError("stage must lie within the schedule horizon")
+
+    candidate_count = len(stage_grid)
+    coverage = cache.coverage.unsqueeze(0).expand(candidate_count, -1).clone()
+    normalized_width = (
+        cache.normalized_width.unsqueeze(0).expand(candidate_count, -1).clone()
+    )
+    incumbent_schedule = incumbent_schedule.to(cache.states_before[stage])
+    stage_grid = stage_grid.to(incumbent_schedule)
+
+    for start in range(0, candidate_count, chunk_size):
+        candidate_radii = stage_grid[start : start + chunk_size]
+        states = _allocate_candidate_states(
+            cache.states_before[stage],
+            len(candidate_radii),
+        )
+        states.copy_(cache.states_before[stage].unsqueeze(0))
+        for suffix_stage in range(stage, horizon):
+            radii = (
+                candidate_radii
+                if suffix_stage == stage
+                else incumbent_schedule[suffix_stage].expand(len(candidate_radii))
+            )
+            states, stage_coverage, stage_width = _evaluate_stage(
+                environment,
+                policy,
+                outcome_model,
+                states=states,
+                radii=radii,
+                outcome_sd=outcome_sd,
+                noise=noise,
+                stage=suffix_stage,
+            )
+            coverage[start : start + len(candidate_radii), suffix_stage] = (
+                stage_coverage
+            )
+            normalized_width[
+                start : start + len(candidate_radii), suffix_stage
+            ] = stage_width
+
+    return CandidateMetrics(
+        coverage=coverage,
+        normalized_width=normalized_width,
+    )
+
+
+class CRNCoordinateEvaluator:
+    """Adapt cached CRN suffix replay to the joint-search evaluator contract."""
+
+    def __init__(
+        self,
+        environment: object,
+        policy: object,
+        outcome_model: object,
+        *,
+        starts: tuple[SearchStart, ...],
+        outcome_sd: Tensor,
+        noise: SyntheticNoiseBundle,
+        chunk_size: int,
+    ) -> None:
+        starts = _canonical_order(starts, tuple(start.name for start in starts))
+        self._environment = environment
+        self._policy = policy
+        self._outcome_model = outcome_model
+        self._outcome_sd = outcome_sd
+        self._noise = noise
+        self._chunk_size = chunk_size
+        self._schedules = {start.name: start.radii.clone() for start in starts}
+        self._caches = {
+            start.name: self._build_cache(start.radii) for start in starts
+        }
+
+    def _build_cache(self, schedule: Tensor) -> ScheduleCache:
+        return build_schedule_cache(
+            self._environment,
+            self._policy,
+            self._outcome_model,
+            schedule=schedule,
+            outcome_sd=self._outcome_sd,
+            noise=self._noise,
+        )
+
+    def __call__(
+        self,
+        start_name: str,
+        incumbent: Tensor,
+        stage: int,
+        grid: Tensor,
+    ) -> CandidateMetrics:
+        if start_name not in self._caches:
+            raise ValueError(
+                "canonical starts must be exactly: "
+                "profiled, greedy, upper_endpoint"
+            )
+        horizon = len(self._schedules[start_name])
+        if incumbent.ndim != 1 or len(incumbent) != horizon:
+            raise ValueError("reused start name has an incompatible horizon")
+        if not 0 <= stage < horizon:
+            raise ValueError("stage must lie within the schedule horizon")
+
+        if not torch.equal(incumbent, self._schedules[start_name]):
+            self._caches[start_name] = self._build_cache(incumbent)
+            self._schedules[start_name] = incumbent.clone()
+
+        return evaluate_coordinate_candidates_crn(
+            self._environment,
+            self._policy,
+            self._outcome_model,
+            cache=self._caches[start_name],
+            incumbent_schedule=incumbent,
+            stage=stage,
+            stage_grid=grid,
+            outcome_sd=self._outcome_sd,
+            noise=self._noise,
+            chunk_size=self._chunk_size,
+        )
 
 
 def choose_coordinate_candidate(
