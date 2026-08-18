@@ -5,11 +5,16 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import TypeVar
 
 import torch
 from torch import Tensor
 
 from scpcp.phase0_oracle import CandidateMetrics
+
+
+_CANONICAL_START_NAMES = ("profiled", "greedy", "upper_endpoint")
+_NamedSearchObject = TypeVar("_NamedSearchObject")
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,20 @@ def _state_from_start(start: SearchStart) -> SearchState:
     )
 
 
+def _canonical_order(
+    values: tuple[_NamedSearchObject, ...],
+    names: tuple[str, ...],
+) -> tuple[_NamedSearchObject, ...]:
+    if len(values) != len(_CANONICAL_START_NAMES) or set(names) != set(
+        _CANONICAL_START_NAMES
+    ):
+        raise ValueError(
+            "canonical starts must be exactly: profiled, greedy, upper_endpoint"
+        )
+    by_name = dict(zip(names, values, strict=True))
+    return tuple(by_name[name] for name in _CANONICAL_START_NAMES)
+
+
 def _micro_width(state: SearchState) -> float:
     return float(state.normalized_width.mean().item())
 
@@ -162,8 +181,17 @@ def _validate_search_inputs(
     if max_wall_seconds is not None and max_wall_seconds <= 0:
         raise ValueError("max_wall_seconds must be positive")
     horizon = stage_grids.shape[0]
-    if any(len(state.radii) != horizon for state in states):
-        raise ValueError("every search state must match the stage-grid horizon")
+    if any(
+        state.radii.ndim != 1
+        or len(state.radii) != horizon
+        or len(state.stage_grid_indices) != horizon
+        or state.coverage.ndim != 1
+        or len(state.coverage) != horizon
+        or state.normalized_width.ndim != 1
+        or len(state.normalized_width) != horizon
+        for state in states
+    ):
+        raise ValueError("state dimensions must match the stage-grid horizon")
 
 
 def _run_search(
@@ -192,7 +220,8 @@ def _run_search(
         pair_committed = False
         updated_states = []
         deadline_reached = False
-        for state in states:
+        pair_completed_at_deadline = False
+        for state_index, state in enumerate(states):
             current = state
             for direction, stages in (
                 ("forward", range(horizon)),
@@ -213,12 +242,6 @@ def _run_search(
                         stage,
                         grid,
                     )
-                    if (
-                        max_wall_seconds is not None
-                        and clock() - started_at >= max_wall_seconds
-                    ):
-                        deadline_reached = True
-                        break
                     schedule_evaluations += len(grid)
                     choice = choose_coordinate_candidate(metrics, target=target)
                     committed = (
@@ -256,15 +279,30 @@ def _run_search(
                             after_micro_width=_micro_width(current),
                         )
                     )
+                    if (
+                        max_wall_seconds is not None
+                        and clock() - started_at >= max_wall_seconds
+                    ):
+                        deadline_reached = True
+                        pair_completed_at_deadline = (
+                            state_index == len(states) - 1
+                            and direction == "reverse"
+                            and stage == 0
+                        )
+                        break
                 if deadline_reached:
                     break
             if deadline_reached:
+                if pair_completed_at_deadline:
+                    updated_states.append(
+                        replace(current, completed_sweep_pairs=sweep_pair)
+                    )
                 break
             updated_states.append(
                 replace(current, completed_sweep_pairs=sweep_pair)
             )
 
-        if deadline_reached:
+        if deadline_reached and not pair_completed_at_deadline:
             states = pair_start_states
             del trace[pair_trace_length:]
             schedule_evaluations = pair_start_evaluations
@@ -276,6 +314,27 @@ def _run_search(
             )
 
         states = tuple(updated_states)
+
+        if deadline_reached:
+            if not pair_committed:
+                states = tuple(
+                    replace(state, converged_at_pair=sweep_pair)
+                    for state in states
+                )
+            if sweep_pair in requested_pairs:
+                checkpoints[sweep_pair] = _checkpoint(
+                    sweep_pair,
+                    sweep_pair,
+                    states,
+                    trace,
+                    schedule_evaluations,
+                    committed_updates,
+                )
+            return JointSearchOutcome(
+                status="WALL_TIME_CAP",
+                checkpoints=checkpoints,
+                elapsed_seconds=clock() - started_at,
+            )
 
         if not pair_committed:
             states = tuple(
@@ -324,6 +383,7 @@ def cyclic_joint_coordinate_search(
     """Return deterministic best-found checkpoints from cyclic coordinate search."""
 
     started_at = clock()
+    starts = _canonical_order(starts, tuple(start.name for start in starts))
     active_states = tuple(
         _state_from_start(start)
         for start in starts
@@ -368,7 +428,11 @@ def resume_cyclic_joint_coordinate_search(
     """Continue pair-four states at pair five and return only pair eight."""
 
     started_at = clock()
-    if not states or any(state.completed_sweep_pairs != 4 for state in states):
+    states = _canonical_order(
+        states,
+        tuple(state.start_name for state in states),
+    )
+    if any(state.completed_sweep_pairs != 4 for state in states):
         raise ValueError("every state must have completed_sweep_pairs equal to 4")
 
     requested_pairs = (8,)
@@ -378,10 +442,23 @@ def resume_cyclic_joint_coordinate_search(
         requested_pairs,
         max_wall_seconds,
     )
-    if all(state.converged_at_pair is not None for state in states):
-        executed_pair = max(
-            state.converged_at_pair or 4 for state in states
+    if any(not bool((state.coverage >= target).all().item()) for state in states):
+        raise ValueError("resume states must be jointly feasible")
+
+    converged_pairs = tuple(state.converged_at_pair for state in states)
+    present_converged_pairs = tuple(
+        pair for pair in converged_pairs if pair is not None
+    )
+    if present_converged_pairs and (
+        len(present_converged_pairs) != len(states)
+        or len(set(present_converged_pairs)) != 1
+        or not 1 <= present_converged_pairs[0] <= 4
+    ):
+        raise ValueError(
+            "convergence metadata must be consistent and no later than pair 4"
         )
+    if all(state.converged_at_pair is not None for state in states):
+        executed_pair = present_converged_pairs[0]
         checkpoint = _checkpoint(8, executed_pair, states, [], 0, 0)
         return JointSearchOutcome(
             status="SELECTED",
