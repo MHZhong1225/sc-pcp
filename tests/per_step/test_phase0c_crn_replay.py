@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import weakref
 
 import pytest
@@ -365,17 +364,72 @@ def test_adapter_rejects_noncanonical_constructor_starts() -> None:
         )
 
 
-def test_candidate_state_buffer_is_released_before_next_coordinate(
+@pytest.mark.parametrize(
+    ("stage", "expected_stage_calls"),
+    (
+        (0, (0, 1, 2, 0, 1, 2, 0, 1, 2)),
+        (1, (1, 2, 1, 2, 1, 2)),
+        (2, (2, 2, 2)),
+    ),
+)
+def test_candidate_evaluation_replays_only_requested_suffix(
+    stage: int,
+    expected_stage_calls: tuple[int, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate_buffers: list[weakref.ReferenceType[Tensor]] = []
+    environment = CountingEnvironment()
+    cache = _cache(environment)
+    initial_state_calls = environment.initial_state_calls
+    real_evaluate_stage = phase0c_joint_search._evaluate_stage
+    observed_stage_calls: list[int] = []
+
+    def recording_evaluate_stage(*args: object, **kwargs: object):
+        observed_stage_calls.append(int(kwargs["stage"]))
+        return real_evaluate_stage(*args, **kwargs)
+
+    monkeypatch.setattr(
+        phase0c_joint_search,
+        "_evaluate_stage",
+        recording_evaluate_stage,
+    )
+
+    evaluate_coordinate_candidates_crn(
+        environment,
+        DeterministicPolicy(),
+        DeterministicOutcomeModel(),
+        cache=cache,
+        incumbent_schedule=INCUMBENT,
+        stage=stage,
+        stage_grid=STAGE_GRID,
+        outcome_sd=OUTCOME_SD,
+        noise=_noise(),
+        chunk_size=2,
+    )
+
+    assert tuple(observed_stage_calls) == expected_stage_calls
+    assert environment.initial_state_calls == initial_state_calls
+
+
+def test_final_candidate_state_buffer_is_released_before_next_coordinate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluator = _coordinate_evaluator(DeterministicEnvironment())
+    real_evaluate_stage = phase0c_joint_search._evaluate_stage
+    next_state_buffers: list[weakref.ReferenceType[Tensor]] = []
+    allocations = 0
 
     def tracked_allocation(state: Tensor, candidate_count: int) -> Tensor:
-        gc.collect()
-        assert all(reference() is None for reference in candidate_buffers)
-        allocated = state.new_empty((candidate_count, *state.shape))
-        candidate_buffers.append(weakref.ref(allocated))
-        return allocated
+        nonlocal allocations
+        if next_state_buffers:
+            assert next_state_buffers[-1]() is None
+        allocations += 1
+        return state.new_empty((candidate_count, *state.shape))
+
+    def tracked_evaluate_stage(*args: object, **kwargs: object):
+        result = real_evaluate_stage(*args, **kwargs)
+        assert result[0].shape == (len(STAGE_GRID), 5, 1)
+        next_state_buffers.append(weakref.ref(result[0]))
+        return result
 
     monkeypatch.setattr(
         phase0c_joint_search,
@@ -383,11 +437,15 @@ def test_candidate_state_buffer_is_released_before_next_coordinate(
         tracked_allocation,
         raising=False,
     )
-    evaluator = _coordinate_evaluator(DeterministicEnvironment())
+    monkeypatch.setattr(
+        phase0c_joint_search,
+        "_evaluate_stage",
+        tracked_evaluate_stage,
+    )
 
     evaluator("profiled", INCUMBENT, 0, STAGE_GRID)
     evaluator("profiled", INCUMBENT, 1, STAGE_GRID)
 
-    assert len(candidate_buffers) == 2
-    gc.collect()
-    assert all(reference() is None for reference in candidate_buffers)
+    assert allocations == 2
+    assert len(next_state_buffers) == 5
+    assert next_state_buffers[-1]() is None
