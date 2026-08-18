@@ -460,6 +460,46 @@ def test_deadline_during_last_coordinate_keeps_and_publishes_complete_pair() -> 
     assert len(checkpoint.trace) == 8
 
 
+def test_deadline_after_converged_pair_materializes_later_checkpoints() -> None:
+    clock = ManualClock()
+    evaluator_calls = 0
+    start = _start("profiled", (1.0,), width=(1.0,))
+
+    def equal_width_proposals(
+        start_name: str,
+        incumbent: Tensor,
+        stage: int,
+        grid: Tensor,
+    ) -> CandidateMetrics:
+        nonlocal evaluator_calls
+        evaluator_calls += 1
+        clock.now += 1.0
+        return CandidateMetrics(
+            coverage=torch.full((len(grid), 1), 0.95),
+            normalized_width=torch.ones(len(grid), 1),
+        )
+
+    outcome = cyclic_joint_coordinate_search(
+        _canonical_starts(start),
+        torch.tensor([[1.0, 2.0]]),
+        equal_width_proposals,
+        sweep_pair_checkpoints=(2, 4),
+        max_wall_seconds=1.5,
+        clock=clock,
+    )
+
+    assert outcome.status == "WALL_TIME_CAP"
+    assert tuple(outcome.checkpoints) == (2, 4)
+    assert evaluator_calls == 2
+    for requested_pair, checkpoint in outcome.checkpoints.items():
+        assert checkpoint.requested_sweep_pairs == requested_pair
+        assert checkpoint.executed_sweep_pairs == 1
+        assert checkpoint.schedule_evaluations == 4
+        assert len(checkpoint.trace) == 2
+        assert checkpoint.best.completed_sweep_pairs == requested_pair
+        assert checkpoint.best.converged_at_pair == 1
+
+
 def _pair_four_state(name: str, completed_sweep_pairs: int = 4) -> SearchState:
     return SearchState(
         start_name=name,

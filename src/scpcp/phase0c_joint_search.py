@@ -168,6 +168,28 @@ def _checkpoint(
     )
 
 
+def _materialize_converged_checkpoints(
+    checkpoints: dict[int, JointSearchCheckpoint],
+    requested_pairs: tuple[int, ...],
+    executed_pair: int,
+    states: tuple[SearchState, ...],
+    trace: list[CoordinateStep],
+    schedule_evaluations: int,
+    committed_updates: int,
+) -> None:
+    for requested_pair in requested_pairs:
+        if requested_pair < executed_pair:
+            continue
+        checkpoints[requested_pair] = _checkpoint(
+            requested_pair,
+            executed_pair,
+            states,
+            trace,
+            schedule_evaluations,
+            committed_updates,
+        )
+
+
 def _validate_search_inputs(
     states: tuple[SearchState, ...],
     stage_grids: Tensor,
@@ -321,7 +343,16 @@ def _run_search(
                     replace(state, converged_at_pair=sweep_pair)
                     for state in states
                 )
-            if sweep_pair in requested_pairs:
+                _materialize_converged_checkpoints(
+                    checkpoints,
+                    requested_pairs,
+                    sweep_pair,
+                    states,
+                    trace,
+                    schedule_evaluations,
+                    committed_updates,
+                )
+            elif sweep_pair in requested_pairs:
                 checkpoints[sweep_pair] = _checkpoint(
                     sweep_pair,
                     sweep_pair,
@@ -340,17 +371,15 @@ def _run_search(
             states = tuple(
                 replace(state, converged_at_pair=sweep_pair) for state in states
             )
-            for requested_pair in requested_pairs:
-                if requested_pair < sweep_pair:
-                    continue
-                checkpoints[requested_pair] = _checkpoint(
-                    requested_pair,
-                    sweep_pair,
-                    states,
-                    trace,
-                    schedule_evaluations,
-                    committed_updates,
-                )
+            _materialize_converged_checkpoints(
+                checkpoints,
+                requested_pairs,
+                sweep_pair,
+                states,
+                trace,
+                schedule_evaluations,
+                committed_updates,
+            )
             break
 
         if sweep_pair in requested_pairs:
