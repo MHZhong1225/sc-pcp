@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -457,7 +458,9 @@ def _record(
         "tuning_stream_id": tuning_stream_id,
         "evaluation_stream_id": evaluation_stream_id,
         "n_tuning_rollouts": config.samples.oracle_surface_rollouts,
-        "n_evaluation_rollouts": config.samples.oracle_rollouts,
+        "n_evaluation_rollouts": (
+            config.samples.oracle_rollouts if evaluation is not None else 0
+        ),
         "schedule_evaluations": result.schedule_evaluations,
         "committed_updates": result.committed_updates,
         "converged_at_pair": result.converged_at_pair,
@@ -771,6 +774,11 @@ def run_phase0c_seed(
             "start_order": [start.name for start in context.starts],
             "active_start_names": list(active_start_names),
             "extension_eligible": extension_eligible,
+            "pair4_state_sha256": (
+                []
+                if checkpoint4 is None
+                else [_state_sha256(state) for state in checkpoint4.per_start]
+            ),
             "greedy_partial_indices": (
                 []
                 if context.greedy_selection.selection_available
@@ -799,17 +807,32 @@ def _tensor_fingerprint(tensor: Tensor) -> tuple[tuple[int, ...], torch.dtype, b
     return tuple(canonical.shape), canonical.dtype, raw_bytes
 
 
-def _states_equal(left: SearchState, right: SearchState) -> bool:
-    return (
-        left.start_name == right.start_name
-        and _tensor_fingerprint(left.radii) == _tensor_fingerprint(right.radii)
-        and left.stage_grid_indices == right.stage_grid_indices
-        and _tensor_fingerprint(left.coverage) == _tensor_fingerprint(right.coverage)
-        and _tensor_fingerprint(left.normalized_width)
-        == _tensor_fingerprint(right.normalized_width)
-        and left.completed_sweep_pairs == right.completed_sweep_pairs
-        and left.converged_at_pair == right.converged_at_pair
+def _state_sha256(state: SearchState) -> str:
+    parts = [b"phase0c-search-state-v1", state.start_name.encode("utf-8")]
+    for tensor in (state.radii, state.coverage, state.normalized_width):
+        shape, dtype, raw_bytes = _tensor_fingerprint(tensor)
+        parts.extend(
+            (
+                json.dumps(list(shape), separators=(",", ":")).encode(),
+                str(dtype).encode("ascii"),
+                raw_bytes,
+            )
+        )
+    parts.append(
+        json.dumps(
+            [
+                list(state.stage_grid_indices),
+                state.completed_sweep_pairs,
+                state.converged_at_pair,
+            ],
+            separators=(",", ":"),
+        ).encode()
     )
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
 
 
 def _preflight_parent_states(
@@ -881,6 +904,30 @@ def _preflight_extension_eligibility(extension_eligible: object) -> None:
         raise TypeError("extension_eligible values must be bool")
     if any(not extension_eligible[scenario] for scenario in _SCENARIOS):
         raise ValueError("extension_eligible must be true for both scenarios")
+
+
+def _preflight_parent_hashes(
+    parents: dict[str, tuple[SearchState, ...]],
+    pair4_state_sha256: object,
+) -> None:
+    if not isinstance(pair4_state_sha256, dict) or set(pair4_state_sha256) != set(
+        _SCENARIOS
+    ):
+        raise ValueError("pair4_state_sha256 must contain both scenarios")
+    for scenario in _SCENARIOS:
+        hashes = pair4_state_sha256[scenario]
+        if not isinstance(hashes, tuple) or len(hashes) != len(_START_NAMES):
+            raise ValueError("pair4_state_sha256 values must be canonical triples")
+        if any(
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in hashes
+        ):
+            raise ValueError("pair4_state_sha256 values must be lowercase SHA256 hex")
+        expected = tuple(_state_sha256(state) for state in parents[scenario])
+        if hashes != expected:
+            raise ValueError("pair4_state_sha256 SHA256 mismatch for parent pair-4 state")
 
 
 def _validate_parent_against_context(
@@ -955,6 +1002,7 @@ def run_phase0c_extension_seed(
     seed: int,
     device: str,
     pair4_states: dict[str, tuple[SearchState, ...]],
+    pair4_state_sha256: dict[str, tuple[str, str, str]],
     extension_eligible: dict[str, bool],
     candidate_chunk_size: int = 16,
     max_seed_wall_seconds: float,
@@ -973,13 +1021,16 @@ def run_phase0c_extension_seed(
         horizon=config.horizon,
         grid_size=config.q_grid_size,
     )
+    _preflight_parent_hashes(parents, pair4_state_sha256)
     streams = _stream_ids(seed)
 
     contexts: dict[str, Phase0CScenarioContext] = {}
+    wall_time_phase: str | None = None
     for scenario_index, scenario in enumerate(_SCENARIOS):
         tuning_stream_id, evaluation_stream_id = streams[scenario_index]
         if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
-            raise TimeoutError("seed wall-time cap expired during parent validation")
+            wall_time_phase = "parent_validation"
+            break
         context = prepare_phase0c_scenario_context(
             config,
             seed=seed,
@@ -993,62 +1044,99 @@ def run_phase0c_extension_seed(
             evaluation_stream_id,
         ):
             raise RuntimeError("Phase 0C context stream identity changed")
+        contexts[scenario] = context
+        if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+            wall_time_phase = "parent_validation"
+            break
         _validate_parent_against_context(
             context,
             parents[scenario],
             candidate_chunk_size=candidate_chunk_size,
         )
-        contexts[scenario] = context
+        if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+            wall_time_phase = "parent_validation"
+            break
 
     outcomes: dict[str, JointSearchOutcome] = {}
     results: dict[str, _MethodResult] = {}
-    for scenario in _SCENARIOS:
-        context = contexts[scenario]
-        remaining = _remaining_seconds(started_at, max_seed_wall_seconds)
-        if remaining <= 0.0:
-            raise TimeoutError("seed wall-time cap expired before continuation")
-        evaluator = _resume_evaluator(
-            context,
-            parents[scenario],
-            candidate_chunk_size=candidate_chunk_size,
-        )
-        outcome = resume_cyclic_joint_coordinate_search(
-            parents[scenario],
-            context.stage_grids,
-            evaluator,
-            target=1.0 - config.certification.alpha,
-            max_wall_seconds=remaining,
-        )
-        checkpoint = outcome.checkpoints.get(8)
-        outcomes[scenario] = outcome
-        results[scenario] = _joint_payload("joint_8SP", outcome, checkpoint)
+    if wall_time_phase is None:
+        for scenario in _SCENARIOS:
+            if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+                wall_time_phase = f"{scenario}_cache"
+                break
+            context = contexts[scenario]
+            evaluator = _resume_evaluator(
+                context,
+                parents[scenario],
+                candidate_chunk_size=candidate_chunk_size,
+            )
+            remaining = _remaining_seconds(started_at, max_seed_wall_seconds)
+            if remaining <= 0.0:
+                wall_time_phase = f"{scenario}_cache"
+                break
+            outcome = resume_cyclic_joint_coordinate_search(
+                parents[scenario],
+                context.stage_grids,
+                evaluator,
+                target=1.0 - config.certification.alpha,
+                max_wall_seconds=remaining,
+            )
+            checkpoint = outcome.checkpoints.get(8)
+            outcomes[scenario] = outcome
+            if (
+                outcome.status == "WALL_TIME_CAP"
+                or _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0
+            ):
+                wall_time_phase = f"{scenario}_continuation"
+                break
+            if outcome.status != "SELECTED" or checkpoint is None:
+                raise RuntimeError("extension continuation did not complete pair 8")
+            results[scenario] = _joint_payload("joint_8SP", outcome, checkpoint)
 
     evaluations_by_scenario: dict[str, FrozenOracleEvaluation | None] = {}
-    for scenario in _SCENARIOS:
-        if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
-            raise TimeoutError("seed wall-time cap expired before fresh evaluation")
-        result = results[scenario]
-        schedules = (
-            {"joint_8SP": result.radii}
-            if result.status == "SELECTED" and result.radii is not None
-            else {}
-        )
-        evaluations = _evaluate_methods(contexts[scenario], schedules)
-        if set(evaluations) != set(schedules):
-            raise RuntimeError("fresh evaluation did not return every frozen schedule")
-        evaluations_by_scenario[scenario] = evaluations.get("joint_8SP")
+    fresh_completed: set[str] = set()
+    if wall_time_phase is None:
+        for scenario in _SCENARIOS:
+            if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+                wall_time_phase = "before_fresh"
+                break
+            result = results[scenario]
+            if result.radii is None:
+                raise RuntimeError("selected pair-8 result has no schedule")
+            schedules = {"joint_8SP": result.radii}
+            evaluations = _evaluate_methods(contexts[scenario], schedules)
+            if set(evaluations) != set(schedules):
+                raise RuntimeError("fresh evaluation did not return every frozen schedule")
+            evaluations_by_scenario[scenario] = evaluations["joint_8SP"]
+            fresh_completed.add(scenario)
+            if _remaining_seconds(started_at, max_seed_wall_seconds) <= 0.0:
+                wall_time_phase = f"{scenario}_fresh"
+                break
+
+    if wall_time_phase is not None:
+        elapsed = time.monotonic() - started_at
+        results = {
+            scenario: _MethodResult(
+                method_id="joint_8SP",
+                status="WALL_TIME_CAP",
+                wall_time_seconds=elapsed,
+            )
+            for scenario in _SCENARIOS
+        }
+        evaluations_by_scenario = {scenario: None for scenario in _SCENARIOS}
 
     records: list[dict[str, object]] = []
     surfaces: dict[str, Tensor] = {}
     diagnostics: dict[str, object] = {}
     for scenario_index, scenario in enumerate(_SCENARIOS):
-        context = contexts[scenario]
-        outcome = outcomes[scenario]
+        context = contexts.get(scenario)
+        outcome = outcomes.get(scenario)
         result = results[scenario]
         evaluation = evaluations_by_scenario[scenario]
         tuning_stream_id, evaluation_stream_id = streams[scenario_index]
-        checkpoint = outcome.checkpoints.get(8)
-        surfaces[f"{scenario}_stage_grids"] = context.stage_grids
+        checkpoint = None if outcome is None else outcome.checkpoints.get(8)
+        if context is not None:
+            surfaces[f"{scenario}_stage_grids"] = context.stage_grids
         _materialize_method(
             config=config,
             seed=seed,
@@ -1059,12 +1147,17 @@ def run_phase0c_extension_seed(
             evaluation_stream_id=evaluation_stream_id,
             records=records,
             surfaces=surfaces,
-            like=context.profile,
+            like=torch.empty(0) if context is None else context.profile,
         )
         diagnostics[scenario] = {
             "tuning_stream_id": tuning_stream_id,
             "evaluation_stream_id": evaluation_stream_id,
-            "search_status": outcome.status,
+            "search_status": (
+                "WALL_TIME_CAP" if wall_time_phase is not None else outcome.status
+            ),
+            "continuation_status": None if outcome is None else outcome.status,
+            "fresh_evaluation_completed": scenario in fresh_completed,
+            "wall_time_phase": wall_time_phase,
             "checkpoint": (
                 None if checkpoint is None else _checkpoint_diagnostics(checkpoint)
             ),

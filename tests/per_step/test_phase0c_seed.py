@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import replace
@@ -213,6 +214,43 @@ def _canonical_parent_states() -> dict[str, tuple[SearchState, ...]]:
         for name, stage_indices in zip(names, indices, strict=True)
     )
     return {scenario: states for scenario in SCENARIOS}
+
+
+def _canonical_state_sha256(state: SearchState) -> str:
+    parts = [b"phase0c-search-state-v1", state.start_name.encode("utf-8")]
+    for tensor in (state.radii, state.coverage, state.normalized_width):
+        canonical = tensor.detach().cpu().contiguous()
+        parts.extend(
+            (
+                json.dumps(list(canonical.shape), separators=(",", ":")).encode(),
+                str(canonical.dtype).encode("ascii"),
+                canonical.reshape(-1).view(torch.uint8).numpy().tobytes(),
+            )
+        )
+    parts.append(
+        json.dumps(
+            [
+                list(state.stage_grid_indices),
+                state.completed_sweep_pairs,
+                state.converged_at_pair,
+            ],
+            separators=(",", ":"),
+        ).encode()
+    )
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
+
+
+def _parent_hashes(
+    parents: dict[str, tuple[SearchState, ...]],
+) -> dict[str, tuple[str, str, str]]:
+    return {
+        scenario: tuple(_canonical_state_sha256(state) for state in parents[scenario])
+        for scenario in SCENARIOS
+    }
 
 
 def _frozen(schedule: torch.Tensor) -> FrozenOracleEvaluation:
@@ -493,6 +531,9 @@ def test_seed_contract_uses_shared_crn_nested_search_and_one_fresh_evaluation(
             "upper_endpoint",
         ]
         assert result.diagnostics[scenario]["extension_eligible"] is True
+        assert result.diagnostics[scenario]["pair4_state_sha256"] == list(
+            _parent_hashes(fixture.initial_pair4)[scenario]
+        )
         assert torch.equal(
             result.surfaces[f"{scenario}_active_start_names"],
             torch.tensor([0, 1, 2]),
@@ -926,6 +967,7 @@ def test_seed_rejects_non_exact_checkpoint_tuple_before_model_work(
 def test_extension_rejects_boolean_wall_cap_before_stream_or_model_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    parents = _canonical_parent_states()
     work: list[str] = []
     monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
     monkeypatch.setattr(
@@ -938,7 +980,8 @@ def test_extension_rejects_boolean_wall_cap_before_stream_or_model_work(
             _config(),
             seed=17,
             device="cpu",
-            pair4_states=_canonical_parent_states(),
+            pair4_states=parents,
+            pair4_state_sha256=_parent_hashes(parents),
             extension_eligible={scenario: True for scenario in SCENARIOS},
             max_seed_wall_seconds=True,
         )
@@ -988,6 +1031,10 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
         max_seed_wall_seconds=60.0,
     )
     parent_states = fixture.initial_pair4
+    parent_hashes = {
+        scenario: tuple(initial.diagnostics[scenario]["pair4_state_sha256"])
+        for scenario in SCENARIOS
+    }
     resumed: list[tuple[str, tuple[SearchState, ...]]] = []
     original_replay = study.evaluate_profiled_candidates_crn
 
@@ -1057,6 +1104,7 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
         seed=17,
         device="cpu",
         pair4_states=parent_states,
+        pair4_state_sha256=parent_hashes,
         extension_eligible={scenario: True for scenario in SCENARIOS},
         candidate_chunk_size=16,
         max_seed_wall_seconds=60.0,
@@ -1088,6 +1136,7 @@ def test_extension_resumes_validated_pair4_states_and_rejects_mutation(
             seed=17,
             device="cpu",
             pair4_states=mutated,
+            pair4_state_sha256=parent_hashes,
             extension_eligible={scenario: True for scenario in SCENARIOS},
             max_seed_wall_seconds=60.0,
         )
@@ -1178,10 +1227,19 @@ def test_extension_validates_both_parents_before_any_continuation_or_evaluation(
         events.append(f"eval:{environment.scenario}")
         return original_frozen(*args, **kwargs)
 
-    ticks = iter(float(value) for value in range(100, 140))
-    monkeypatch.setattr(study.time, "monotonic", lambda: next(ticks))
+    now = [0.0]
+    original_resume_evaluator = study._resume_evaluator
+
+    def build_resume_evaluator(*args: object, **kwargs: object) -> object:
+        scenario = args[0].environment.scenario
+        events.append(f"cache:{scenario}")
+        now[0] += 10.0
+        return original_resume_evaluator(*args, **kwargs)
+
+    monkeypatch.setattr(study.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(study, "evaluate_profiled_candidates_crn", replay)
     monkeypatch.setattr(study, "cyclic_joint_coordinate_search", forbidden_initial_search)
+    monkeypatch.setattr(study, "_resume_evaluator", build_resume_evaluator)
     monkeypatch.setattr(study, "resume_cyclic_joint_coordinate_search", resume)
     monkeypatch.setattr(study, "evaluate_frozen_schedules_crn", frozen)
 
@@ -1190,20 +1248,154 @@ def test_extension_validates_both_parents_before_any_continuation_or_evaluation(
         seed=17,
         device="cpu",
         pair4_states=parents,
+        pair4_state_sha256=_parent_hashes(parents),
         extension_eligible={scenario: True for scenario in SCENARIOS},
-        max_seed_wall_seconds=60.0,
+        max_seed_wall_seconds=100.0,
     )
 
     assert events == [
         "validate:standard",
         "validate:tail_shift",
+        "cache:standard",
         "continue:standard",
+        "cache:tail_shift",
         "continue:tail_shift",
         "eval:standard",
         "eval:tail_shift",
     ]
-    assert remaining_budgets[1] < remaining_budgets[0] < 60.0
+    assert remaining_budgets == [90.0, 80.0]
     assert len(result.records) == 2
+
+
+@pytest.mark.parametrize(
+    ("cap_phase", "expected_resume_calls"),
+    (("standard_continuation", ["standard"]), ("before_fresh", list(SCENARIOS))),
+)
+def test_extension_wall_cap_is_atomic_two_unavailable_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    cap_phase: str,
+    expected_resume_calls: list[str],
+) -> None:
+    fixture = _install_happy_path(monkeypatch)
+    initial = study.run_phase0c_seed(
+        fixture.config,
+        seed=17,
+        device="cpu",
+        max_seed_wall_seconds=60.0,
+    )
+    parents = dict(fixture.initial_pair4)
+    parent_hashes = {
+        scenario: tuple(initial.diagnostics[scenario]["pair4_state_sha256"])
+        for scenario in SCENARIOS
+    }
+    original_replay = study.evaluate_profiled_candidates_crn
+
+    def replay(
+        environment: object,
+        policy: object,
+        outcome_model: object,
+        *,
+        candidate_schedules: torch.Tensor,
+        outcome_sd: torch.Tensor,
+        noise: object,
+        chunk_size: int,
+    ) -> CandidateMetrics:
+        states = parents[environment.scenario]
+        if torch.equal(candidate_schedules, torch.stack([state.radii for state in states])):
+            return CandidateMetrics(
+                coverage=torch.stack([state.coverage for state in states]),
+                normalized_width=torch.stack([state.normalized_width for state in states]),
+            )
+        return original_replay(
+            environment,
+            policy,
+            outcome_model,
+            candidate_schedules=candidate_schedules,
+            outcome_sd=outcome_sd,
+            noise=noise,
+            chunk_size=chunk_size,
+        )
+
+    now = [0.0]
+    tail_finished = [False]
+    after_tail_clock_reads = [0]
+    resume_calls: list[str] = []
+
+    def resume(
+        states: tuple[SearchState, ...],
+        stage_grids: torch.Tensor,
+        evaluator: object,
+        *,
+        target: float,
+        max_wall_seconds: float,
+    ) -> JointSearchOutcome:
+        scenario = next(name for name, value in parents.items() if states is value)
+        resume_calls.append(scenario)
+        if cap_phase == "standard_continuation" and scenario == "standard":
+            now[0] = 100.0
+            return JointSearchOutcome(
+                status="WALL_TIME_CAP",
+                checkpoints={},
+                elapsed_seconds=100.0,
+            )
+        checkpoint = _checkpoint(
+            8,
+            tuple(
+                SearchStart(
+                    name=state.start_name,
+                    radii=state.radii,
+                    stage_grid_indices=state.stage_grid_indices,
+                    coverage=state.coverage,
+                    normalized_width=state.normalized_width,
+                )
+                for state in states
+            ),
+        )
+        if cap_phase == "before_fresh" and scenario == "tail_shift":
+            tail_finished[0] = True
+        return JointSearchOutcome(
+            status="SELECTED",
+            checkpoints={8: checkpoint},
+            elapsed_seconds=1.0,
+        )
+
+    def clock() -> float:
+        if cap_phase == "before_fresh" and tail_finished[0]:
+            after_tail_clock_reads[0] += 1
+            return 0.0 if after_tail_clock_reads[0] == 1 else 100.0
+        return now[0]
+
+    monkeypatch.setattr(study.time, "monotonic", clock)
+    monkeypatch.setattr(study, "evaluate_profiled_candidates_crn", replay)
+    monkeypatch.setattr(study, "resume_cyclic_joint_coordinate_search", resume)
+    fixture.evaluation_calls.clear()
+
+    result = study.run_phase0c_extension_seed(
+        fixture.config,
+        seed=17,
+        device="cpu",
+        pair4_states=parents,
+        pair4_state_sha256=parent_hashes,
+        extension_eligible={scenario: True for scenario in SCENARIOS},
+        max_seed_wall_seconds=100.0,
+    )
+
+    assert [(row["scenario"], row["method_id"]) for row in result.records] == [
+        ("standard", "joint_8SP"),
+        ("tail_shift", "joint_8SP"),
+    ]
+    assert resume_calls == expected_resume_calls
+    assert fixture.evaluation_calls == []
+    for row in result.records:
+        assert row["selection_status"] == "WALL_TIME_CAP"
+        assert row["selection_available"] is False
+        assert row["q_by_time_json"] == "[]"
+        assert row["tuning_coverage_json"] == "[]"
+        assert row["final_coverage_json"] == "[]"
+        assert row["n_evaluation_rollouts"] == 0
+        assert result.surfaces[f"{row['scenario']}_joint_8SP_schedule"].numel() == 0
+        assert result.diagnostics[row["scenario"]]["search_status"] == "WALL_TIME_CAP"
+        assert result.diagnostics[row["scenario"]]["wall_time_phase"] == cap_phase
 
 
 @pytest.mark.parametrize(
@@ -1225,6 +1417,7 @@ def test_extension_rejects_structurally_bad_parent_before_stream_or_model_work(
     mutation: str,
 ) -> None:
     parents = _canonical_parent_states()
+    parent_hashes = _parent_hashes(parents)
     if mutation == "scenario_keys":
         parents.pop("tail_shift")
     elif mutation == "states_list":
@@ -1276,6 +1469,78 @@ def test_extension_rejects_structurally_bad_parent_before_stream_or_model_work(
             seed=17,
             device="cpu",
             pair4_states=parents,
+            pair4_state_sha256=parent_hashes,
+            extension_eligible={scenario: True for scenario in SCENARIOS},
+            max_seed_wall_seconds=60.0,
+        )
+    assert work == []
+
+
+def test_extension_rejects_convergence_mutation_against_original_hash_before_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parents = _canonical_parent_states()
+    parent_hashes = _parent_hashes(parents)
+    states = parents["standard"]
+    parents["standard"] = tuple(
+        replace(state, converged_at_pair=2) for state in states
+    )
+    work: list[str] = []
+    monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work.append("model"),
+    )
+
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        study.run_phase0c_extension_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            pair4_states=parents,
+            pair4_state_sha256=parent_hashes,
+            extension_eligible={scenario: True for scenario in SCENARIOS},
+            max_seed_wall_seconds=60.0,
+        )
+    assert work == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("scenario_shape", "value_shape", "hash_count", "bad_hex", "wrong_order"),
+)
+def test_extension_rejects_malformed_parent_hashes_before_stream_or_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    parents = _canonical_parent_states()
+    hashes: object = _parent_hashes(parents)
+    if mutation == "scenario_shape":
+        hashes = {"standard": hashes["standard"]}  # type: ignore[index]
+    elif mutation == "value_shape":
+        hashes["standard"] = list(hashes["standard"])  # type: ignore[index]
+    elif mutation == "hash_count":
+        hashes["standard"] = hashes["standard"][:2]  # type: ignore[index]
+    elif mutation == "bad_hex":
+        hashes["standard"] = ("G" * 64, *hashes["standard"][1:])  # type: ignore[index]
+    else:
+        hashes["standard"] = tuple(reversed(hashes["standard"]))  # type: ignore[index]
+
+    work: list[str] = []
+    monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
+    monkeypatch.setattr(
+        study,
+        "_prepare_oracle_context",
+        lambda *_args, **_kwargs: work.append("model"),
+    )
+    with pytest.raises(ValueError, match="pair4_state_sha256"):
+        study.run_phase0c_extension_seed(
+            _config(),
+            seed=17,
+            device="cpu",
+            pair4_states=parents,
+            pair4_state_sha256=hashes,  # type: ignore[arg-type]
             extension_eligible={scenario: True for scenario in SCENARIOS},
             max_seed_wall_seconds=60.0,
         )
@@ -1294,7 +1559,7 @@ def test_extension_rejects_structurally_bad_parent_before_stream_or_model_work(
         "convergence",
     ),
 )
-def test_parent_state_comparison_is_byte_and_metadata_exact(mutation: str) -> None:
+def test_parent_state_sha256_is_byte_and_metadata_exact(mutation: str) -> None:
     base = _canonical_parent_states()["standard"][0]
     if mutation == "radii_raw_bytes":
         base = replace(base, radii=torch.zeros(12))
@@ -1316,7 +1581,8 @@ def test_parent_state_comparison_is_byte_and_metadata_exact(mutation: str) -> No
         candidate = replace(base, completed_sweep_pairs=3)
     else:
         candidate = replace(base, converged_at_pair=2)
-    assert not study._states_equal(base, candidate)
+    assert study._state_sha256(base) == _canonical_state_sha256(base)
+    assert study._state_sha256(base) != study._state_sha256(candidate)
 
 
 def test_real_task1_partial_active_search_is_available_but_not_extension_eligible(
@@ -1395,6 +1661,7 @@ def test_extension_rejects_ineligible_parent_before_stream_or_model_work(
     monkeypatch: pytest.MonkeyPatch,
     eligibility: dict[str, object],
 ) -> None:
+    parents = _canonical_parent_states()
     work: list[str] = []
     monkeypatch.setattr(study, "_paper_seed", lambda *_args: work.append("stream"))
     monkeypatch.setattr(
@@ -1407,7 +1674,8 @@ def test_extension_rejects_ineligible_parent_before_stream_or_model_work(
             _config(),
             seed=17,
             device="cpu",
-            pair4_states=_canonical_parent_states(),
+            pair4_states=parents,
+            pair4_state_sha256=_parent_hashes(parents),
             extension_eligible=eligibility,  # type: ignore[arg-type]
             max_seed_wall_seconds=60.0,
         )
