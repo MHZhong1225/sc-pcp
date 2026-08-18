@@ -124,6 +124,12 @@ _SMOKE_FIELDS = {
 _SEED_DIRECTORY = re.compile(r"seed_(\d{5})")
 _HEX = re.compile(r"[0-9a-f]{64}")
 _SMOKE_EXECUTION_CAP_SECONDS = 86_400.0
+_RUNNER_MEASUREMENT_FIELDS = {
+    "protocol",
+    "elapsed_seconds",
+    "max_memory_allocated_bytes",
+    "max_memory_reserved_bytes",
+}
 
 
 def _positive_integer(value: str) -> int:
@@ -318,11 +324,41 @@ def _execution_metadata(
     return execution
 
 
-def _runner_result(result: Any, execution: dict[str, Any]) -> Any:
+def _validated_runner_measurement(
+    value: object,
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _RUNNER_MEASUREMENT_FIELDS:
+        raise RuntimeError(f"seed {seed} runner measurement has wrong exact fields")
+    if value["protocol"] != "phase0c_runner_measurement_v1":
+        raise RuntimeError(f"seed {seed} runner measurement protocol changed")
+    elapsed = value["elapsed_seconds"]
+    if type(elapsed) is not float or not math.isfinite(elapsed) or elapsed <= 0.0:
+        raise RuntimeError(
+            f"seed {seed} runner measurement elapsed_seconds must be finite and positive"
+        )
+    for field in ("max_memory_allocated_bytes", "max_memory_reserved_bytes"):
+        measured = value[field]
+        if type(measured) is not int or measured < 0:
+            raise RuntimeError(
+                f"seed {seed} runner measurement {field} must be a nonnegative integer"
+            )
+    return dict(value)
+
+
+def _runner_result(
+    result: Any,
+    execution: dict[str, Any],
+    measurement: dict[str, Any],
+) -> Any:
     diagnostics = dict(result.diagnostics)
-    if "runner_provenance" in diagnostics:
-        raise RuntimeError("seed diagnostics already contain runner_provenance")
+    if {"runner_provenance", "runner_measurement"} & diagnostics.keys():
+        raise RuntimeError("seed diagnostics already contain runner-owned fields")
     diagnostics["runner_provenance"] = execution
+    diagnostics["runner_measurement"] = _validated_runner_measurement(
+        measurement, seed=result.seed
+    )
     return replace(result, diagnostics=diagnostics)
 
 
@@ -343,9 +379,39 @@ def _validate_file_facts(
     for relative, expected in files.items():
         if not isinstance(expected, dict) or set(expected) != {"bytes", "sha256"}:
             raise RuntimeError(f"{label} {relative} bytes/hash fields are invalid")
+        if type(expected["bytes"]) is not int or expected["bytes"] < 0:
+            raise RuntimeError(f"{label} {relative} bytes must be an exact integer")
+        _require_sha256(expected["sha256"], label=f"{label} {relative} sha256")
         if not (root / relative).is_file() or _file_fact(root / relative) != expected:
             raise RuntimeError(f"{label} {relative} bytes/hash mismatch")
     return files
+
+
+def _validate_execution_integer_contract(execution: dict[str, Any]) -> None:
+    seeds = execution.get("ordered_seeds")
+    if (
+        not isinstance(seeds, list)
+        or not seeds
+        or any(type(seed) is not int or seed < 0 for seed in seeds)
+        or len(set(seeds)) != len(seeds)
+    ):
+        raise RuntimeError("execution ordered_seeds must contain exact integers")
+    for field in ("workers_per_device", "candidate_chunk_size"):
+        value = execution.get(field)
+        if type(value) is not int or value < 1:
+            raise RuntimeError(f"execution {field} must be a positive exact integer")
+    checkpoints = execution.get("sweep_pair_checkpoints")
+    if not isinstance(checkpoints, list) or any(
+        type(value) is not int for value in checkpoints
+    ):
+        raise RuntimeError(
+            "execution sweep_pair_checkpoints must contain exact integers"
+        )
+    expected_checkpoints = (
+        [8] if execution.get("study_kind") == "extension-8sp" else [2, 4]
+    )
+    if checkpoints != expected_checkpoints:
+        raise RuntimeError("execution sweep_pair_checkpoints changed")
 
 
 def _json_vector(value: object, *, seed: int, field: str, length: int) -> np.ndarray:
@@ -372,6 +438,62 @@ def _finite_number(value: object, *, seed: int, field: str, positive: bool = Fal
     if positive and number <= 0.0:
         raise RuntimeError(f"seed {seed} {field} must be positive")
     return number
+
+
+def _matches_float32_reduction(left: float, right: float, *, terms: int) -> bool:
+    left32 = np.float32(left)
+    right32 = np.float32(right)
+    scale = max(abs(float(left32)), abs(float(right32)))
+    roundoff_bound = float(np.finfo(np.float32).eps) * scale * terms
+    return abs(float(left32) - float(right32)) <= roundoff_bound
+
+
+def _pandas_integer(
+    value: object,
+    *,
+    seed: int,
+    field: str,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise RuntimeError(f"seed {seed} {field} must be an exact integer")
+    parsed = int(value)
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        raise RuntimeError(f"seed {seed} {field} is outside its valid range")
+    return parsed
+
+
+def _pandas_boolean(value: object, *, seed: int, field: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise RuntimeError(f"seed {seed} {field} must be an exact boolean")
+    return bool(value)
+
+
+def _nullable_csv_integer(
+    value: object,
+    *,
+    seed: int,
+    field: str,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    if pd.isna(value):
+        return None
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if not math.isfinite(number) or not number.is_integer():
+            raise RuntimeError(f"seed {seed} {field} must be an exact integer or null")
+        value = int(number)
+    return _pandas_integer(
+        value,
+        seed=seed,
+        field=field,
+        minimum=minimum,
+        maximum=maximum,
+    )
 
 
 def _record_vectors(
@@ -413,31 +535,74 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
     seen_streams: set[int] = set()
     for scenario_index, scenario in enumerate(_SCENARIOS):
         scenario_rows = records.loc[records["scenario"].eq(scenario)]
-        tuning_ids = set(int(value) for value in scenario_rows["tuning_stream_id"])
-        evaluation_ids = set(int(value) for value in scenario_rows["evaluation_stream_id"])
         expected_tuning = _paper_seed(seed, 1_300_001 + scenario_index)
         expected_evaluation = _paper_seed(seed, 1_400_001 + scenario_index)
+        tuning_ids = {
+            _pandas_integer(
+                value,
+                seed=seed,
+                field=f"{scenario} tuning_stream_id",
+                minimum=0,
+            )
+            for value in scenario_rows["tuning_stream_id"]
+        }
+        evaluation_ids = {
+            _pandas_integer(
+                value,
+                seed=seed,
+                field=f"{scenario} evaluation_stream_id",
+                minimum=0,
+            )
+            for value in scenario_rows["evaluation_stream_id"]
+        }
         if tuning_ids != {expected_tuning} or evaluation_ids != {expected_evaluation}:
             raise RuntimeError(f"seed {seed} {scenario} stream IDs changed")
-        if tuning_ids & evaluation_ids or seen_streams & (tuning_ids | evaluation_ids):
+        scenario_streams = tuning_ids | evaluation_ids
+        if tuning_ids & evaluation_ids or seen_streams & scenario_streams:
             raise RuntimeError(f"seed {seed} contains a tuning/evaluation stream collision")
-        seen_streams.update(tuning_ids | evaluation_ids)
+        seen_streams.update(scenario_streams)
 
     for row in records.to_dict(orient="records"):
-        method = str(row["method_id"])
+        method = row["method_id"]
+        if type(method) is not str or method not in _METHOD_SPECS:
+            raise RuntimeError(f"seed {seed} method_id changed")
         analysis_role, budget_id, sweep_pairs, index_length = _METHOD_SPECS[method]
-        if row["schema_version"] != "phase0c_seed_v1":
+        if type(row["schema_version"]) is not str or row["schema_version"] != "phase0c_seed_v1":
             raise RuntimeError(f"seed {seed} schema_version changed")
-        if row["analysis_role"] != analysis_role or row["budget_id"] != budget_id:
+        if (
+            type(row["analysis_role"]) is not str
+            or type(row["budget_id"]) is not str
+            or row["analysis_role"] != analysis_role
+            or row["budget_id"] != budget_id
+        ):
             raise RuntimeError(f"seed {seed} {method} method metadata changed")
-        if type(row["sweep_pairs"]) is bool or int(row["sweep_pairs"]) != sweep_pairs:
+        if _pandas_integer(
+            row["sweep_pairs"],
+            seed=seed,
+            field=f"{method} sweep_pairs",
+            minimum=0,
+            maximum=8,
+        ) != sweep_pairs:
             raise RuntimeError(f"seed {seed} {method} sweep_pairs changed")
         status = row["selection_status"]
-        if status not in {"SELECTED", "NO_FEASIBLE_START", "WALL_TIME_CAP"}:
+        if type(status) is not str or status not in {
+            "SELECTED",
+            "NO_FEASIBLE_START",
+            "WALL_TIME_CAP",
+        }:
             raise RuntimeError(f"seed {seed} {method} has an invalid selection status")
-        available = bool(row["selection_available"])
+        available = _pandas_boolean(
+            row["selection_available"],
+            seed=seed,
+            field=f"{method} selection_available",
+        )
         if available != (status == "SELECTED"):
             raise RuntimeError(f"seed {seed} {method} availability disagrees with status")
+        tuning_feasible = _pandas_boolean(
+            row["tuning_joint_feasible"],
+            seed=seed,
+            field=f"{method} tuning_joint_feasible",
+        )
         vector_length = 12 if available else 0
         indices = _json_vector(
             row["selected_stage_grid_indices_json"],
@@ -445,12 +610,55 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
             field=f"{method} selected indices",
             length=index_length if available else 0,
         )
+        minimum_index = -1 if method.startswith("joint_") else 0
         if available and (
             indices.dtype.kind not in "iu"
-            or np.any(indices < 0)
+            or np.any(indices < minimum_index)
             or np.any(indices > 100)
         ):
             raise RuntimeError(f"seed {seed} {method} selected indices are invalid")
+        endpoint_count = _pandas_integer(
+            row["selected_endpoint_stage_count"],
+            seed=seed,
+            field=f"{method} selected endpoint count",
+            minimum=0,
+            maximum=12,
+        )
+        expected_endpoint_count = (
+            int(np.count_nonzero((indices == 0) | (indices == 100)))
+            if available
+            else 0
+        )
+        if method == "current_profiled" and expected_endpoint_count:
+            expected_endpoint_count = 12
+        if endpoint_count != expected_endpoint_count:
+            raise RuntimeError(f"seed {seed} {method} endpoint count disagrees")
+        expected_initialization = {
+            "current_profiled": "profiled",
+            "greedy": "greedy",
+        }.get(method)
+        chosen = row["chosen_initialization"]
+        if available:
+            if type(chosen) is not str or (
+                expected_initialization is not None
+                and chosen != expected_initialization
+            ) or (
+                expected_initialization is None and chosen not in _START_NAMES
+            ):
+                raise RuntimeError(
+                    f"seed {seed} {method} chosen_initialization is invalid"
+                )
+            if not pd.isna(row["failure_reason"]):
+                raise RuntimeError(f"seed {seed} {method} failure_reason must be empty")
+        else:
+            if not pd.isna(chosen):
+                raise RuntimeError(
+                    f"seed {seed} unavailable {method} chosen_initialization must be empty"
+                )
+            if type(row["failure_reason"]) is not str or row["failure_reason"] != status:
+                raise RuntimeError(
+                    f"seed {seed} unavailable {method} failure_reason disagrees"
+                )
         vectors = _record_vectors(row, seed, method, vector_length)
         q = vectors["schedule"]
         tuning_coverage = vectors["tuning_coverage"]
@@ -458,6 +666,13 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
         final_coverage = vectors["final_coverage"]
         final_lcb = vectors["final_wilson_lcb"]
         final_width = vectors["final_stage_width"]
+        expected_tuning_feasible = bool(
+            available
+            and np.all(
+                np.asarray(tuning_coverage, dtype=np.float32)
+                >= np.asarray(0.90, dtype=np.float32)
+            )
+        )
         if available:
             if np.any(q <= 0.0) or np.any(tuning_width <= 0.0) or np.any(final_width <= 0.0):
                 raise RuntimeError(f"seed {seed} {method} widths and radii must be positive")
@@ -467,8 +682,16 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
                 or np.any((final_lcb < 0.0) | (final_lcb > 1.0))
             ):
                 raise RuntimeError(f"seed {seed} {method} coverage is outside [0,1]")
-            if method.startswith("joint_") and np.any(tuning_coverage < 0.90):
-                raise RuntimeError(f"seed {seed} {method} selected tuning coverage is below .90")
+            coverage32 = np.asarray(tuning_coverage, dtype=np.float32)
+            target32 = np.asarray(0.90, dtype=coverage32.dtype)
+            if method.startswith("joint_") and np.any(coverage32 < target32):
+                raise RuntimeError(
+                    f"seed {seed} {method} selected tuning coverage is below .90"
+                )
+            if tuning_feasible != expected_tuning_feasible:
+                raise RuntimeError(
+                    f"seed {seed} {method} tuning_joint_feasible disagrees"
+                )
             tuning_micro = _finite_number(
                 row["tuning_micro_width"], seed=seed, field=f"{method} tuning micro width", positive=True
             )
@@ -478,15 +701,34 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
             patient = _finite_number(
                 row["patient_normalized_width"], seed=seed, field=f"{method} patient width", positive=True
             )
-            if not math.isclose(tuning_micro, float(tuning_width.mean()), abs_tol=1e-7):
+            tuning_mean = float(
+                np.asarray(tuning_width, dtype=np.float32).mean(dtype=np.float32)
+            )
+            final_mean = float(
+                np.asarray(final_width, dtype=np.float32).mean(dtype=np.float32)
+            )
+            if not _matches_float32_reduction(
+                tuning_micro, tuning_mean, terms=len(tuning_width)
+            ):
                 raise RuntimeError(f"seed {seed} {method} tuning micro width disagrees")
-            if not math.isclose(micro, float(final_width.mean()), abs_tol=1e-7):
+            if not _matches_float32_reduction(
+                micro, final_mean, terms=len(final_width)
+            ):
                 raise RuntimeError(f"seed {seed} {method} micro width disagrees")
-            if not math.isclose(patient, micro, abs_tol=1e-7):
+            if not _matches_float32_reduction(patient, micro, terms=len(final_width)):
                 raise RuntimeError(f"seed {seed} {method} patient width disagrees")
-            if int(row["n_evaluation_rollouts"]) != 50_000:
+            if _pandas_integer(
+                row["n_evaluation_rollouts"],
+                seed=seed,
+                field=f"{method} evaluation rollout count",
+                minimum=0,
+            ) != 50_000:
                 raise RuntimeError(f"seed {seed} {method} evaluation rollout count changed")
         else:
+            if tuning_feasible != expected_tuning_feasible:
+                raise RuntimeError(
+                    f"seed {seed} {method} tuning_joint_feasible disagrees"
+                )
             for field in (
                 "tuning_micro_width",
                 "micro_normalized_width",
@@ -494,15 +736,68 @@ def _validate_record_rows(records: pd.DataFrame, seed: int, *, mode: str) -> Non
             ):
                 if not pd.isna(row[field]):
                     raise RuntimeError(f"seed {seed} unavailable {method} {field} must be NaN")
-            if int(row["n_evaluation_rollouts"]) != 0:
+            if _pandas_integer(
+                row["n_evaluation_rollouts"],
+                seed=seed,
+                field=f"{method} evaluation rollout count",
+                minimum=0,
+            ) != 0:
                 raise RuntimeError(f"seed {seed} unavailable {method} has evaluation rollouts")
-        if int(row["n_tuning_rollouts"]) != 5_000:
+        if _pandas_integer(
+            row["n_tuning_rollouts"],
+            seed=seed,
+            field=f"{method} tuning rollout count",
+            minimum=0,
+        ) != 5_000:
             raise RuntimeError(f"seed {seed} {method} tuning rollout count changed")
-        for field in ("schedule_evaluations", "committed_updates"):
-            value = row[field]
-            if isinstance(value, bool) or not float(value).is_integer() or value < 0:
-                raise RuntimeError(f"seed {seed} {method} {field} must be nonnegative integer")
-        _finite_number(row["wall_time_seconds"], seed=seed, field=f"{method} wall time")
+        search_counts = {
+            field: _pandas_integer(
+                row[field],
+                seed=seed,
+                field=f"{method} {field}",
+                minimum=0,
+            )
+            for field in ("schedule_evaluations", "committed_updates")
+        }
+        if (method in {"current_profiled", "greedy"} or not available) and any(
+            value != 0 for value in search_counts.values()
+        ):
+            raise RuntimeError(
+                f"seed {seed} {method} unavailable/reference search counts must be exactly zero"
+            )
+        converged = _nullable_csv_integer(
+            row["converged_at_pair"],
+            seed=seed,
+            field=f"{method} converged_at_pair",
+            minimum=1,
+            maximum=max(1, sweep_pairs),
+        )
+        if (method in {"current_profiled", "greedy"} or not available) and converged is not None:
+            raise RuntimeError(f"seed {seed} {method} converged_at_pair must be null")
+        wall_time = _finite_number(
+            row["wall_time_seconds"], seed=seed, field=f"{method} wall time"
+        )
+        if wall_time < 0.0:
+            raise RuntimeError(f"seed {seed} {method} wall time must be nonnegative")
+        if method in {"current_profiled", "greedy"} and wall_time != 0.0:
+            raise RuntimeError(f"seed {seed} {method} reference wall time must be zero")
+
+    if mode in {"smoke", "initial"}:
+        for scenario in _SCENARIOS:
+            pair2_wall = _finite_number(
+                _row(records, scenario, "joint_B")["wall_time_seconds"],
+                seed=seed,
+                field=f"{scenario} joint_B wall time",
+            )
+            pair4_wall = _finite_number(
+                _row(records, scenario, "joint_2B")["wall_time_seconds"],
+                seed=seed,
+                field=f"{scenario} joint_2B wall time",
+            )
+            if pair2_wall != pair4_wall:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} nested checkpoint wall times differ"
+                )
 
 
 def _load_npz(seed_dir: Path, seed: int) -> dict[str, np.ndarray]:
@@ -520,12 +815,17 @@ def _require_array(
     *,
     seed: int,
     finite: bool = True,
+    dtype: object | None = None,
 ) -> np.ndarray:
     if name not in surfaces:
         raise RuntimeError(f"seed {seed} surfaces.npz is missing {name}")
     array = surfaces[name]
     if array.shape != shape:
         raise RuntimeError(f"seed {seed} {name} has shape {array.shape}, expected {shape}")
+    if dtype is not None and array.dtype != np.dtype(dtype):
+        raise RuntimeError(
+            f"seed {seed} {name} has dtype {array.dtype}, expected {np.dtype(dtype)}"
+        )
     if array.dtype.kind == "O" or (finite and not np.isfinite(array).all()):
         raise RuntimeError(f"seed {seed} {name} must be finite numeric data")
     return array
@@ -551,9 +851,33 @@ def _surface_vectors_for_row(
     vectors = _record_vectors(row, seed, method, length)
     for suffix, expected in vectors.items():
         name = f"{scenario}_{method}_{suffix}"
-        actual = _require_array(surfaces, name, (length,), seed=seed)
+        actual = _require_array(
+            surfaces, name, (length,), seed=seed, dtype=np.float32
+        )
         if not np.array_equal(actual, expected):
             raise RuntimeError(f"seed {seed} records/NPZ disagrees for {name}")
+
+
+def _schedule_from_stage_indices(
+    indices: np.ndarray,
+    stage_grids: np.ndarray,
+    current_profiled: np.ndarray,
+    *,
+    seed: int,
+    label: str,
+) -> np.ndarray:
+    schedule = np.empty(len(indices), dtype=stage_grids.dtype)
+    for stage, index_value in enumerate(indices):
+        index = int(index_value)
+        if index == -1:
+            if current_profiled.shape != (12,):
+                raise RuntimeError(
+                    f"seed {seed} {label} inherits an unavailable current profile"
+                )
+            schedule[stage] = current_profiled[stage]
+        else:
+            schedule[stage] = stage_grids[stage, index]
+    return schedule
 
 
 def _state_from_surfaces(
@@ -564,21 +888,41 @@ def _state_from_surfaces(
     seed: int,
 ) -> SearchState:
     prefix = f"{scenario}_pair4_{start_name}"
-    radii = _require_array(surfaces, f"{prefix}_radii", (12,), seed=seed)
+    radii = _require_array(
+        surfaces, f"{prefix}_radii", (12,), seed=seed, dtype=np.float32
+    )
     indices = _require_array(
-        surfaces, f"{prefix}_stage_grid_indices", (12,), seed=seed
+        surfaces,
+        f"{prefix}_stage_grid_indices",
+        (12,),
+        seed=seed,
+        dtype=np.int64,
     )
     if indices.dtype.kind not in "iu" or np.any(indices < -1) or np.any(indices > 100):
         raise RuntimeError(f"seed {seed} {prefix} indices are invalid")
-    coverage = _require_array(surfaces, f"{prefix}_coverage", (12,), seed=seed)
+    coverage = _require_array(
+        surfaces, f"{prefix}_coverage", (12,), seed=seed, dtype=np.float32
+    )
     width = _require_array(
-        surfaces, f"{prefix}_normalized_width", (12,), seed=seed
+        surfaces,
+        f"{prefix}_normalized_width",
+        (12,),
+        seed=seed,
+        dtype=np.float32,
     )
     completed = _require_array(
-        surfaces, f"{prefix}_completed_sweep_pairs", (), seed=seed
+        surfaces,
+        f"{prefix}_completed_sweep_pairs",
+        (),
+        seed=seed,
+        dtype=np.int64,
     )
     converged = _require_array(
-        surfaces, f"{prefix}_converged_at_pair", (), seed=seed
+        surfaces,
+        f"{prefix}_converged_at_pair",
+        (),
+        seed=seed,
+        dtype=np.int64,
     )
     if completed.dtype.kind not in "iu" or int(completed) != 4:
         raise RuntimeError(f"seed {seed} {prefix} completed pair count changed")
@@ -596,6 +940,248 @@ def _state_from_surfaces(
         completed_sweep_pairs=4,
         converged_at_pair=None if converged_value == -1 else converged_value,
     )
+
+
+_TRACE_FIELDS = {
+    "start_name",
+    "sweep_pair",
+    "direction",
+    "stage",
+    "feasible_count",
+    "proposed_grid_index",
+    "before_micro_width",
+    "proposed_micro_width",
+    "committed",
+    "after_micro_width",
+}
+_CHECKPOINT_FIELDS = {
+    "requested_sweep_pairs",
+    "executed_sweep_pairs",
+    "best_start_name",
+    "schedule_evaluations",
+    "committed_updates",
+    "trace",
+}
+
+
+class _TraceFacts(NamedTuple):
+    schedule_evaluations: int
+    committed_updates: int
+    commits_by_pair: dict[int, int]
+    final_width_by_start: dict[str, float]
+
+
+class _CheckpointFacts(NamedTuple):
+    payload: dict[str, Any]
+    trace: _TraceFacts
+
+
+def _exact_int(
+    value: object,
+    *,
+    seed: int,
+    label: str,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if type(value) is not int or value < minimum or (
+        maximum is not None and value > maximum
+    ):
+        raise RuntimeError(f"seed {seed} {label} must be an exact integer in range")
+    return value
+
+
+def _positive_json_number(value: object, *, seed: int, label: str) -> float:
+    if type(value) not in {int, float}:
+        raise RuntimeError(f"seed {seed} {label} trace value must be numeric")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise RuntimeError(f"seed {seed} {label} trace value must be finite and positive")
+    return number
+
+
+def _validate_coordinate_trace(
+    trace: object,
+    *,
+    seed: int,
+    label: str,
+    start_names: list[str] | tuple[str, ...],
+    minimum_pair: int,
+    maximum_pair: int,
+) -> _TraceFacts:
+    if not isinstance(trace, list):
+        raise RuntimeError(f"seed {seed} {label} trace must be a list")
+    expected_coordinates = [
+        (start_name, sweep_pair, direction, stage)
+        for sweep_pair in range(minimum_pair, maximum_pair + 1)
+        for start_name in start_names
+        for direction, stages in (
+            ("forward", range(12)),
+            ("reverse", range(11, -1, -1)),
+        )
+        for stage in stages
+    ]
+    if len(trace) != len(expected_coordinates):
+        raise RuntimeError(f"seed {seed} {label} trace is not a complete canonical sequence")
+    committed_count = 0
+    commits_by_pair = {
+        sweep_pair: 0 for sweep_pair in range(minimum_pair, maximum_pair + 1)
+    }
+    last_width: dict[str, float] = {}
+    for step, expected_coordinate in zip(trace, expected_coordinates, strict=True):
+        if not isinstance(step, dict) or set(step) != _TRACE_FIELDS:
+            raise RuntimeError(f"seed {seed} {label} trace has wrong exact fields")
+        if type(step["start_name"]) is not str or step["start_name"] not in start_names:
+            raise RuntimeError(f"seed {seed} {label} trace start name is invalid")
+        _exact_int(
+            step["sweep_pair"],
+            seed=seed,
+            label=f"{label} trace sweep pair",
+            minimum=minimum_pair,
+            maximum=maximum_pair,
+        )
+        if step["direction"] not in {"forward", "reverse"}:
+            raise RuntimeError(f"seed {seed} {label} trace direction is invalid")
+        _exact_int(
+            step["stage"],
+            seed=seed,
+            label=f"{label} trace stage",
+            minimum=0,
+            maximum=11,
+        )
+        coordinate = (
+            step["start_name"],
+            step["sweep_pair"],
+            step["direction"],
+            step["stage"],
+        )
+        if coordinate != expected_coordinate:
+            raise RuntimeError(f"seed {seed} {label} trace order is not canonical")
+        feasible_count = _exact_int(
+            step["feasible_count"],
+            seed=seed,
+            label=f"{label} trace feasible count",
+            minimum=0,
+            maximum=101,
+        )
+        proposed_index = step["proposed_grid_index"]
+        proposed_width = step["proposed_micro_width"]
+        if feasible_count == 0:
+            if proposed_index is not None or proposed_width is not None:
+                raise RuntimeError(f"seed {seed} {label} trace infeasible proposal is invalid")
+        else:
+            _exact_int(
+                proposed_index,
+                seed=seed,
+                label=f"{label} trace proposed grid index",
+                minimum=0,
+                maximum=100,
+            )
+            _positive_json_number(
+                proposed_width,
+                seed=seed,
+                label=f"{label} proposed micro width",
+            )
+        before = _positive_json_number(
+            step["before_micro_width"],
+            seed=seed,
+            label=f"{label} before micro width",
+        )
+        after = _positive_json_number(
+            step["after_micro_width"],
+            seed=seed,
+            label=f"{label} after micro width",
+        )
+        committed = step["committed"]
+        if type(committed) is not bool:
+            raise RuntimeError(f"seed {seed} {label} trace committed must be bool")
+        previous = last_width.get(step["start_name"])
+        if previous is not None and before != previous:
+            raise RuntimeError(f"seed {seed} {label} trace width chain is broken")
+        if committed:
+            if (
+                proposed_width is None
+                or proposed_width >= before
+                or after != proposed_width
+            ):
+                raise RuntimeError(f"seed {seed} {label} committed trace step is invalid")
+            committed_count += 1
+            commits_by_pair[step["sweep_pair"]] += 1
+        elif after != before or (
+            proposed_width is not None and proposed_width < before
+        ):
+            raise RuntimeError(f"seed {seed} {label} uncommitted trace step is invalid")
+        last_width[step["start_name"]] = after
+    if any(
+        commits_by_pair[sweep_pair] == 0
+        for sweep_pair in range(minimum_pair, maximum_pair)
+    ):
+        raise RuntimeError(f"seed {seed} {label} trace continued after convergence")
+    return _TraceFacts(
+        len(trace) * 101,
+        committed_count,
+        commits_by_pair,
+        last_width,
+    )
+
+
+def _validate_checkpoint_diagnostics(
+    checkpoint: object,
+    *,
+    seed: int,
+    label: str,
+    requested_pair: int,
+    start_names: list[str] | tuple[str, ...],
+    extension: bool,
+) -> _CheckpointFacts:
+    if not isinstance(checkpoint, dict) or set(checkpoint) != _CHECKPOINT_FIELDS:
+        raise RuntimeError(f"seed {seed} {label} checkpoint has wrong exact fields")
+    if checkpoint["requested_sweep_pairs"] != requested_pair or type(
+        checkpoint["requested_sweep_pairs"]
+    ) is not int:
+        raise RuntimeError(f"seed {seed} {label} checkpoint request changed")
+    executed = _exact_int(
+        checkpoint["executed_sweep_pairs"],
+        seed=seed,
+        label=f"{label} checkpoint executed pairs",
+        minimum=1,
+        maximum=requested_pair,
+    )
+    best_start = checkpoint["best_start_name"]
+    if type(best_start) is not str or best_start not in start_names:
+        raise RuntimeError(f"seed {seed} {label} checkpoint best start is invalid")
+    schedule_evaluations = _exact_int(
+        checkpoint["schedule_evaluations"],
+        seed=seed,
+        label=f"{label} checkpoint schedule evaluations",
+        minimum=0,
+    )
+    committed_updates = _exact_int(
+        checkpoint["committed_updates"],
+        seed=seed,
+        label=f"{label} checkpoint committed updates",
+        minimum=0,
+    )
+    trace = checkpoint["trace"]
+    if extension and executed <= 4:
+        if trace != []:
+            raise RuntimeError(f"seed {seed} {label} converged-parent trace must be empty")
+        trace_facts = _TraceFacts(0, 0, {}, {})
+    else:
+        trace_facts = _validate_coordinate_trace(
+            trace,
+            seed=seed,
+            label=label,
+            start_names=start_names,
+            minimum_pair=5 if extension else 1,
+            maximum_pair=executed,
+        )
+    if (
+        schedule_evaluations != trace_facts.schedule_evaluations
+        or committed_updates != trace_facts.committed_updates
+    ):
+        raise RuntimeError(f"seed {seed} {label} checkpoint trace-derived counts differ")
+    return _CheckpointFacts(checkpoint, trace_facts)
 
 
 def _validate_initial_surfaces(
@@ -650,6 +1236,22 @@ def _validate_initial_surfaces(
             raise RuntimeError(f"seed {seed} {scenario} pair4 state hash count changed")
         if any(type(value) is not str or _HEX.fullmatch(value) is None for value in hashes):
             raise RuntimeError(f"seed {seed} {scenario} pair4 state hash is malformed")
+        search_status = scenario_diagnostics["search_status"]
+        if type(search_status) is not str or search_status not in {
+            "SELECTED",
+            "NO_FEASIBLE_START",
+            "WALL_TIME_CAP",
+        }:
+            raise RuntimeError(f"seed {seed} {scenario} diagnostic search status is invalid")
+        greedy_partial = scenario_diagnostics["greedy_partial_indices"]
+        if (
+            not isinstance(greedy_partial, list)
+            or len(greedy_partial) > 11
+            or any(type(value) is not int or not 0 <= value <= 100 for value in greedy_partial)
+        ):
+            raise RuntimeError(f"seed {seed} {scenario} greedy partial diagnostics are invalid")
+        if bool(_row(records, scenario, "greedy")["selection_available"]) and greedy_partial:
+            raise RuntimeError(f"seed {seed} {scenario} selected greedy has partial diagnostics")
 
         base_keys = {
             f"{scenario}_profile",
@@ -660,15 +1262,33 @@ def _validate_initial_surfaces(
             f"{scenario}_extension_eligible",
         }
         expected_keys.update(base_keys)
-        profile = _require_array(surfaces, f"{scenario}_profile", (12,), seed=seed)
+        profile = _require_array(
+            surfaces,
+            f"{scenario}_profile",
+            (12,),
+            seed=seed,
+            dtype=np.float32,
+        )
         scale_grid = _require_array(
-            surfaces, f"{scenario}_profiled_scale_grid", (101,), seed=seed
+            surfaces,
+            f"{scenario}_profiled_scale_grid",
+            (101,),
+            seed=seed,
+            dtype=np.float32,
         )
         profiled_schedules = _require_array(
-            surfaces, f"{scenario}_profiled_schedules", (101, 12), seed=seed
+            surfaces,
+            f"{scenario}_profiled_schedules",
+            (101, 12),
+            seed=seed,
+            dtype=np.float32,
         )
         stage_grids = _require_array(
-            surfaces, f"{scenario}_stage_grids", (12, 101), seed=seed
+            surfaces,
+            f"{scenario}_stage_grids",
+            (12, 101),
+            seed=seed,
+            dtype=np.float32,
         )
         if np.any(profile <= 0.0) or np.any(scale_grid <= 0.0) or np.any(stage_grids <= 0.0):
             raise RuntimeError(f"seed {seed} {scenario} grids/profile must be positive")
@@ -677,18 +1297,27 @@ def _validate_initial_surfaces(
         if not np.array_equal(profiled_schedules, scale_grid[:, None] * profile[None, :]):
             raise RuntimeError(f"seed {seed} {scenario} profiled schedules disagree")
         active_surface = _require_array(
-            surfaces, f"{scenario}_active_start_names", (len(active_names),), seed=seed
+            surfaces,
+            f"{scenario}_active_start_names",
+            (len(active_names),),
+            seed=seed,
+            dtype=np.int64,
         )
         if active_surface.dtype.kind not in "iu" or active_surface.tolist() != [
             _START_NAMES.index(name) for name in active_names
         ]:
             raise RuntimeError(f"seed {seed} {scenario} active-start surface disagrees")
         eligible_surface = _require_array(
-            surfaces, f"{scenario}_extension_eligible", (), seed=seed
+            surfaces,
+            f"{scenario}_extension_eligible",
+            (),
+            seed=seed,
+            dtype=np.bool_,
         )
         if eligible_surface.dtype.kind != "b" or bool(eligible_surface) != eligible:
             raise RuntimeError(f"seed {seed} {scenario} eligibility surface disagrees")
 
+        current_schedule = surfaces[f"{scenario}_current_profiled_schedule"]
         for method in _INITIAL_METHODS:
             expected_keys.update(
                 f"{scenario}_{method}_{suffix}" for suffix in _SURFACE_FIELDS
@@ -706,15 +1335,22 @@ def _validate_initial_surfaces(
                     length=indices_length,
                 ).astype(int)
                 schedule = surfaces[f"{scenario}_{method}_schedule"]
-                expected_schedule = (
-                    profiled_schedules[int(indices[0])]
-                    if method == "current_profiled"
-                    else stage_grids[np.arange(12), indices]
-                )
+                if method == "current_profiled":
+                    expected_schedule = profiled_schedules[int(indices[0])]
+                elif method == "greedy":
+                    expected_schedule = stage_grids[np.arange(12), indices]
+                else:
+                    expected_schedule = _schedule_from_stage_indices(
+                        indices,
+                        stage_grids,
+                        current_schedule,
+                        seed=seed,
+                        label=f"{scenario} {method}",
+                    )
                 if not np.array_equal(schedule, expected_schedule):
                     raise RuntimeError(f"seed {seed} {scenario} {method} index mapping disagrees")
 
-        current_schedule = surfaces[f"{scenario}_current_profiled_schedule"]
+        states_by_name: dict[str, SearchState] = {}
         for state_index, start_name in enumerate(state_names):
             prefix = f"{scenario}_pair4_{start_name}"
             state_keys = {f"{prefix}_{suffix}" for suffix in _STATE_SUFFIXES}
@@ -722,6 +1358,7 @@ def _validate_initial_surfaces(
             state = _state_from_surfaces(
                 surfaces, scenario=scenario, start_name=start_name, seed=seed
             )
+            states_by_name[start_name] = state
             for stage, index in enumerate(state.stage_grid_indices):
                 expected_radius = (
                     current_schedule[stage] if index is None else stage_grids[stage, index]
@@ -731,34 +1368,369 @@ def _validate_initial_surfaces(
             if _state_sha256(state) != hashes[state_index]:
                 raise RuntimeError(f"seed {seed} {scenario} pair4 state hash mismatch")
 
-        if not isinstance(checkpoints, dict) or not set(checkpoints).issubset({"2", "4"}):
+        if not isinstance(checkpoints, dict):
             raise RuntimeError(f"seed {seed} {scenario} checkpoints are invalid")
-        for pair_text, checkpoint in checkpoints.items():
-            if not isinstance(checkpoint, dict):
-                raise RuntimeError(f"seed {seed} checkpoint diagnostics must be objects")
-            required = {
-                "requested_sweep_pairs",
-                "executed_sweep_pairs",
-                "best_start_name",
-                "schedule_evaluations",
-                "committed_updates",
-                "trace",
-            }
-            if set(checkpoint) != required or not isinstance(checkpoint["trace"], list):
-                raise RuntimeError(f"seed {seed} checkpoint diagnostics have wrong fields")
-            pair = int(pair_text)
-            if checkpoint["requested_sweep_pairs"] != pair:
-                raise RuntimeError(f"seed {seed} checkpoint request changed")
-            method_row = _row(records, scenario, "joint_B" if pair == 2 else "joint_2B")
-            if bool(method_row["selection_available"]):
-                if int(method_row["schedule_evaluations"]) != checkpoint["schedule_evaluations"]:
-                    raise RuntimeError(f"seed {seed} checkpoint schedule count disagrees")
-                if int(method_row["committed_updates"]) != checkpoint["committed_updates"]:
-                    raise RuntimeError(f"seed {seed} checkpoint commit count disagrees")
+        rows_by_pair = {
+            2: _row(records, scenario, "joint_B"),
+            4: _row(records, scenario, "joint_2B"),
+        }
+        expected_checkpoint_keys = {
+            str(pair)
+            for pair, method_row in rows_by_pair.items()
+            if method_row["selection_status"] == "SELECTED"
+        }
+        if set(checkpoints) != expected_checkpoint_keys:
+            raise RuntimeError(f"seed {seed} {scenario} checkpoint keys disagree with rows")
+        if search_status == "SELECTED" and expected_checkpoint_keys != {"2", "4"}:
+            raise RuntimeError(f"seed {seed} {scenario} selected diagnostics lack checkpoints")
+        if search_status == "NO_FEASIBLE_START" and expected_checkpoint_keys:
+            raise RuntimeError(f"seed {seed} {scenario} infeasible diagnostics have checkpoints")
+        checkpoint_facts_by_pair: dict[int, _CheckpointFacts] = {}
+        for pair, method_row in rows_by_pair.items():
+            if str(pair) not in checkpoints:
+                if method_row["selection_status"] != search_status:
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} checkpoint status disagrees with rows"
+                    )
+                continue
+            checkpoint_facts = _validate_checkpoint_diagnostics(
+                checkpoints[str(pair)],
+                seed=seed,
+                label=f"{scenario} pair{pair}",
+                requested_pair=pair,
+                start_names=active_names,
+                extension=False,
+            )
+            checkpoint_facts_by_pair[pair] = checkpoint_facts
+            checkpoint = checkpoint_facts.payload
+            executed = checkpoint["executed_sweep_pairs"]
+            expected_convergence = (
+                executed
+                if checkpoint_facts.trace.commits_by_pair[executed] == 0
+                else None
+            )
+            row_convergence = _nullable_csv_integer(
+                method_row["converged_at_pair"],
+                seed=seed,
+                field=f"{scenario} {method_row['method_id']} converged_at_pair",
+                minimum=1,
+                maximum=pair,
+            )
+            if row_convergence != expected_convergence:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} checkpoint convergence disagrees with row"
+                )
+            trace_best_start = min(
+                active_names,
+                key=checkpoint_facts.trace.final_width_by_start.__getitem__,
+            )
+            if checkpoint["best_start_name"] != trace_best_start:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} checkpoint winner disagrees with trace"
+                )
+            trace_best_width = checkpoint_facts.trace.final_width_by_start[
+                trace_best_start
+            ]
+            row_tuning_width = _finite_number(
+                method_row["tuning_micro_width"],
+                seed=seed,
+                field=f"{scenario} {method_row['method_id']} tuning micro width",
+                positive=True,
+            )
+            if not _matches_float32_reduction(
+                row_tuning_width, trace_best_width, terms=12
+            ):
+                raise RuntimeError(
+                    f"seed {seed} {scenario} checkpoint row tuning width disagrees with trace"
+                )
+            if method_row["chosen_initialization"] != checkpoint["best_start_name"]:
+                raise RuntimeError(f"seed {seed} {scenario} checkpoint winner disagrees with row")
+            if method_row["schedule_evaluations"] != checkpoint["schedule_evaluations"]:
+                raise RuntimeError(f"seed {seed} checkpoint schedule count disagrees")
+            if method_row["committed_updates"] != checkpoint["committed_updates"]:
+                raise RuntimeError(f"seed {seed} checkpoint commit count disagrees")
+            if pair == 4:
+                for name, state in states_by_name.items():
+                    state_width = float(state.normalized_width.mean().item())
+                    trace_width = checkpoint_facts.trace.final_width_by_start[name]
+                    if not _matches_float32_reduction(
+                        state_width, trace_width, terms=12
+                    ):
+                        raise RuntimeError(
+                            f"seed {seed} {scenario} persisted state width disagrees with trace"
+                        )
+                    if state.converged_at_pair != row_convergence:
+                        raise RuntimeError(
+                            f"seed {seed} {scenario} state convergence disagrees with row"
+                        )
+                best_state = states_by_name.get(checkpoint["best_start_name"])
+                if best_state is None:
+                    raise RuntimeError(f"seed {seed} pair4 checkpoint has no persisted state")
+                persisted_best_start = min(
+                    state_names,
+                    key=lambda name: float(
+                        states_by_name[name].normalized_width.mean().item()
+                    ),
+                )
+                if checkpoint["best_start_name"] != persisted_best_start:
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} checkpoint winner disagrees with states"
+                    )
+                vectors = _record_vectors(method_row, seed, "joint_2B", 12)
+                persisted = {
+                    "schedule": best_state.radii.numpy(),
+                    "tuning_coverage": best_state.coverage.numpy(),
+                    "tuning_stage_width": best_state.normalized_width.numpy(),
+                }
+                if any(
+                    not np.array_equal(vectors[name], expected)
+                    for name, expected in persisted.items()
+                ):
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} row disagrees with persisted pair4 state"
+                    )
+        if 4 in checkpoint_facts_by_pair:
+            if 2 not in checkpoint_facts_by_pair:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} pair4 checkpoint has no nested pair2"
+                )
+            pair2 = checkpoint_facts_by_pair[2].payload
+            pair4 = checkpoint_facts_by_pair[4].payload
+            trace2 = pair2["trace"]
+            trace4 = pair4["trace"]
+            if pair4["executed_sweep_pairs"] < pair2["executed_sweep_pairs"]:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} nested checkpoint execution regressed"
+                )
+            if pair4["executed_sweep_pairs"] == pair2["executed_sweep_pairs"]:
+                executed = pair4["executed_sweep_pairs"]
+                if (
+                    checkpoint_facts_by_pair[4].trace.commits_by_pair[executed]
+                    != 0
+                ):
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} equal nested checkpoints must be converged"
+                    )
+                if (
+                    trace4 != trace2
+                    or pair4["schedule_evaluations"] != pair2["schedule_evaluations"]
+                    or pair4["committed_updates"] != pair2["committed_updates"]
+                ):
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} equal nested checkpoints differ"
+                    )
+                pair2_vectors = _record_vectors(
+                    rows_by_pair[2], seed, "joint_B", 12
+                )
+                pair4_vectors = _record_vectors(
+                    rows_by_pair[4], seed, "joint_2B", 12
+                )
+                for name in ("schedule", "tuning_coverage", "tuning_stage_width"):
+                    if not np.array_equal(pair2_vectors[name], pair4_vectors[name]):
+                        raise RuntimeError(
+                            f"seed {seed} {scenario} equal nested checkpoint rows differ"
+                        )
+            elif len(trace4) <= len(trace2) or trace4[: len(trace2)] != trace2:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} pair2 trace is not a strict pair4 prefix"
+                )
     if set(surfaces) != expected_keys:
         extra = sorted(set(surfaces) - expected_keys)
         missing = sorted(expected_keys - set(surfaces))
         raise RuntimeError(f"seed {seed} surfaces.npz exact keys differ; missing={missing}, extra={extra}")
+
+
+_EXTENSION_DIAGNOSTIC_FIELDS = {
+    "tuning_stream_id",
+    "evaluation_stream_id",
+    "search_status",
+    "continuation_status",
+    "fresh_evaluation_completed",
+    "wall_time_phase",
+    "checkpoint",
+}
+_EXTENSION_WALL_PHASES = {
+    "parent_validation",
+    "standard_cache",
+    "standard_continuation",
+    "tail_shift_cache",
+    "tail_shift_continuation",
+    "before_fresh",
+    "standard_fresh",
+    "tail_shift_fresh",
+}
+
+
+def _validate_extension_diagnostics(
+    records: pd.DataFrame,
+    diagnostics: dict[str, Any],
+    seed: int,
+    parent_facts: _ParentSeedFacts,
+) -> None:
+    phases: list[object] = []
+    for scenario_index, scenario in enumerate(_SCENARIOS):
+        row = _row(records, scenario, "joint_8SP")
+        scenario_diagnostics = diagnostics.get(scenario)
+        if not isinstance(scenario_diagnostics, dict) or set(
+            scenario_diagnostics
+        ) != _EXTENSION_DIAGNOSTIC_FIELDS:
+            raise RuntimeError(
+                f"seed {seed} {scenario} extension diagnostics have wrong exact fields"
+            )
+        if scenario_diagnostics["tuning_stream_id"] != _paper_seed(
+            seed, 1_300_001 + scenario_index
+        ) or scenario_diagnostics["evaluation_stream_id"] != _paper_seed(
+            seed, 1_400_001 + scenario_index
+        ):
+            raise RuntimeError(f"seed {seed} extension diagnostic stream IDs changed")
+        phase = scenario_diagnostics["wall_time_phase"]
+        phases.append(phase)
+        if phase is None:
+            if (
+                scenario_diagnostics["search_status"] != "SELECTED"
+                or scenario_diagnostics["continuation_status"] != "SELECTED"
+                or scenario_diagnostics["fresh_evaluation_completed"] is not True
+                or row["selection_status"] != "SELECTED"
+                or not bool(row["selection_available"])
+            ):
+                raise RuntimeError(
+                    f"seed {seed} {scenario} extension selected status semantics differ"
+                )
+            checkpoint_facts = _validate_checkpoint_diagnostics(
+                scenario_diagnostics["checkpoint"],
+                seed=seed,
+                label=f"{scenario} pair8",
+                requested_pair=8,
+                start_names=_START_NAMES,
+                extension=True,
+            )
+            checkpoint = checkpoint_facts.payload
+            executed = checkpoint["executed_sweep_pairs"]
+            row_convergence = _nullable_csv_integer(
+                row["converged_at_pair"],
+                seed=seed,
+                field=f"{scenario} joint_8SP converged_at_pair",
+                minimum=1,
+                maximum=8,
+            )
+            if checkpoint_facts.trace.final_width_by_start:
+                expected_convergence = (
+                    executed
+                    if checkpoint_facts.trace.commits_by_pair[executed] == 0
+                    else None
+                )
+                expected_best_start = min(
+                    _START_NAMES,
+                    key=checkpoint_facts.trace.final_width_by_start.__getitem__,
+                )
+                trace_best_width = checkpoint_facts.trace.final_width_by_start[
+                    expected_best_start
+                ]
+                row_tuning_width = _finite_number(
+                    row["tuning_micro_width"],
+                    seed=seed,
+                    field=f"{scenario} joint_8SP tuning micro width",
+                    positive=True,
+                )
+                if not _matches_float32_reduction(
+                    row_tuning_width, trace_best_width, terms=12
+                ):
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} extension row width disagrees with trace"
+                    )
+            else:
+                expected_convergence = parent_facts.converged_at_pair[scenario]
+                expected_best_start = parent_facts.best_start_name[scenario]
+                if expected_convergence is None or executed != expected_convergence:
+                    raise RuntimeError(
+                        f"seed {seed} {scenario} empty extension trace disagrees with parent"
+                    )
+            if row_convergence != expected_convergence:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} extension convergence disagrees"
+                )
+            if checkpoint["best_start_name"] != expected_best_start:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} extension checkpoint winner disagrees with trace"
+                )
+            if checkpoint["best_start_name"] != row["chosen_initialization"]:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} extension checkpoint winner disagrees"
+                )
+            if checkpoint["schedule_evaluations"] != row["schedule_evaluations"]:
+                raise RuntimeError(f"seed {seed} extension checkpoint schedule count differs")
+            if checkpoint["committed_updates"] != row["committed_updates"]:
+                raise RuntimeError(f"seed {seed} extension checkpoint commit count differs")
+            continue
+
+        if type(phase) is not str or phase not in _EXTENSION_WALL_PHASES:
+            raise RuntimeError(f"seed {seed} extension wall-time phase is invalid")
+        if (
+            scenario_diagnostics["search_status"] != "WALL_TIME_CAP"
+            or row["selection_status"] != "WALL_TIME_CAP"
+            or bool(row["selection_available"])
+            or bool(row["tuning_joint_feasible"])
+        ):
+            raise RuntimeError(f"seed {seed} extension wall-cap status semantics differ")
+        completed_before = {
+            "parent_validation": 0,
+            "standard_cache": 0,
+            "tail_shift_cache": 1,
+            "before_fresh": 2,
+            "standard_fresh": 2,
+            "tail_shift_fresh": 2,
+        }.get(phase)
+        continuation_index = {
+            "standard_continuation": 0,
+            "tail_shift_continuation": 1,
+        }.get(phase)
+        continuation = scenario_diagnostics["continuation_status"]
+        if continuation_index is not None:
+            if scenario_index < continuation_index:
+                expected_continuations = {"SELECTED"}
+            elif scenario_index == continuation_index:
+                expected_continuations = {"SELECTED", "WALL_TIME_CAP"}
+            else:
+                expected_continuations = {None}
+        else:
+            assert completed_before is not None
+            expected_continuations = (
+                {"SELECTED"} if scenario_index < completed_before else {None}
+            )
+        if continuation not in expected_continuations:
+            raise RuntimeError(f"seed {seed} extension continuation status differs")
+        expected_fresh = scenario_index < {
+            "standard_fresh": 1,
+            "tail_shift_fresh": 2,
+        }.get(phase, 0)
+        if type(scenario_diagnostics["fresh_evaluation_completed"]) is not bool or (
+            scenario_diagnostics["fresh_evaluation_completed"] != expected_fresh
+        ):
+            raise RuntimeError(f"seed {seed} extension fresh-evaluation status differs")
+        checkpoint = scenario_diagnostics["checkpoint"]
+        if continuation is None:
+            if checkpoint is not None:
+                raise RuntimeError(f"seed {seed} extension absent continuation has checkpoint")
+        elif continuation == "SELECTED":
+            _validate_checkpoint_diagnostics(
+                checkpoint,
+                seed=seed,
+                label=f"{scenario} pair8",
+                requested_pair=8,
+                start_names=_START_NAMES,
+                extension=True,
+            )
+        elif checkpoint is not None:
+            _validate_checkpoint_diagnostics(
+                checkpoint,
+                seed=seed,
+                label=f"{scenario} pair8",
+                requested_pair=8,
+                start_names=_START_NAMES,
+                extension=True,
+            )
+    if len(set(phases)) != 1:
+        raise RuntimeError(f"seed {seed} extension wall-time phase differs by scenario")
 
 
 def _validate_extension_surfaces(
@@ -766,21 +1738,50 @@ def _validate_extension_surfaces(
     surfaces: dict[str, np.ndarray],
     diagnostics: dict[str, Any],
     seed: int,
+    parent_facts: _ParentSeedFacts,
 ) -> None:
+    _validate_extension_diagnostics(records, diagnostics, seed, parent_facts)
     expected_keys: set[str] = set()
     for scenario_index, scenario in enumerate(_SCENARIOS):
-        stage_grids = _require_array(
-            surfaces, f"{scenario}_stage_grids", (12, 101), seed=seed
-        )
-        expected_keys.add(f"{scenario}_stage_grids")
         row = _row(records, scenario, "joint_8SP")
+        scenario_diagnostics = diagnostics.get(scenario)
+        assert isinstance(scenario_diagnostics, dict)
         _surface_vectors_for_row(
             surfaces, row, scenario=scenario, method="joint_8SP", seed=seed
         )
         expected_keys.update(
             f"{scenario}_joint_8SP_{suffix}" for suffix in _SURFACE_FIELDS
         )
+        grid_name = f"{scenario}_stage_grids"
+        stage_grids = None
+        if grid_name in surfaces:
+            stage_grids = _require_array(
+                surfaces, grid_name, (12, 101), seed=seed, dtype=np.float32
+            )
+            expected_keys.add(grid_name)
+        else:
+            exact_early_cap = (
+                row["selection_status"] == "WALL_TIME_CAP"
+                and not bool(row["selection_available"])
+                and not bool(row["tuning_joint_feasible"])
+                and row["failure_reason"] == "WALL_TIME_CAP"
+                and pd.isna(row["chosen_initialization"])
+                and scenario_diagnostics.get("search_status") == "WALL_TIME_CAP"
+                and scenario_diagnostics.get("continuation_status") is None
+                and scenario_diagnostics.get("fresh_evaluation_completed") is False
+                and scenario_diagnostics.get("wall_time_phase") == "parent_validation"
+                and scenario_diagnostics.get("checkpoint") is None
+            )
+            if not exact_early_cap:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} missing stage grid is not an exact "
+                    "parent-validation wall cap"
+                )
         if bool(row["selection_available"]):
+            if stage_grids is None:
+                raise RuntimeError(
+                    f"seed {seed} selected {scenario} extension has no stage grid"
+                )
             indices = _json_vector(
                 row["selected_stage_grid_indices_json"],
                 seed=seed,
@@ -788,17 +1789,25 @@ def _validate_extension_surfaces(
                 length=12,
             ).astype(int)
             schedule = surfaces[f"{scenario}_joint_8SP_schedule"]
-            if not np.array_equal(schedule, stage_grids[np.arange(12), indices]):
+            expected_schedule = _schedule_from_stage_indices(
+                indices,
+                stage_grids,
+                parent_facts.current_schedules[scenario],
+                seed=seed,
+                label=f"{scenario} joint_8SP",
+            )
+            if not np.array_equal(schedule, expected_schedule):
                 raise RuntimeError(f"seed {seed} {scenario} joint_8SP index mapping disagrees")
-        scenario_diagnostics = diagnostics.get(scenario)
-        if not isinstance(scenario_diagnostics, dict):
-            raise RuntimeError(f"seed {seed} extension diagnostics missing {scenario}")
-        if scenario_diagnostics.get("tuning_stream_id") != _paper_seed(
-            seed, 1_300_001 + scenario_index
-        ) or scenario_diagnostics.get("evaluation_stream_id") != _paper_seed(
-            seed, 1_400_001 + scenario_index
-        ):
-            raise RuntimeError(f"seed {seed} extension diagnostic stream IDs changed")
+    if diagnostics["standard"]["wall_time_phase"] == "parent_validation":
+        present_stage_grids = tuple(
+            scenario
+            for scenario in _SCENARIOS
+            if f"{scenario}_stage_grids" in surfaces
+        )
+        if present_stage_grids not in ((), ("standard",), _SCENARIOS):
+            raise RuntimeError(
+                f"seed {seed} parent-validation stage grid presence is not a canonical prefix"
+            )
     if set(surfaces) != expected_keys:
         raise RuntimeError(f"seed {seed} extension surfaces.npz exact keys differ")
 
@@ -809,6 +1818,7 @@ def validate_seed_artifact(
     *,
     mode: str = "initial",
     expected_execution: dict[str, Any] | None = None,
+    parent_seed_dir: Path | None = None,
 ) -> Path:
     """Deeply validate one atomic initial/smoke/extension seed artifact."""
 
@@ -833,6 +1843,8 @@ def validate_seed_artifact(
     runner_provenance = diagnostics.get("runner_provenance")
     if not isinstance(runner_provenance, dict):
         raise RuntimeError(f"seed {seed} runner provenance is missing")
+    _validate_execution_integer_contract(runner_provenance)
+    _validated_runner_measurement(diagnostics.get("runner_measurement"), seed=seed)
     provenance_without_hash = dict(runner_provenance)
     stored_execution_hash = provenance_without_hash.pop("execution_sha256", None)
     if _require_sha256(stored_execution_hash, label=f"seed {seed} execution_sha256") != _canonical_sha256(
@@ -860,15 +1872,105 @@ def validate_seed_artifact(
     _validate_record_rows(records, seed, mode=mode)
     surfaces = _load_npz(seed_dir, seed)
     scenario_diagnostics = {
-        key: value for key, value in diagnostics.items() if key != "runner_provenance"
+        key: value
+        for key, value in diagnostics.items()
+        if key not in {"runner_provenance", "runner_measurement"}
     }
     if set(scenario_diagnostics) != set(_SCENARIOS):
         raise RuntimeError(f"seed {seed} diagnostics must contain exactly both scenarios")
     if mode in {"smoke", "initial"}:
+        if parent_seed_dir is not None:
+            raise ValueError("initial/smoke validation does not accept a parent seed")
         _validate_initial_surfaces(records, surfaces, scenario_diagnostics, seed)
     else:
-        _validate_extension_surfaces(records, surfaces, scenario_diagnostics, seed)
+        parent_facts = _validated_parent_current_schedules(
+            parent_seed_dir,
+            seed,
+            extension_execution=runner_provenance,
+        )
+        _validate_extension_surfaces(
+            records,
+            surfaces,
+            scenario_diagnostics,
+            seed,
+            parent_facts,
+        )
     return seed_dir
+
+
+class _ParentSeedFacts(NamedTuple):
+    current_schedules: dict[str, np.ndarray]
+    converged_at_pair: dict[str, int | None]
+    best_start_name: dict[str, str]
+
+
+def _validated_parent_current_schedules(
+    parent_seed_dir: Path | None,
+    seed: int,
+    *,
+    extension_execution: dict[str, Any],
+) -> _ParentSeedFacts:
+    if parent_seed_dir is None:
+        raise RuntimeError("extension validation requires an authenticated parent seed")
+    parent_root = parent_seed_dir.parent.resolve()
+    frozen_parent = extension_execution.get("parent_output_dir")
+    if type(frozen_parent) is not str or str(Path(frozen_parent).resolve()) != frozen_parent:
+        raise RuntimeError("extension parent_output_dir must be a resolved path")
+    if parent_root != Path(frozen_parent) or parent_seed_dir.resolve() != (
+        parent_root / f"seed_{seed:05d}"
+    ):
+        raise RuntimeError("extension parent seed path differs from frozen provenance")
+    parent_manifest = validate_study_manifest(parent_root, expected_kind="initial")
+    manifest_sha = hashlib.sha256(
+        (parent_root / "study_manifest.json").read_bytes()
+    ).hexdigest()
+    if manifest_sha != extension_execution.get("parent_study_manifest_sha256"):
+        raise RuntimeError("extension parent study manifest hash differs")
+    parent_metadata = _load_json_object(
+        parent_root / "study_metadata.json", label="parent study metadata"
+    )
+    parent_execution = parent_metadata.get("execution")
+    if not isinstance(parent_execution, dict) or parent_execution.get(
+        "execution_sha256"
+    ) != extension_execution.get("parent_execution_sha256"):
+        raise RuntimeError("extension parent execution hash differs")
+    if parent_manifest.get("execution_sha256") != parent_execution["execution_sha256"]:
+        raise RuntimeError("extension parent manifest/execution cross-check failed")
+    validate_seed_artifact(
+        parent_seed_dir,
+        seed,
+        mode="initial",
+        expected_execution=parent_execution,
+    )
+    parent_surfaces = _load_npz(parent_seed_dir, seed)
+    current_schedules = {
+        scenario: _require_array(
+            parent_surfaces,
+            f"{scenario}_current_profiled_schedule",
+            (12,),
+            seed=seed,
+            dtype=np.float32,
+        )
+        for scenario in _SCENARIOS
+    }
+    parent_seed_metadata = _load_json_object(
+        parent_seed_dir / "metadata.json", label=f"parent seed {seed} metadata"
+    )
+    parent_diagnostics = parent_seed_metadata["diagnostics"]
+    converged: dict[str, int | None] = {}
+    best_names: dict[str, str] = {}
+    for scenario in _SCENARIOS:
+        checkpoint = parent_diagnostics[scenario]["checkpoints"]["4"]
+        best_name = checkpoint["best_start_name"]
+        state = _state_from_surfaces(
+            parent_surfaces,
+            scenario=scenario,
+            start_name=best_name,
+            seed=seed,
+        )
+        converged[scenario] = state.converged_at_pair
+        best_names[scenario] = best_name
+    return _ParentSeedFacts(current_schedules, converged, best_names)
 
 
 class ParentContinuation(NamedTuple):
@@ -939,6 +2041,53 @@ def _publish_study_manifest(
     return path
 
 
+def _validate_root_completion(
+    output_dir: Path,
+    ordered_seeds: list[int],
+) -> None:
+    marker = output_dir / "COMPLETE"
+    try:
+        marker_bytes = marker.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"study root COMPLETE is unreadable: {error}") from error
+    if marker_bytes != b"complete\n":
+        raise RuntimeError("study root COMPLETE must contain exactly complete\\n")
+
+    status = _load_json_object(
+        output_dir / "study_status.json", label="study status"
+    )
+    expected_fields = {
+        "status",
+        "expected_seeds",
+        "completed_seeds",
+        "missing_seeds",
+        "updated_at_utc",
+        "error",
+    }
+    exact_seed_list = (
+        isinstance(ordered_seeds, list)
+        and all(type(seed) is int for seed in ordered_seeds)
+    )
+    status_seed_lists_are_exact = all(
+        isinstance(status.get(field), list)
+        and all(type(seed) is int for seed in status[field])
+        for field in ("expected_seeds", "completed_seeds")
+    )
+    if (
+        set(status) != expected_fields
+        or status.get("status") != "complete"
+        or not exact_seed_list
+        or not status_seed_lists_are_exact
+        or status.get("expected_seeds") != ordered_seeds
+        or status.get("completed_seeds") != ordered_seeds
+        or status.get("missing_seeds") != []
+        or type(status.get("updated_at_utc")) is not str
+        or not status["updated_at_utc"]
+        or status.get("error") is not None
+    ):
+        raise RuntimeError("study status completion contract is invalid")
+
+
 def validate_study_manifest(
     output_dir: Path,
     *,
@@ -974,13 +2123,17 @@ def validate_study_manifest(
     execution = metadata.get("execution")
     if not isinstance(execution, dict):
         raise RuntimeError("study metadata execution is missing")
+    _validate_execution_integer_contract(execution)
     ordered_seeds = manifest["ordered_seeds"]
+    metadata_seeds = metadata.get("seeds")
     if (
         not isinstance(ordered_seeds, list)
         or any(type(seed) is not int for seed in ordered_seeds)
         or len(set(ordered_seeds)) != len(ordered_seeds)
+        or not isinstance(metadata_seeds, list)
+        or any(type(seed) is not int for seed in metadata_seeds)
         or ordered_seeds != execution.get("ordered_seeds")
-        or ordered_seeds != metadata.get("seeds")
+        or ordered_seeds != metadata_seeds
     ):
         raise RuntimeError("study manifest ordered seeds differ from metadata")
     if metadata.get("source_tree_sha256") != manifest["source_tree_sha256"]:
@@ -1007,8 +2160,8 @@ def validate_study_manifest(
         raise RuntimeError("study root seed directories differ from ordered seeds")
     if any(path.name.startswith(".seed_") for path in output_dir.iterdir()):
         raise RuntimeError("partial atomic seed directory blocks study validation")
-    if require_root_complete and not (output_dir / "COMPLETE").is_file():
-        raise RuntimeError("study root COMPLETE is missing")
+    if require_root_complete:
+        _validate_root_completion(output_dir, ordered_seeds)
     return manifest
 
 
@@ -1043,11 +2196,18 @@ def _validated_existing_seeds(
         seed = int(match.group(1))
         if seed not in requested:
             raise RuntimeError(f"unexpected seed {seed} directory blocks resume")
+        parent_seed_dir = None
+        if execution["study_kind"] == "extension-8sp":
+            frozen_parent = execution.get("parent_output_dir")
+            if type(frozen_parent) is not str:
+                raise RuntimeError("extension resume parent_output_dir is missing")
+            parent_seed_dir = Path(frozen_parent) / f"seed_{seed:05d}"
         validate_seed_artifact(
             path,
             seed,
             mode=execution["study_kind"],
             expected_execution=execution,
+            parent_seed_dir=parent_seed_dir,
         )
         completed.add(seed)
     return completed
@@ -1082,6 +2242,7 @@ def _validate_resume_provenance(
     stored_execution = metadata.get("execution")
     if not isinstance(stored_execution, dict):
         raise RuntimeError("resume execution metadata is missing")
+    _validate_execution_integer_contract(stored_execution)
     for key, expected in execution.items():
         if stored_execution.get(key) != expected:
             raise RuntimeError(f"resume {key} differs from requested execution")
@@ -1137,9 +2298,7 @@ def _run_and_write(
     execution: dict[str, Any],
     parent_seed_dir: Path | None,
 ) -> dict[str, Any]:
-    started_at = time.monotonic()
-
-    def run_and_publish() -> Path:
+    def run_and_measure(cuda_device: torch.device | None) -> tuple[Any, dict[str, Any]]:
         if mode == "extension-8sp":
             if parent_seed_dir is None:
                 raise RuntimeError("extension worker requires a parent seed directory")
@@ -1152,6 +2311,10 @@ def _run_and_write(
                 for scenario in _SCENARIOS
             ):
                 raise RuntimeError(f"seed {seed} parent does not contain three canonical states")
+        if cuda_device is not None:
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+        started_at = time.monotonic()
+        if mode == "extension-8sp":
             result = run_phase0c_extension_seed(
                 config,
                 seed=seed,
@@ -1171,36 +2334,53 @@ def _run_and_write(
                 sweep_pair_checkpoints=(2, 4),
                 max_seed_wall_seconds=max_seed_wall_seconds,
             )
-        result = _runner_result(result, execution)
+        elapsed = time.monotonic() - started_at
+        measurement = {
+            "protocol": "phase0c_runner_measurement_v1",
+            "elapsed_seconds": elapsed,
+            "max_memory_allocated_bytes": (
+                0
+                if cuda_device is None
+                else int(torch.cuda.max_memory_allocated(cuda_device))
+            ),
+            "max_memory_reserved_bytes": (
+                0
+                if cuda_device is None
+                else int(torch.cuda.max_memory_reserved(cuda_device))
+            ),
+        }
+        return result, _validated_runner_measurement(measurement, seed=seed)
+
+    def run_and_publish(
+        cuda_device: torch.device | None,
+    ) -> tuple[Path, dict[str, Any]]:
+        result, measurement = run_and_measure(cuda_device)
+        result = _runner_result(result, execution, measurement)
         seed_dir = write_seed_result(result, output_dir, config)
         validate_seed_artifact(
             seed_dir,
             seed,
             mode=mode,
             expected_execution=execution,
+            parent_seed_dir=parent_seed_dir,
         )
-        return seed_dir
+        return seed_dir, measurement
 
-    allocated = 0
-    reserved = 0
     if device.startswith("cuda"):
         cuda_device = torch.device(device)
         torch.cuda.set_device(cuda_device)
         with torch.cuda.device(cuda_device):
-            torch.cuda.reset_peak_memory_stats(cuda_device)
             try:
-                seed_dir = run_and_publish()
-                allocated = int(torch.cuda.max_memory_allocated(cuda_device))
-                reserved = int(torch.cuda.max_memory_reserved(cuda_device))
+                seed_dir, measurement = run_and_publish(cuda_device)
             finally:
                 torch.cuda.empty_cache()
     else:
-        seed_dir = run_and_publish()
+        seed_dir, measurement = run_and_publish(None)
     return {
         "seed_dir": str(seed_dir),
-        "elapsed_seconds": time.monotonic() - started_at,
-        "max_memory_allocated_bytes": allocated,
-        "max_memory_reserved_bytes": reserved,
+        "elapsed_seconds": measurement["elapsed_seconds"],
+        "max_memory_allocated_bytes": measurement["max_memory_allocated_bytes"],
+        "max_memory_reserved_bytes": measurement["max_memory_reserved_bytes"],
     }
 
 
@@ -1239,6 +2419,24 @@ def _run_pending_seeds(
         for worker_index, seed, device in assigned
     )
     return _execute_jobs(worker_devices, jobs, worker_function=_run_and_write)
+
+
+def _persisted_measurement_result(seed_dir: Path, seed: int) -> dict[str, Any]:
+    metadata = _load_json_object(
+        seed_dir / "metadata.json", label=f"seed {seed} metadata"
+    )
+    diagnostics = metadata.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError(f"seed {seed} diagnostics are missing")
+    measurement = _validated_runner_measurement(
+        diagnostics.get("runner_measurement"), seed=seed
+    )
+    return {
+        "seed_dir": str(seed_dir),
+        "elapsed_seconds": measurement["elapsed_seconds"],
+        "max_memory_allocated_bytes": measurement["max_memory_allocated_bytes"],
+        "max_memory_reserved_bytes": measurement["max_memory_reserved_bytes"],
+    }
 
 
 def _write_smoke_result(
@@ -1318,8 +2516,6 @@ def authorize_extension(
     expected_decision_path = parent_dir / "checkpoint_analysis" / "phase0c_decision.json"
     if decision_json.resolve() != expected_decision_path.resolve():
         raise RuntimeError("decision path must be parent/checkpoint_analysis/phase0c_decision.json")
-    if not (parent_dir / "COMPLETE").is_file():
-        raise RuntimeError("extension parent root COMPLETE is missing")
     parent_manifest = validate_study_manifest(parent_dir, expected_kind="initial")
     seeds = tuple(parent_manifest["ordered_seeds"])
     if seeds != tuple(range(10_000, 10_040)) or config.seeds != seeds:
@@ -1400,6 +2596,11 @@ def authorize_extension(
         raise RuntimeError("checkpoint decision does not authorize extension")
     if summary_manifest["decision"] != decision["decision"]:
         raise RuntimeError("checkpoint summary/decision cross-check failed")
+    decision_seeds = decision.get("ordered_seeds")
+    if not isinstance(decision_seeds, list) or any(
+        type(seed) is not int for seed in decision_seeds
+    ):
+        raise RuntimeError("checkpoint decision ordered_seeds must be exact integers")
     exact = {
         "parent_study_manifest_sha256": parent_manifest_sha,
         "ordered_seeds": list(seeds),
@@ -1424,6 +2625,20 @@ def authorize_extension(
     }
     if not isinstance(eligibility, dict) or set(eligibility) != expected_eligibility_fields:
         raise RuntimeError("checkpoint extension eligibility has wrong fields")
+    for field in (
+        "eligible_scenario_seed_count",
+        "required_scenario_seed_count",
+        "canonical_state_hash_count",
+    ):
+        if type(eligibility[field]) is not int:
+            label = (
+                "canonical state hash count"
+                if field == "canonical_state_hash_count"
+                else f"extension eligibility {field}"
+            )
+            raise RuntimeError(
+                f"checkpoint {label} must be an exact integer"
+            )
     if (
         eligibility["all_eligible"] is not True
         or eligibility["eligible_scenario_seed_count"] != 80
@@ -1441,6 +2656,16 @@ def authorize_extension(
         "parent_execution_sha256": parent_execution["execution_sha256"],
         "max_seed_wall_seconds": float(parent_execution["max_seed_wall_seconds"]),
     }
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    first_resolved = first.resolve()
+    second_resolved = second.resolve()
+    return (
+        first_resolved == second_resolved
+        or first_resolved in second_resolved.parents
+        or second_resolved in first_resolved.parents
+    )
 
 
 def run_config(
@@ -1467,6 +2692,12 @@ def run_config(
         raise ValueError("config output_dir must exactly match the requested output_dir")
     if mode == "smoke" and config.seeds != (9999,):
         raise ValueError("smoke seed bank must be exactly (9999,)")
+    if (
+        mode == "extension-8sp"
+        and parent_dir is not None
+        and _paths_overlap(output_dir, parent_dir)
+    ):
+        raise ValueError("extension output and parent paths must not overlap")
 
     current_source_hash = source_tree_sha256()
     current_experiment_hash = experiment_tree_sha256()
@@ -1506,6 +2737,7 @@ def run_config(
                 "parent_execution_sha256",
             )
         }
+        parent_fields["parent_output_dir"] = str(parent_dir.resolve())
 
     execution = _execution_metadata(
         config,
@@ -1555,10 +2787,25 @@ def run_config(
                 seed,
                 mode=mode,
                 expected_execution=execution,
+                parent_seed_dir=(
+                    None
+                    if parent_dir is None
+                    else parent_dir / f"seed_{seed:05d}"
+                ),
             )
         _validate_global_streams(output_dir, config.seeds)
         if mode == "smoke":
-            _write_smoke_result(output_dir, execution, measurements)
+            persisted_measurements = tuple(
+                _persisted_measurement_result(
+                    output_dir / f"seed_{seed:05d}", seed
+                )
+                for seed in config.seeds
+            )
+            if measurements and measurements != persisted_measurements:
+                raise RuntimeError(
+                    "smoke worker measurement differs from its atomic seed metadata"
+                )
+            _write_smoke_result(output_dir, execution, persisted_measurements)
         _publish_study_manifest(output_dir, execution)
         validate_study_manifest(
             output_dir, expected_kind=mode, require_root_complete=False
