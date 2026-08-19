@@ -127,7 +127,17 @@ def _coordinate_trace(
 
 
 def _search_state(name: str, index: int | None) -> SearchState:
-    radius = 1.5 if index is None else 1.0 + index / 100.0
+    indices: tuple[int | None, ...]
+    if name == "profiled":
+        indices = (25, *((None,) * 11))
+    elif name == "greedy":
+        indices = (25, *((index,) * 11))
+    else:
+        indices = (index,) * 12
+    radii = torch.tensor(
+        [1.5 if value is None else 1.0 + value / 100.0 for value in indices],
+        dtype=torch.float32,
+    )
     normalized_width = {
         "profiled": 1.48,
         "greedy": 1.4,
@@ -135,8 +145,8 @@ def _search_state(name: str, index: int | None) -> SearchState:
     }[name]
     return SearchState(
         start_name=name,
-        radii=torch.full((12,), radius, dtype=torch.float32),
-        stage_grid_indices=(index,) * 12,
+        radii=radii,
+        stage_grid_indices=indices,
         coverage=torch.full((12,), 0.91, dtype=torch.float32),
         normalized_width=torch.full((12,), normalized_width, dtype=torch.float32),
         completed_sweep_pairs=4,
@@ -151,10 +161,10 @@ def _initial_result(seed: int, device: str, *, partial_active: bool = False) -> 
     stage_grids = torch.stack([torch.linspace(1.0, 2.0, 101) for _ in range(12)])
     profiled_schedules = stage_grids.T.contiguous()
     methods = {
-        "current_profiled": (50, "profiled", "REFERENCE", 0),
-        "greedy": (75, "greedy", "REFERENCE", 0),
-        "joint_B": (25, "profiled", "B", 2),
-        "joint_2B": (75, "greedy", "2B", 4),
+        "current_profiled": ([50], "profiled", "REFERENCE", 0),
+        "greedy": ([75] * 12, "greedy", "REFERENCE", 0),
+        "joint_B": ([25, *([-1] * 11)], "profiled", "B", 2),
+        "joint_2B": ([25, *([75] * 11)], "greedy", "2B", 4),
     }
     for scenario_index, scenario in enumerate(SCENARIOS):
         tuning_stream = _paper_seed(seed, 1_300_001 + scenario_index)
@@ -181,8 +191,16 @@ def _initial_result(seed: int, device: str, *, partial_active: bool = False) -> 
                 f"{scenario}_stage_grids": stage_grids,
             }
         )
-        for method_id, (index, chosen, budget, sweep_pairs) in methods.items():
-            schedule = stage_grids[:, index]
+        for method_id, (indices, chosen, budget, sweep_pairs) in methods.items():
+            schedule = torch.tensor(
+                [
+                    1.5 if index == -1 else float(stage_grids[stage, index])
+                    for stage, index in enumerate(
+                        indices if len(indices) == 12 else [indices[0]] * 12
+                    )
+                ],
+                dtype=torch.float32,
+            )
             tuning_coverage = torch.full((12,), 0.91)
             tuning_width = torch.full(
                 (12,), float(trace_widths.get(method_id, float(schedule.mean())))
@@ -190,7 +208,7 @@ def _initial_result(seed: int, device: str, *, partial_active: bool = False) -> 
             final_coverage = torch.full((12,), 0.93)
             final_lcb = torch.full((12,), 0.925)
             final_width = schedule * 2.0
-            selected_indices = [index] if method_id == "current_profiled" else [index] * 12
+            selected_indices = indices
             records.append(
                 {
                     "schema_version": "phase0c_seed_v1",
@@ -331,7 +349,8 @@ def _extension_result(seed: int, device: str) -> SeedResult:
         tuning_stream = _paper_seed(seed, 1_300_001 + scenario_index)
         evaluation_stream = _paper_seed(seed, 1_400_001 + scenario_index)
         trace = _coordinate_trace(START_NAMES, 5, 8)
-        schedule = stage_grids[:, 25]
+        selected_indices = [25, *([-1] * 11)]
+        schedule = torch.tensor([1.25, *([1.5] * 11)], dtype=torch.float32)
         coverage = torch.full((12,), 0.91)
         tuning_width = torch.full((12,), 1.46)
         final_coverage = torch.full((12,), 0.93)
@@ -352,7 +371,7 @@ def _extension_result(seed: int, device: str) -> SeedResult:
                 "failure_reason": "",
                 "chosen_initialization": "profiled",
                 "selected_endpoint_stage_count": 0,
-                "selected_stage_grid_indices_json": _compact([25] * 12),
+                "selected_stage_grid_indices_json": _compact(selected_indices),
                 "q_by_time_json": _compact(schedule.tolist()),
                 "tuning_coverage_json": _compact(coverage.tolist()),
                 "tuning_stage_width_json": _compact(tuning_width.tolist()),
@@ -1642,23 +1661,6 @@ def test_validator_rejects_float32_width_corruption_at_one_e_minus_four(
         runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
 
 
-def _set_mixed_joint_schedule(seed_dir: Path, method: str) -> None:
-    records_path = seed_dir / "records.csv"
-    records = pd.read_csv(records_path)
-    selected = records["scenario"].eq("standard") & records["method_id"].eq(method)
-    indices = [25, -1, *([25] * 10)]
-    schedule = [1.25, 1.5, *([1.25] * 10)]
-    records.loc[selected, "selected_stage_grid_indices_json"] = _compact(indices)
-    records.loc[selected, "q_by_time_json"] = _compact(schedule)
-    records.to_csv(records_path, index=False)
-    _rewrite_npz(
-        seed_dir / "surfaces.npz",
-        updates={
-            f"standard_{method}_schedule": np.asarray(schedule, dtype=np.float32)
-        },
-    )
-
-
 def test_initial_joint_minus_one_uses_authenticated_current_profiled_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1667,7 +1669,15 @@ def test_initial_joint_minus_one_uses_authenticated_current_profiled_stage(
     output = tmp_path / "mixed-initial"
     _run_initial_fixture(runner, monkeypatch, output)
     seed_dir = output / "seed_10000"
-    _set_mixed_joint_schedule(seed_dir, "joint_B")
+    records = pd.read_csv(seed_dir / "records.csv")
+    row = records.loc[
+        records["scenario"].eq("standard")
+        & records["method_id"].eq("joint_B")
+    ].iloc[0]
+    indices = json.loads(row["selected_stage_grid_indices_json"])
+    schedule = json.loads(row["q_by_time_json"])
+    assert indices[1] == -1
+    assert schedule[1] == 1.5
 
     assert runner.validate_seed_artifact(seed_dir, 10_000, mode="initial") == seed_dir
 
@@ -1739,8 +1749,8 @@ def _write_mixed_extension_seed(
     inherited_radius: float,
 ) -> Path:
     result = _extension_result(10_000, "cpu")
-    indices = [25, -1, *([25] * 10)]
-    schedule = torch.tensor([1.25, inherited_radius, *([1.25] * 10)])
+    indices = [25, *([-1] * 11)]
+    schedule = torch.tensor([1.25, *([inherited_radius] * 11)])
     row = next(row for row in result.records if row["scenario"] == "standard")
     row["selected_stage_grid_indices_json"] = _compact(indices)
     row["q_by_time_json"] = _compact(schedule.tolist())
@@ -1833,11 +1843,7 @@ def test_joint_target_rejects_one_float32_ulp_below_point_nine(
         runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
 
 
-def _early_parent_validation_cap_result(
-    *,
-    missing_stage_grids: tuple[str, ...],
-) -> SeedResult:
-    result = _extension_result(10_000, "cpu")
+def _reset_extension_rows_for_wall_cap(result: SeedResult) -> None:
     for row in result.records:
         row.update(
             {
@@ -1874,6 +1880,16 @@ def _early_parent_validation_cap_result(
             "final_stage_width",
         ):
             result.surfaces[f"{scenario}_joint_8SP_{suffix}"] = torch.empty(0)
+
+
+def _early_parent_validation_cap_result(
+    *,
+    missing_stage_grids: tuple[str, ...],
+) -> SeedResult:
+    result = _extension_result(10_000, "cpu")
+    _reset_extension_rows_for_wall_cap(result)
+    for row in result.records:
+        scenario = str(row["scenario"])
         result.diagnostics[scenario] = {
             "tuning_stream_id": row["tuning_stream_id"],
             "evaluation_stream_id": row["evaluation_stream_id"],
@@ -1885,6 +1901,26 @@ def _early_parent_validation_cap_result(
         }
     for scenario in missing_stage_grids:
         result.surfaces.pop(f"{scenario}_stage_grids")
+    return result
+
+
+def _standard_continuation_wall_cap_result() -> SeedResult:
+    result = _extension_result(10_000, "cpu")
+    standard_checkpoint = json.loads(
+        json.dumps(result.diagnostics["standard"]["checkpoint"])
+    )
+    _reset_extension_rows_for_wall_cap(result)
+    for row in result.records:
+        scenario = str(row["scenario"])
+        result.diagnostics[scenario] = {
+            "tuning_stream_id": row["tuning_stream_id"],
+            "evaluation_stream_id": row["evaluation_stream_id"],
+            "search_status": "WALL_TIME_CAP",
+            "continuation_status": "SELECTED" if scenario == "standard" else None,
+            "fresh_evaluation_completed": False,
+            "wall_time_phase": "standard_continuation",
+            "checkpoint": standard_checkpoint if scenario == "standard" else None,
+        }
     return result
 
 
@@ -1913,6 +1949,48 @@ def test_extension_accepts_exact_parent_validation_early_cap_without_stage_grid(
         mode="extension-8sp",
         parent_seed_dir=parent / "seed_10000",
     ) == seed_dir
+
+
+def test_extension_accepts_completed_standard_checkpoint_before_wall_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    parent = tmp_path / "parent"
+    _run_initial_fixture(runner, monkeypatch, parent)
+    seed_dir = _write_extension_seed(
+        runner,
+        parent,
+        tmp_path / "extension",
+        _standard_continuation_wall_cap_result(),
+    )
+
+    assert runner.validate_seed_artifact(
+        seed_dir,
+        10_000,
+        mode="extension-8sp",
+        parent_seed_dir=parent / "seed_10000",
+    ) == seed_dir
+
+
+def test_extension_wall_cap_checkpoint_winner_still_matches_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    parent = tmp_path / "parent"
+    _run_initial_fixture(runner, monkeypatch, parent)
+    result = _standard_continuation_wall_cap_result()
+    result.diagnostics["standard"]["checkpoint"]["best_start_name"] = "greedy"
+    seed_dir = _write_extension_seed(runner, parent, tmp_path / "extension", result)
+
+    with pytest.raises(RuntimeError, match="checkpoint winner|winner.*trace"):
+        runner.validate_seed_artifact(
+            seed_dir,
+            10_000,
+            mode="extension-8sp",
+            parent_seed_dir=parent / "seed_10000",
+        )
 
 
 def test_parent_validation_stage_grid_presence_must_be_canonical_prefix(
@@ -2201,6 +2279,56 @@ def test_checkpoint_counts_are_derived_exactly_from_trace(
         runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
 
 
+def test_checkpoint_cannot_stop_before_requested_pair_while_still_committing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    output = tmp_path / "premature-pair2"
+    _run_initial_fixture(runner, monkeypatch, output)
+    seed_dir = output / "seed_10000"
+    metadata_path = seed_dir / "metadata.json"
+    records_path = seed_dir / "records.csv"
+    metadata = json.loads(metadata_path.read_text())
+    checkpoint = metadata["diagnostics"]["standard"]["checkpoints"]["2"]
+    trace = checkpoint["trace"][: len(START_NAMES) * 24]
+    checkpoint.update(
+        {
+            "executed_sweep_pairs": 1,
+            "trace": trace,
+            "schedule_evaluations": 101 * len(trace),
+            "committed_updates": sum(bool(step["committed"]) for step in trace),
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    winner_width = next(
+        float(step["after_micro_width"])
+        for step in reversed(trace)
+        if step["start_name"] == "profiled"
+    )
+    tuning_width = np.full(12, winner_width, dtype=np.float32)
+    records = pd.read_csv(records_path)
+    selected = records["scenario"].eq("standard") & records["method_id"].eq(
+        "joint_B"
+    )
+    records.loc[selected, "schedule_evaluations"] = checkpoint[
+        "schedule_evaluations"
+    ]
+    records.loc[selected, "committed_updates"] = checkpoint["committed_updates"]
+    records.loc[selected, "tuning_stage_width_json"] = _compact(
+        tuning_width.tolist()
+    )
+    records.loc[selected, "tuning_micro_width"] = float(tuning_width.mean())
+    records.to_csv(records_path, index=False)
+    _rewrite_npz(
+        seed_dir / "surfaces.npz",
+        updates={"standard_joint_B_tuning_stage_width": tuning_width},
+    )
+
+    with pytest.raises(RuntimeError, match="premature|converg"):
+        runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
+
+
 def test_initial_row_convergence_is_derived_from_checkpoint_trace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2237,6 +2365,36 @@ def test_initial_pair2_trace_must_be_exact_pair4_prefix(
     metadata_path.write_text(json.dumps(metadata))
 
     with pytest.raises(RuntimeError, match="prefix"):
+        runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
+
+
+def test_initial_committed_trace_indices_replay_to_rows_and_pair4_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    output = tmp_path / "trace-index-state"
+    _run_initial_fixture(runner, monkeypatch, output)
+    seed_dir = output / "seed_10000"
+    metadata_path = seed_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    for pair in ("2", "4"):
+        trace = metadata["diagnostics"]["standard"]["checkpoints"][pair][
+            "trace"
+        ]
+        step = next(
+            step
+            for step in trace
+            if step["start_name"] == "profiled"
+            and step["sweep_pair"] == 2
+            and step["direction"] == "forward"
+            and step["stage"] == 0
+            and step["committed"] is True
+        )
+        step["proposed_grid_index"] = 0
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(RuntimeError, match="trace.*index|index.*trace|replay"):
         runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
 
 
@@ -2394,8 +2552,12 @@ def _make_pair4_materialize_pair2(
             "standard_pair4_profiled_radii": np.array(
                 archive["standard_joint_B_schedule"], copy=True
             ),
-            "standard_pair4_profiled_stage_grid_indices": np.full(
-                12, 25, dtype=np.int64
+            "standard_pair4_profiled_stage_grid_indices": np.asarray(
+                [25, *([-1] * 11)], dtype=np.int64
+            ),
+            "standard_pair4_greedy_radii": np.full(12, 1.75, dtype=np.float32),
+            "standard_pair4_greedy_stage_grid_indices": np.full(
+                12, 75, dtype=np.int64
             ),
         }
         for name in START_NAMES:
@@ -2444,7 +2606,7 @@ def test_equal_executed_nested_checkpoints_require_convergence(
     seed_dir = output / "seed_10000"
     _make_pair4_materialize_pair2(runner, seed_dir, converged=False)
 
-    with pytest.raises(RuntimeError, match="equal.*converg"):
+    with pytest.raises(RuntimeError, match="premature|converg"):
         runner.validate_seed_artifact(seed_dir, 10_000, mode="initial")
 
 
@@ -2563,6 +2725,33 @@ def test_extension_checkpoint_and_status_cross_bind_selected_row(
     seed_dir = _write_extension_seed(runner, parent, tmp_path / "extension", result)
 
     with pytest.raises(RuntimeError, match="checkpoint|trace|status"):
+        runner.validate_seed_artifact(
+            seed_dir,
+            10_000,
+            mode="extension-8sp",
+            parent_seed_dir=parent / "seed_10000",
+        )
+
+
+def test_extension_committed_trace_indices_replay_from_parent_to_selected_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    parent = tmp_path / "parent"
+    _run_initial_fixture(runner, monkeypatch, parent)
+    result = _extension_result(10_000, "cpu")
+    trace = result.diagnostics["standard"]["checkpoint"]["trace"]
+    step = next(
+        step
+        for step in reversed(trace)
+        if step["start_name"] == "profiled"
+        and step["committed"] is True
+    )
+    step["proposed_grid_index"] = 0
+    seed_dir = _write_extension_seed(runner, parent, tmp_path / "extension", result)
+
+    with pytest.raises(RuntimeError, match="trace.*index|index.*trace|replay"):
         runner.validate_seed_artifact(
             seed_dir,
             10_000,

@@ -976,6 +976,23 @@ class _CheckpointFacts(NamedTuple):
     trace: _TraceFacts
 
 
+def _replay_trace_indices(
+    trace: list[dict[str, Any]],
+    initial_indices: dict[str, tuple[int | None, ...]],
+    *,
+    seed: int,
+    label: str,
+) -> dict[str, tuple[int | None, ...]]:
+    replayed = {name: list(indices) for name, indices in initial_indices.items()}
+    for step in trace:
+        if step["committed"]:
+            start_name = step["start_name"]
+            if start_name not in replayed:
+                raise RuntimeError(f"seed {seed} {label} trace index replay has unknown start")
+            replayed[start_name][step["stage"]] = step["proposed_grid_index"]
+    return {name: tuple(indices) for name, indices in replayed.items()}
+
+
 def _exact_int(
     value: object,
     *,
@@ -1181,6 +1198,12 @@ def _validate_checkpoint_diagnostics(
         or committed_updates != trace_facts.committed_updates
     ):
         raise RuntimeError(f"seed {seed} {label} checkpoint trace-derived counts differ")
+    if (
+        trace_facts.commits_by_pair
+        and executed < requested_pair
+        and trace_facts.commits_by_pair[executed] != 0
+    ):
+        raise RuntimeError(f"seed {seed} {label} checkpoint stopped prematurely before convergence")
     return _CheckpointFacts(checkpoint, trace_facts)
 
 
@@ -1350,6 +1373,25 @@ def _validate_initial_surfaces(
                 if not np.array_equal(schedule, expected_schedule):
                     raise RuntimeError(f"seed {seed} {scenario} {method} index mapping disagrees")
 
+        initial_indices: dict[str, tuple[int | None, ...]] = {}
+        if "profiled" in active_names:
+            if not bool(_row(records, scenario, "current_profiled")["selection_available"]):
+                raise RuntimeError(f"seed {seed} {scenario} active profiled start is unavailable")
+            initial_indices["profiled"] = (None,) * 12
+        if "greedy" in active_names:
+            greedy_row = _row(records, scenario, "greedy")
+            if not bool(greedy_row["selection_available"]):
+                raise RuntimeError(f"seed {seed} {scenario} active greedy start is unavailable")
+            greedy_indices = _json_vector(
+                greedy_row["selected_stage_grid_indices_json"],
+                seed=seed,
+                field=f"{scenario} greedy selected indices",
+                length=12,
+            )
+            initial_indices["greedy"] = tuple(int(value) for value in greedy_indices)
+        if "upper_endpoint" in active_names:
+            initial_indices["upper_endpoint"] = (100,) * 12
+
         states_by_name: dict[str, SearchState] = {}
         for state_index, start_name in enumerate(state_names):
             prefix = f"{scenario}_pair4_{start_name}"
@@ -1403,6 +1445,12 @@ def _validate_initial_surfaces(
             )
             checkpoint_facts_by_pair[pair] = checkpoint_facts
             checkpoint = checkpoint_facts.payload
+            replayed_indices = _replay_trace_indices(
+                checkpoint["trace"],
+                initial_indices,
+                seed=seed,
+                label=f"{scenario} pair{pair}",
+            )
             executed = checkpoint["executed_sweep_pairs"]
             expected_convergence = (
                 executed
@@ -1445,12 +1493,29 @@ def _validate_initial_surfaces(
                 )
             if method_row["chosen_initialization"] != checkpoint["best_start_name"]:
                 raise RuntimeError(f"seed {seed} {scenario} checkpoint winner disagrees with row")
+            row_indices = tuple(
+                None if int(value) == -1 else int(value)
+                for value in _json_vector(
+                    method_row["selected_stage_grid_indices_json"],
+                    seed=seed,
+                    field=f"{scenario} {method_row['method_id']} selected indices",
+                    length=12,
+                )
+            )
+            if row_indices != replayed_indices[checkpoint["best_start_name"]]:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} checkpoint row indices disagree with trace replay"
+                )
             if method_row["schedule_evaluations"] != checkpoint["schedule_evaluations"]:
                 raise RuntimeError(f"seed {seed} checkpoint schedule count disagrees")
             if method_row["committed_updates"] != checkpoint["committed_updates"]:
                 raise RuntimeError(f"seed {seed} checkpoint commit count disagrees")
             if pair == 4:
                 for name, state in states_by_name.items():
+                    if state.stage_grid_indices != replayed_indices[name]:
+                        raise RuntimeError(
+                            f"seed {seed} {scenario} persisted state indices disagree with trace replay"
+                        )
                     state_width = float(state.normalized_width.mean().item())
                     trace_width = checkpoint_facts.trace.final_width_by_start[name]
                     if not _matches_float32_reduction(
@@ -1561,13 +1626,76 @@ _EXTENSION_WALL_PHASES = {
 }
 
 
+class _ExtensionCheckpointSemantics(NamedTuple):
+    facts: _CheckpointFacts
+    expected_convergence: int | None
+    expected_best_start: str
+    replayed_indices: dict[str, tuple[int | None, ...]]
+
+
+def _validate_extension_checkpoint_semantics(
+    checkpoint: object,
+    *,
+    scenario: str,
+    seed: int,
+    parent_facts: _ParentSeedFacts,
+) -> _ExtensionCheckpointSemantics:
+    facts = _validate_checkpoint_diagnostics(
+        checkpoint,
+        seed=seed,
+        label=f"{scenario} pair8",
+        requested_pair=8,
+        start_names=_START_NAMES,
+        extension=True,
+    )
+    payload = facts.payload
+    executed = payload["executed_sweep_pairs"]
+    parent_states = parent_facts.states_by_name[scenario]
+    initial_indices = {
+        name: state.stage_grid_indices for name, state in parent_states.items()
+    }
+    if facts.trace.final_width_by_start:
+        expected_convergence = (
+            executed if facts.trace.commits_by_pair[executed] == 0 else None
+        )
+        expected_best_start = min(
+            _START_NAMES,
+            key=facts.trace.final_width_by_start.__getitem__,
+        )
+        replayed_indices = _replay_trace_indices(
+            payload["trace"],
+            initial_indices,
+            seed=seed,
+            label=f"{scenario} pair8",
+        )
+    else:
+        expected_convergence = parent_facts.converged_at_pair[scenario]
+        expected_best_start = parent_facts.best_start_name[scenario]
+        if expected_convergence is None or executed != expected_convergence:
+            raise RuntimeError(
+                f"seed {seed} {scenario} empty extension trace disagrees with parent"
+            )
+        replayed_indices = initial_indices
+    if payload["best_start_name"] != expected_best_start:
+        raise RuntimeError(
+            f"seed {seed} {scenario} extension checkpoint winner disagrees with trace"
+        )
+    return _ExtensionCheckpointSemantics(
+        facts,
+        expected_convergence,
+        expected_best_start,
+        replayed_indices,
+    )
+
+
 def _validate_extension_diagnostics(
     records: pd.DataFrame,
     diagnostics: dict[str, Any],
     seed: int,
     parent_facts: _ParentSeedFacts,
-) -> None:
+) -> dict[str, _ExtensionCheckpointSemantics]:
     phases: list[object] = []
+    checkpoint_semantics: dict[str, _ExtensionCheckpointSemantics] = {}
     for scenario_index, scenario in enumerate(_SCENARIOS):
         row = _row(records, scenario, "joint_8SP")
         scenario_diagnostics = diagnostics.get(scenario)
@@ -1596,16 +1724,14 @@ def _validate_extension_diagnostics(
                 raise RuntimeError(
                     f"seed {seed} {scenario} extension selected status semantics differ"
                 )
-            checkpoint_facts = _validate_checkpoint_diagnostics(
+            semantics = _validate_extension_checkpoint_semantics(
                 scenario_diagnostics["checkpoint"],
+                scenario=scenario,
                 seed=seed,
-                label=f"{scenario} pair8",
-                requested_pair=8,
-                start_names=_START_NAMES,
-                extension=True,
+                parent_facts=parent_facts,
             )
-            checkpoint = checkpoint_facts.payload
-            executed = checkpoint["executed_sweep_pairs"]
+            checkpoint_semantics[scenario] = semantics
+            checkpoint = semantics.facts.payload
             row_convergence = _nullable_csv_integer(
                 row["converged_at_pair"],
                 seed=seed,
@@ -1613,18 +1739,9 @@ def _validate_extension_diagnostics(
                 minimum=1,
                 maximum=8,
             )
-            if checkpoint_facts.trace.final_width_by_start:
-                expected_convergence = (
-                    executed
-                    if checkpoint_facts.trace.commits_by_pair[executed] == 0
-                    else None
-                )
-                expected_best_start = min(
-                    _START_NAMES,
-                    key=checkpoint_facts.trace.final_width_by_start.__getitem__,
-                )
-                trace_best_width = checkpoint_facts.trace.final_width_by_start[
-                    expected_best_start
+            if semantics.facts.trace.final_width_by_start:
+                trace_best_width = semantics.facts.trace.final_width_by_start[
+                    semantics.expected_best_start
                 ]
                 row_tuning_width = _finite_number(
                     row["tuning_micro_width"],
@@ -1638,20 +1755,9 @@ def _validate_extension_diagnostics(
                     raise RuntimeError(
                         f"seed {seed} {scenario} extension row width disagrees with trace"
                     )
-            else:
-                expected_convergence = parent_facts.converged_at_pair[scenario]
-                expected_best_start = parent_facts.best_start_name[scenario]
-                if expected_convergence is None or executed != expected_convergence:
-                    raise RuntimeError(
-                        f"seed {seed} {scenario} empty extension trace disagrees with parent"
-                    )
-            if row_convergence != expected_convergence:
+            if row_convergence != semantics.expected_convergence:
                 raise RuntimeError(
                     f"seed {seed} {scenario} extension convergence disagrees"
-                )
-            if checkpoint["best_start_name"] != expected_best_start:
-                raise RuntimeError(
-                    f"seed {seed} {scenario} extension checkpoint winner disagrees with trace"
                 )
             if checkpoint["best_start_name"] != row["chosen_initialization"]:
                 raise RuntimeError(
@@ -1711,26 +1817,18 @@ def _validate_extension_diagnostics(
         if continuation is None:
             if checkpoint is not None:
                 raise RuntimeError(f"seed {seed} extension absent continuation has checkpoint")
-        elif continuation == "SELECTED":
-            _validate_checkpoint_diagnostics(
-                checkpoint,
-                seed=seed,
-                label=f"{scenario} pair8",
-                requested_pair=8,
-                start_names=_START_NAMES,
-                extension=True,
-            )
         elif checkpoint is not None:
-            _validate_checkpoint_diagnostics(
+            checkpoint_semantics[scenario] = _validate_extension_checkpoint_semantics(
                 checkpoint,
+                scenario=scenario,
                 seed=seed,
-                label=f"{scenario} pair8",
-                requested_pair=8,
-                start_names=_START_NAMES,
-                extension=True,
+                parent_facts=parent_facts,
             )
+        elif continuation == "SELECTED":
+            raise RuntimeError(f"seed {seed} selected continuation has no checkpoint")
     if len(set(phases)) != 1:
         raise RuntimeError(f"seed {seed} extension wall-time phase differs by scenario")
+    return checkpoint_semantics
 
 
 def _validate_extension_surfaces(
@@ -1740,7 +1838,9 @@ def _validate_extension_surfaces(
     seed: int,
     parent_facts: _ParentSeedFacts,
 ) -> None:
-    _validate_extension_diagnostics(records, diagnostics, seed, parent_facts)
+    checkpoint_semantics = _validate_extension_diagnostics(
+        records, diagnostics, seed, parent_facts
+    )
     expected_keys: set[str] = set()
     for scenario_index, scenario in enumerate(_SCENARIOS):
         row = _row(records, scenario, "joint_8SP")
@@ -1788,6 +1888,19 @@ def _validate_extension_surfaces(
                 field="joint_8SP selected indices",
                 length=12,
             ).astype(int)
+            semantics = checkpoint_semantics.get(scenario)
+            if semantics is None:
+                raise RuntimeError(f"seed {seed} selected extension has no checkpoint")
+            replayed_winner = semantics.replayed_indices[
+                semantics.expected_best_start
+            ]
+            row_indices = tuple(
+                None if int(value) == -1 else int(value) for value in indices
+            )
+            if row_indices != replayed_winner:
+                raise RuntimeError(
+                    f"seed {seed} {scenario} extension row indices disagree with trace replay"
+                )
             schedule = surfaces[f"{scenario}_joint_8SP_schedule"]
             expected_schedule = _schedule_from_stage_indices(
                 indices,
@@ -1902,6 +2015,7 @@ class _ParentSeedFacts(NamedTuple):
     current_schedules: dict[str, np.ndarray]
     converged_at_pair: dict[str, int | None]
     best_start_name: dict[str, str]
+    states_by_name: dict[str, dict[str, SearchState]]
 
 
 def _validated_parent_current_schedules(
@@ -1959,18 +2073,23 @@ def _validated_parent_current_schedules(
     parent_diagnostics = parent_seed_metadata["diagnostics"]
     converged: dict[str, int | None] = {}
     best_names: dict[str, str] = {}
+    states_by_name: dict[str, dict[str, SearchState]] = {}
     for scenario in _SCENARIOS:
         checkpoint = parent_diagnostics[scenario]["checkpoints"]["4"]
         best_name = checkpoint["best_start_name"]
-        state = _state_from_surfaces(
-            parent_surfaces,
-            scenario=scenario,
-            start_name=best_name,
-            seed=seed,
-        )
-        converged[scenario] = state.converged_at_pair
+        scenario_states = {
+            name: _state_from_surfaces(
+                parent_surfaces,
+                scenario=scenario,
+                start_name=name,
+                seed=seed,
+            )
+            for name in _START_NAMES
+        }
+        states_by_name[scenario] = scenario_states
+        converged[scenario] = scenario_states[best_name].converged_at_pair
         best_names[scenario] = best_name
-    return _ParentSeedFacts(current_schedules, converged, best_names)
+    return _ParentSeedFacts(current_schedules, converged, best_names, states_by_name)
 
 
 class ParentContinuation(NamedTuple):
