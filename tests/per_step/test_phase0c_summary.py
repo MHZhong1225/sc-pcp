@@ -59,6 +59,20 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_rehashed_bundle_contract(
+    output: Path, decision: dict[str, object], manifest: dict[str, object]
+) -> None:
+    decision_path = output / "phase0c_decision.json"
+    decision_path.write_text(json.dumps(decision, sort_keys=True, indent=2) + "\n")
+    manifest["files"]["phase0c_decision.json"] = {
+        "bytes": decision_path.stat().st_size,
+        "sha256": _sha256(decision_path),
+    }
+    (output / "phase0c_summary_manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    )
+
+
 def _refresh_study_fact(root: Path, relative: str) -> None:
     manifest_path = root / "study_manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -706,6 +720,164 @@ def test_summary_bundle_validator_rejects_extra_decision_fields_even_when_rehash
         summary.validate_summary_bundle(output)
 
 
+def test_summary_bundle_validator_rejects_phase_incompatible_decisions(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    summary = _load_summary()
+    initial = summary.load_validate_analyze(complete_initial_root.root)
+    initial_output = summary.publish_summary(initial, tmp_path / "valid-initial")
+    final = {
+        **initial,
+        "analysis_phase": "final",
+        "decision": "STOP_SCALAR_INSUFFICIENT",
+        "provenance": {
+            **initial["provenance"],
+            "extension_study_manifest_sha256": "a" * 64,
+        },
+    }
+    final_output = summary.publish_summary(final, tmp_path / "valid-final")
+
+    incompatible = (
+        (initial_output, "STOP_SCALAR_INSUFFICIENT"),
+        (final_output, "STOP_SCALAR_SATURATED"),
+        (final_output, "EXTENSION_8SP_REQUIRED"),
+    )
+    for index, (source, decision_literal) in enumerate(incompatible):
+        output = tmp_path / f"incompatible-{index}"
+        shutil.copytree(source, output)
+        decision_path = output / "phase0c_decision.json"
+        manifest_path = output / "phase0c_summary_manifest.json"
+        decision = json.loads(decision_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        decision["decision"] = decision_literal
+        manifest["decision"] = decision_literal
+        _write_rehashed_bundle_contract(output, decision, manifest)
+
+        with pytest.raises(RuntimeError, match="decision"):
+            summary.validate_summary_bundle(output)
+
+
+def test_summary_bundle_validator_binds_eligibility_boolean_to_exact_counts(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    source = summary.publish_summary(analysis, tmp_path / "valid-eligibility")
+    mutations = (
+        {"all_eligible": False},
+        {"eligible_scenario_seed_count": 79},
+        {"canonical_state_hash_count": 239},
+    )
+
+    for index, mutation in enumerate(mutations):
+        output = tmp_path / f"eligibility-{index}"
+        shutil.copytree(source, output)
+        decision_path = output / "phase0c_decision.json"
+        manifest_path = output / "phase0c_summary_manifest.json"
+        decision = json.loads(decision_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        decision["extension_eligibility"].update(mutation)
+        _write_rehashed_bundle_contract(output, decision, manifest)
+
+        with pytest.raises(RuntimeError, match="decision"):
+            summary.validate_summary_bundle(output)
+
+
+@pytest.mark.parametrize("phase", ["initial", "final"])
+def test_extension_required_and_final_bundles_require_complete_eligibility(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    if phase == "final":
+        analysis = {
+            **analysis,
+            "analysis_phase": "final",
+            "decision": "STOP_SCALAR_INSUFFICIENT",
+            "provenance": {
+                **analysis["provenance"],
+                "extension_study_manifest_sha256": "a" * 64,
+            },
+        }
+    output = summary.publish_summary(analysis, tmp_path / f"complete-{phase}")
+    decision_path = output / "phase0c_decision.json"
+    manifest_path = output / "phase0c_summary_manifest.json"
+    decision = json.loads(decision_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    if phase == "initial":
+        decision["decision"] = "EXTENSION_8SP_REQUIRED"
+        manifest["decision"] = "EXTENSION_8SP_REQUIRED"
+    decision["extension_eligibility"].update(
+        {
+            "all_eligible": False,
+            "eligible_scenario_seed_count": 79,
+            "canonical_state_hash_count": 237,
+        }
+    )
+    _write_rehashed_bundle_contract(output, decision, manifest)
+
+    with pytest.raises(RuntimeError, match="decision"):
+        summary.validate_summary_bundle(output)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-decision",
+        "missing-manifest",
+        "wrong-decision",
+        "wrong-manifest",
+        "type-decision",
+        "type-manifest",
+    ],
+)
+def test_final_bundle_validator_rejects_extension_manifest_hash_mutations(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    summary = _load_summary()
+    initial = summary.load_validate_analyze(complete_initial_root.root)
+    extension_hash = "a" * 64
+    final = {
+        **initial,
+        "analysis_phase": "final",
+        "decision": "STOP_SCALAR_INSUFFICIENT",
+        "provenance": {
+            **initial["provenance"],
+            "extension_study_manifest_sha256": extension_hash,
+        },
+    }
+    source = summary.publish_summary(final, tmp_path / "valid-final-hash")
+    source_decision = json.loads((source / "phase0c_decision.json").read_text())
+    source_manifest = json.loads(
+        (source / "phase0c_summary_manifest.json").read_text()
+    )
+    assert source_decision["extension_study_manifest_sha256"] == extension_hash
+    assert source_manifest["extension_study_manifest_sha256"] == extension_hash
+
+    output = tmp_path / mutation
+    shutil.copytree(source, output)
+    decision = json.loads((output / "phase0c_decision.json").read_text())
+    manifest = json.loads((output / "phase0c_summary_manifest.json").read_text())
+    target, action = mutation.split("-", maxsplit=1)
+    payload = decision if action == "decision" else manifest
+    if target == "missing":
+        payload.pop("extension_study_manifest_sha256")
+    elif target == "wrong":
+        payload["extension_study_manifest_sha256"] = "0" * 64
+    else:
+        payload["extension_study_manifest_sha256"] = 1
+    _write_rehashed_bundle_contract(output, decision, manifest)
+
+    with pytest.raises(RuntimeError, match="decision|manifest"):
+        summary.validate_summary_bundle(output)
+
+
 def test_two_independent_cli_processes_publish_byte_identical_text_artifacts(
     complete_initial_root: SimpleNamespace,
     tmp_path: Path,
@@ -785,6 +957,13 @@ def test_authorized_extension_is_validated_and_publishes_only_final_analysis(
     output = summary.publish_summary(final)
     assert output == parent / "final_analysis"
     assert checkpoint.is_dir()
+    extension_manifest_sha = _sha256(extension / "study_manifest.json")
+    final_decision = json.loads((output / "phase0c_decision.json").read_text())
+    final_manifest = json.loads(
+        (output / "phase0c_summary_manifest.json").read_text()
+    )
+    assert final_decision["extension_study_manifest_sha256"] == extension_manifest_sha
+    assert final_manifest["extension_study_manifest_sha256"] == extension_manifest_sha
     assert summary.validate_summary_bundle(output) == output
 
     wrong_parent = tmp_path / "wrong-parent"

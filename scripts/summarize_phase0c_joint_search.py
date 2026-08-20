@@ -863,7 +863,7 @@ def _render_figure(analysis: dict[str, Any], output_dir: Path) -> None:
 
 def _decision_payload(analysis: dict[str, Any]) -> dict[str, Any]:
     provenance = analysis["provenance"]
-    return {
+    payload = {
         "protocol": "phase0c_joint_search_summary_v1",
         "analysis_phase": analysis["analysis_phase"],
         "decision": analysis["decision"],
@@ -876,6 +876,11 @@ def _decision_payload(analysis: dict[str, Any]) -> dict[str, Any]:
         "config_sha256": provenance["config_sha256"],
         "extension_eligibility": analysis["extension_eligibility"],
     }
+    if analysis["analysis_phase"] == "final":
+        payload["extension_study_manifest_sha256"] = provenance[
+            "extension_study_manifest_sha256"
+        ]
+    return payload
 
 
 def _file_fact(path: Path) -> dict[str, object]:
@@ -907,6 +912,10 @@ def _write_bundle(stage: Path, analysis: dict[str, Any]) -> None:
             name: _file_fact(stage / name) for name in sorted(_PAYLOAD_NAMES)
         },
     }
+    if analysis["analysis_phase"] == "final":
+        manifest["extension_study_manifest_sha256"] = analysis["provenance"][
+            "extension_study_manifest_sha256"
+        ]
     (stage / "phase0c_summary_manifest.json").write_text(
         json.dumps(manifest, sort_keys=True, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
@@ -921,6 +930,7 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
     manifest = _read_json(
         output / "phase0c_summary_manifest.json", label="summary manifest"
     )
+    manifest_phase = manifest.get("analysis_phase")
     expected_fields = {
         "protocol",
         "status",
@@ -929,12 +939,25 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
         "parent_study_manifest_sha256",
         "files",
     }
+    if manifest_phase == "final":
+        expected_fields.add("extension_study_manifest_sha256")
+    manifest_extension_hash = manifest.get("extension_study_manifest_sha256")
     if set(manifest) != expected_fields or manifest["protocol"] != (
         "phase0c_joint_search_summary_manifest_v1"
-    ) or manifest["status"] != "complete" or manifest["analysis_phase"] not in {
+    ) or manifest["status"] != "complete" or manifest_phase not in {
         "initial",
         "final",
-    }:
+    } or (
+        manifest_phase == "final"
+        and (
+            type(manifest_extension_hash) is not str
+            or len(manifest_extension_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in manifest_extension_hash
+            )
+        )
+    ):
         raise RuntimeError("summary manifest contract is invalid")
     files = manifest["files"]
     if not isinstance(files, dict) or set(files) != set(_PAYLOAD_NAMES):
@@ -952,6 +975,7 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
         ):
             raise RuntimeError(f"summary manifest {name} bytes/hash mismatch")
     decision = _read_json(output / "phase0c_decision.json", label="summary decision")
+    phase = decision.get("analysis_phase")
     expected_decision_fields = {
         "protocol",
         "analysis_phase",
@@ -963,7 +987,23 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
         "config_sha256",
         "extension_eligibility",
     }
+    if phase == "final":
+        expected_decision_fields.add("extension_study_manifest_sha256")
     eligibility = decision.get("extension_eligibility")
+    decision_literal = decision.get("decision")
+    allowed_decisions = {
+        "initial": {
+            "PROMISING_ORACLE_DIAGNOSTIC",
+            "STOP_SCALAR_SATURATED",
+            "EXTENSION_8SP_REQUIRED",
+            "STOP_SCALAR_UNAVAILABLE",
+        },
+        "final": {
+            "PROMISING_ORACLE_DIAGNOSTIC",
+            "STOP_SCALAR_INSUFFICIENT",
+            "STOP_SCALAR_UNAVAILABLE",
+        },
+    }
     expected_eligibility_fields = {
         "all_eligible",
         "eligible_scenario_seed_count",
@@ -981,18 +1021,22 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
             if not isinstance(eligibility, dict)
             else eligibility.get("state_hash_manifest_sha256")
         ),
+        *(
+            (decision.get("extension_study_manifest_sha256"),)
+            if phase == "final"
+            else ()
+        ),
+    )
+    eligibility_complete = (
+        isinstance(eligibility, dict)
+        and eligibility.get("eligible_scenario_seed_count") == 80
+        and eligibility.get("canonical_state_hash_count") == 240
     )
     if (
         set(decision) != expected_decision_fields
         or decision.get("protocol") != "phase0c_joint_search_summary_v1"
-        or decision.get("analysis_phase") not in {"initial", "final"}
-        or decision.get("decision") not in {
-            "PROMISING_ORACLE_DIAGNOSTIC",
-            "STOP_SCALAR_SATURATED",
-            "EXTENSION_8SP_REQUIRED",
-            "STOP_SCALAR_INSUFFICIENT",
-            "STOP_SCALAR_UNAVAILABLE",
-        }
+        or phase not in allowed_decisions
+        or decision_literal not in allowed_decisions.get(phase, set())
         or decision.get("ordered_seeds") != list(_SEEDS)
         or not isinstance(eligibility, dict)
         or set(eligibility) != expected_eligibility_fields
@@ -1006,6 +1050,11 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
             )
         )
         or eligibility.get("required_scenario_seed_count") != 80
+        or eligibility.get("all_eligible") != eligibility_complete
+        or (
+            (phase == "final" or decision_literal == "EXTENSION_8SP_REQUIRED")
+            and not eligibility_complete
+        )
         or any(
             type(value) is not str
             or len(value) != 64
@@ -1016,6 +1065,11 @@ def validate_summary_bundle(output_dir: Path | str) -> Path:
         or decision.get("analysis_phase") != manifest["analysis_phase"]
         or decision.get("parent_study_manifest_sha256")
         != manifest["parent_study_manifest_sha256"]
+        or (
+            phase == "final"
+            and decision.get("extension_study_manifest_sha256")
+            != manifest_extension_hash
+        )
     ):
         raise RuntimeError("summary decision/manifest cross-check failed")
     return output
