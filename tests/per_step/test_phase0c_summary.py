@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -305,6 +308,247 @@ def test_complete_initial_root_is_deeply_loaded_with_all_seed_denominators(
     assert analysis["audit"]["runner"]["initial"]["n_seed_runs"] == 40
     assert analysis["audit"]["runner"]["extension"] is None
     assert len(analysis["_source_rows"]) == 320
+
+
+def test_diagnostic_figure_has_registered_four_panel_semantics_and_geometry(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+
+    figure = summary._build_diagnostic_figure(analysis)
+    try:
+        figure.canvas.draw()
+        assert figure._suptitle.get_text() == analysis["decision"]
+        assert len(figure.axes) == 4
+        coverage_axis, ratio_axis, convergence_axis, audit_axis = figure.axes
+        assert coverage_axis.get_ylim()[0] <= 0.90 <= coverage_axis.get_ylim()[1]
+        assert ratio_axis.get_yscale() == "log"
+        assert ratio_axis.get_ylim()[0] <= 0.92 <= ratio_axis.get_ylim()[1]
+        assert ratio_axis.get_ylim()[0] <= 1.00 <= ratio_axis.get_ylim()[1]
+        assert any(
+            len(line.get_ydata()) == 2
+            and np.allclose(line.get_ydata(), [0.90, 0.90])
+            for line in coverage_axis.lines
+        )
+        assert any(
+            len(line.get_ydata()) == 2
+            and np.allclose(line.get_ydata(), [0.92, 0.92])
+            for line in ratio_axis.lines
+        )
+        assert any(
+            len(line.get_ydata()) == 2
+            and np.allclose(line.get_ydata(), [1.00, 1.00])
+            for line in ratio_axis.lines
+        )
+        assert any(
+            len(line.get_ydata()) == 2
+            and np.allclose(line.get_ydata(), [0.005, 0.005])
+            for line in convergence_axis.lines
+        )
+        assert audit_axis.axison is False
+        assert len(figure.legends) == 1
+        legend_bbox = figure.legends[0].get_window_extent(figure.canvas.get_renderer())
+        assert all(
+            not legend_bbox.overlaps(axis.get_window_extent()) for axis in figure.axes
+        )
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def test_diagnostic_svg_and_markdown_use_honest_registered_language(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    report = summary._markdown_report(analysis)
+    figure = summary._build_diagnostic_figure(analysis)
+    try:
+        svg = io.StringIO()
+        figure.savefig(svg, format="svg")
+        visible_text = f"{report}\n{svg.getvalue()}"
+        for required in ("Oracle diagnostic", "40/40", "simultaneous LCB"):
+            assert required in visible_text
+        for forbidden in (r"\bSOTA\b", r"\bGO\b", r"significantly superior"):
+            assert re.search(forbidden, visible_text, re.IGNORECASE) is None
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def _figure_text(axis: object) -> str:
+    return "\n".join(text.get_text() for text in axis.texts)
+
+
+def test_initial_and_final_figures_do_not_invent_unavailable_8sp_values(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    initial = summary.load_validate_analyze(complete_initial_root.root)
+    initial_figure = summary._build_diagnostic_figure(initial)
+    initial_unavailable_figure = None
+    final_figure = None
+    unavailable_figure = None
+    try:
+        initial_ratio_axis = initial_figure.axes[1]
+        assert len(initial_ratio_axis.collections) == 2
+        assert "not run" in _figure_text(initial_ratio_axis)
+
+        initial_unavailable = copy.deepcopy(initial)
+        initial_unavailable["ratios"]["joint_2B"] = None
+        initial_unavailable_figure = summary._build_diagnostic_figure(
+            initial_unavailable
+        )
+        initial_unavailable_text = _figure_text(initial_unavailable_figure.axes[1])
+        assert initial_unavailable_text.count("not run") == 1
+        assert "unavailable" in initial_unavailable_text
+
+        final = copy.deepcopy(initial)
+        final["analysis_phase"] = "final"
+        final["decision"] = "STOP_SCALAR_INSUFFICIENT"
+        final["coverage"]["joint_8SP"] = copy.deepcopy(
+            final["coverage"]["joint_2B"]
+        )
+        final["ratios"]["joint_8SP"] = copy.deepcopy(final["ratios"]["joint_2B"])
+        final["audit"]["checkpoints"]["joint_8SP"] = copy.deepcopy(
+            final["audit"]["checkpoints"]["joint_2B"]
+        )
+        final["audit"]["runner"]["extension"] = copy.deepcopy(
+            final["audit"]["runner"]["initial"]
+        )
+        final_figure = summary._build_diagnostic_figure(final)
+        assert len(final_figure.axes[1].collections) == 3
+        assert "not run" not in _figure_text(final_figure.axes[1])
+
+        unavailable = copy.deepcopy(final)
+        unavailable["decision"] = "STOP_SCALAR_UNAVAILABLE"
+        unavailable["coverage"]["joint_8SP"] = None
+        unavailable["ratios"]["joint_8SP"] = None
+        unavailable["audit"]["checkpoints"].pop("joint_8SP")
+        unavailable["audit"]["runner"]["extension"] = None
+        unavailable_figure = summary._build_diagnostic_figure(unavailable)
+        coverage_axis, ratio_axis = unavailable_figure.axes[:2]
+        assert coverage_axis.get_title(loc="left").startswith("8SP")
+        assert "8SP unavailable" in _figure_text(coverage_axis)
+        assert "unavailable" in _figure_text(ratio_axis)
+        assert len(ratio_axis.collections) == 2
+        assert all(
+            float(offset[1]) > 0.0
+            for collection in ratio_axis.collections
+            for offset in collection.get_offsets()
+        )
+        unavailable_figure.canvas.draw()
+        coverage_label = next(
+            text
+            for text in coverage_axis.texts
+            if text.get_text() == "8SP unavailable"
+        )
+        coverage_label_bbox = coverage_label.get_window_extent(
+            unavailable_figure.canvas.get_renderer()
+        )
+        coverage_target_y = coverage_axis.transData.transform((1.0, 0.90))[1]
+        assert not (
+            coverage_label_bbox.y0
+            <= coverage_target_y
+            <= coverage_label_bbox.y1
+        )
+        unavailable_label = next(
+            text for text in ratio_axis.texts if text.get_text() == "unavailable"
+        )
+        label_bbox = unavailable_label.get_window_extent(
+            unavailable_figure.canvas.get_renderer()
+        )
+        axis_bbox = ratio_axis.get_window_extent()
+        assert axis_bbox.x0 <= label_bbox.x0 < label_bbox.x1 <= axis_bbox.x1
+        assert all(
+            "10" not in label.get_text() and "×" not in label.get_text()
+            for label in ratio_axis.get_yticklabels()
+        )
+    finally:
+        import matplotlib.pyplot as plt
+
+        for figure in (
+            initial_figure,
+            initial_unavailable_figure,
+            final_figure,
+            unavailable_figure,
+        ):
+            if figure is not None:
+                plt.close(figure)
+
+
+def test_convergence_and_audit_panels_state_registered_aggregations(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    figure = summary._build_diagnostic_figure(analysis)
+    try:
+        convergence_text = _figure_text(figure.axes[2])
+        audit_text = _figure_text(figure.axes[3])
+        assert f"{analysis['delta_b']['point_gain']:.4f}" in convergence_text
+        figure.canvas.draw()
+        delta_label = next(
+            text
+            for text in figure.axes[2].texts
+            if text.get_text().startswith("Registered Delta_B")
+        )
+        reference_y = figure.axes[2].transData.transform((0.0, 0.005))[1]
+        assert (
+            delta_label.get_window_extent(figure.canvas.get_renderer()).y1
+            < reference_y
+        )
+        for scenario, values in analysis["audit"]["checkpoints"]["joint_2B"][
+            "by_scenario"
+        ].items():
+            assert (
+                f"{scenario}: available {values['available_seed_count']}/40"
+                in audit_text
+            )
+            assert f"winner denominator {values['winner_denominator']}" in audit_text
+            assert (
+                f"endpoint {values['endpoint_stage_count']}/"
+                f"{values['endpoint_stage_denominator']} stages"
+                in audit_text
+            )
+        runner = analysis["audit"]["runner"]["initial"]
+        assert f"one value × {runner['n_seed_runs']} seed runs" in audit_text
+        assert "maximum across seed processes" in audit_text
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def test_markdown_defines_all_registered_statistics_and_limits(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    report = summary._markdown_report(analysis)
+
+    for required in (
+        analysis["decision"],
+        "minimum cell seed mean",
+        "minimum simultaneous LCB",
+        "mean seedwise cell minimum",
+        "raw seed-cell minimum",
+        "Only the simultaneous LCB gates coverage",
+        "80/80 scenario-seed schedules",
+        "not a width-ratio denominator",
+        "tail-only 40-pair",
+        "Delta_B = 1 - exp(mean(log(W_2B/W_B)))",
+        "one runner elapsed time per seed",
+        "maximum across seed processes",
+        "12 × available schedules",
+        "fixed-T",
+        "all-active",
+        "not deployable",
+    ):
+        assert required in report
 
 
 def test_initial_summary_publishes_exact_authorization_contract_and_manifest(
@@ -694,6 +938,93 @@ def test_summary_directory_swap_rolls_back_prior_valid_bundle_byte_for_byte(
         path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
     }
     assert after == before
+    summary.validate_summary_bundle(output)
+
+
+def test_static_exports_have_exact_geometry_editable_text_and_stable_bytes(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    before_figures = tuple(plt.get_fignums())
+    outputs = (tmp_path / "export-first", tmp_path / "export-second")
+    for output in outputs:
+        summary.publish_summary(analysis, output)
+        assert tuple(plt.get_fignums()) == before_figures
+
+        png_path = output / "phase0c_joint_search.png"
+        assert png_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        with Image.open(png_path) as image:
+            assert image.size == (2161, 1417)
+
+        pdf_path = output / "phase0c_joint_search.pdf"
+        assert pdf_path.read_bytes().startswith(b"%PDF-")
+        pdf_info = subprocess.run(
+            ["pdfinfo", str(pdf_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        page_size = re.search(
+            r"Page size:\s+([0-9.]+) x ([0-9.]+) pts", pdf_info
+        )
+        assert page_size is not None
+        assert float(page_size.group(1)) == pytest.approx(183 / 25.4 * 72, abs=0.01)
+        assert float(page_size.group(2)) == pytest.approx(120 / 25.4 * 72, abs=0.01)
+        pdf_fonts = subprocess.run(
+            ["pdffonts", str(pdf_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert re.search(r"TrueType.*\byes\b", pdf_fonts) is not None
+
+        svg = (output / "phase0c_joint_search.svg").read_text(encoding="utf-8")
+        assert "<text" in svg
+        svg_size = re.search(
+            r'<svg[^>]+width="([0-9.]+)pt" height="([0-9.]+)pt"', svg
+        )
+        assert svg_size is not None
+        assert float(svg_size.group(1)) == pytest.approx(183 / 25.4 * 72, abs=0.01)
+        assert float(svg_size.group(2)) == pytest.approx(120 / 25.4 * 72, abs=0.01)
+
+    for name in PAYLOAD_NAMES | {"phase0c_summary_manifest.json"}:
+        assert (outputs[0] / name).read_bytes() == (outputs[1] / name).read_bytes()
+
+
+def test_render_fault_closes_figure_and_preserves_prior_bundle_byte_for_byte(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matplotlib.figure
+    import matplotlib.pyplot as plt
+
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    output = tmp_path / "render-rollback"
+    summary.publish_summary(analysis, output)
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+    before_figures = tuple(plt.get_fignums())
+    original_savefig = matplotlib.figure.Figure.savefig
+
+    def fail_svg_save(
+        figure: object, target: object, *args: object, **kwargs: object
+    ) -> object:
+        if Path(target).suffix == ".svg":
+            raise OSError("injected SVG save fault")
+        return original_savefig(figure, target, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", fail_svg_save)
+    with pytest.raises(OSError, match="injected SVG save fault"):
+        summary.publish_summary(analysis, output)
+
+    assert tuple(plt.get_fignums()) == before_figures
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
     summary.validate_summary_bundle(output)
 
 

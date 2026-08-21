@@ -803,42 +803,335 @@ def _write_csv(path: Path, analysis: dict[str, Any]) -> None:
 
 
 def _markdown_report(analysis: dict[str, Any]) -> str:
+    checkpoint = (
+        "joint_2B" if analysis["analysis_phase"] == "initial" else "joint_8SP"
+    )
+    coverage = analysis["coverage"][checkpoint]
+    checkpoint_label = checkpoint.replace("joint_", "")
+
+    def coverage_value(field: str) -> str:
+        if coverage is None:
+            return "unavailable"
+        return f"{coverage[field]:.6f}"
+
+    ratio_lines = []
+    for method, label in (("joint_B", "R_B"), ("joint_2B", "R_2B")):
+        summary = analysis["ratios"][method]
+        value = "unavailable" if summary is None else f"{summary['point_ratio']:.6f}"
+        ratio_lines.append(f"- {label}: {value}.")
+    ratio_8sp = analysis["ratios"]["joint_8SP"]
+    if ratio_8sp is not None:
+        ratio_lines.append(f"- R_8SP: {ratio_8sp['point_ratio']:.6f}.")
+    elif analysis["analysis_phase"] == "initial":
+        ratio_lines.append("- R_8SP: not run in the initial analysis.")
+    else:
+        ratio_lines.append("- R_8SP: unavailable in the final analysis.")
+    delta = analysis["delta_b"]
+    delta_value = "unavailable" if delta is None else f"{delta['point_gain']:.6f}"
+
     return (
         "# Phase 0C joint-search audit\n\n"
         f"Decision: `{analysis['decision']}`.\n\n"
-        "This is a fixed-horizon, all-active oracle diagnostic on 40 development "
-        "seeds. It is not a deployable method, confirmation result, GO decision, "
-        "or SOTA claim.\n\n"
-        "Coverage is gated only by the simultaneous 24-cell lower confidence "
-        "bound; raw minima and seedwise minima are descriptive. Ratio bootstrap "
-        "intervals are descriptive and do not alter the registered decision.\n"
+        "This fixed-T, all-active Oracle diagnostic uses 40 development seeds. "
+        "It is not deployable, is not a confirmation result, and is not a "
+        "state-of-the-art claim. A promising machine decision would only "
+        "authorize separate practical-method development.\n\n"
+        "## Coverage\n\n"
+        f"The latest attempted checkpoint is {checkpoint_label}. Standard and "
+        "tail-shift coverage each use 40/40 seed schedules when available. The "
+        "registered family contains 24 stage-by-scenario cells, so validity "
+        "across both scenarios requires 80/80 scenario-seed schedules. That "
+        "80/80 value is a validity denominator, not a width-ratio denominator. "
+        "Four summaries answer different questions:\n\n"
+        f"- minimum cell seed mean: {coverage_value('minimum_stage_seed_mean')} "
+        "(average seeds within each cell, then take the minimum);\n"
+        f"- minimum simultaneous LCB: "
+        f"{coverage_value('minimum_simultaneous_lcb')} "
+        "(take the minimum adjusted lower bound across cells);\n"
+        f"- mean seedwise cell minimum: "
+        f"{coverage_value('mean_seedwise_stage_minimum')} "
+        "(take each seed's minimum cell, then average seeds);\n"
+        f"- raw seed-cell minimum: {coverage_value('raw_seed_stage_minimum')} "
+        "(take the minimum over every unaggregated seed-cell value).\n\n"
+        "Only the simultaneous LCB gates coverage. The other three minima are "
+        "descriptive and need not identify the same stage, scenario, or seed.\n\n"
+        "## Width and convergence\n\n"
+        "Width ratios are tail-only 40-pair geometric means against the current "
+        "profiled schedule:\n\n"
+        + "\n".join(ratio_lines)
+        + "\n\n"
+        "The registered convergence statistic is "
+        f"Delta_B = 1 - exp(mean(log(W_2B/W_B))) = {delta_value}. The plotted "
+        "40 seedwise gains are a distributional audit; their arithmetic mean "
+        "does not replace the registered statistic. Bootstrap intervals are "
+        "descriptive and do not alter the decision.\n\n"
+        "## Feasibility and resource audit\n\n"
+        "Winner counts use available schedules as their denominator. Endpoint "
+        "use is counted over 12 × available schedules. Runtime uses one runner "
+        "elapsed time per seed, and GPU peak memory is the maximum across seed "
+        "processes; shared work is never summed across checkpoints or devices.\n"
     )
 
 
-def _render_figure(analysis: dict[str, Any], output_dir: Path) -> None:
+def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
 
-    ratio_items = [
-        (method, summary["point_ratio"])
-        for method, summary in analysis["ratios"].items()
-        if summary is not None
-    ]
-    with plt.rc_context({"svg.hashsalt": "phase0c-joint-search-v1", "pdf.fonttype": 42}):
-        figure, axis = plt.subplots(figsize=(5.0, 3.0), constrained_layout=True)
-        axis.axhline(0.92, color="#B24A33", linestyle="--", linewidth=1.0)
-        axis.axhline(1.0, color="#555555", linestyle=":", linewidth=1.0)
-        axis.scatter(
-            range(len(ratio_items)),
-            [value for _, value in ratio_items],
-            color="#2F6B8A",
+    matplotlib.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "DejaVu Sans", "Liberation Sans"],
+            "svg.fonttype": "none",
+            "svg.hashsalt": "phase0c-joint-search-v1",
+            "pdf.fonttype": 42,
+        }
+    )
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=(183.0 / 25.4, 120.0 / 25.4),
+        gridspec_kw={"height_ratios": (1.05, 0.95)},
+    )
+    figure.subplots_adjust(
+        left=0.085, right=0.98, bottom=0.11, top=0.76, wspace=0.34, hspace=0.58
+    )
+    coverage_axis, ratio_axis, convergence_axis, audit_axis = axes.flat
+    figure.suptitle(analysis["decision"], y=0.985, fontsize=10, fontweight="bold")
+    figure.text(
+        0.5,
+        0.935,
+        "Fixed-T joint scalar search · Oracle diagnostic",
+        ha="center",
+        va="center",
+        fontsize=7,
+        color="#4D4D4D",
+    )
+
+    checkpoint = (
+        "joint_2B" if analysis["analysis_phase"] == "initial" else "joint_8SP"
+    )
+    coverage = analysis["coverage"][checkpoint]
+    stage = np.arange(1, 13)
+    coverage_handles = []
+    coverage_labels = []
+    scenario_styles = (
+        ("standard", "#0F4D92", "o"),
+        ("tail shift", "#B97824", "s"),
+    )
+    coverage_values = [0.90]
+    if coverage is None:
+        coverage_axis.text(
+            0.5,
+            0.62,
+            f"{checkpoint.replace('joint_', '')} unavailable",
+            transform=coverage_axis.transAxes,
+            ha="center",
+            va="center",
+            color="#606060",
+        )
+    else:
+        for index, (scenario, color, marker) in enumerate(scenario_styles):
+            mean = np.asarray(coverage["stage_seed_mean"][index], dtype=np.float64)
+            lcb = np.asarray(coverage["simultaneous_lcb"][index], dtype=np.float64)
+            coverage_values.extend(mean.tolist())
+            coverage_values.extend(lcb.tolist())
+            mean_line = coverage_axis.plot(
+                stage,
+                mean,
+                color=color,
+                marker=marker,
+                markersize=2.8,
+                linewidth=1.0,
+            )[0]
+            lcb_line = coverage_axis.plot(
+                stage,
+                lcb,
+                color=color,
+                marker=marker,
+                markerfacecolor="white",
+                markersize=2.8,
+                linewidth=0.9,
+                linestyle="--",
+            )[0]
+            coverage_handles.extend((mean_line, lcb_line))
+            coverage_labels.extend(
+                (f"{scenario} mean (40/40)", f"{scenario} simultaneous LCB")
+            )
+    target_line = coverage_axis.axhline(
+        0.90, color="#4D4D4D", linewidth=0.9, linestyle=":"
+    )
+    coverage_handles.append(target_line)
+    coverage_labels.append("target 0.90")
+    coverage_axis.set_xlim(0.5, 12.5)
+    coverage_axis.set_xticks((1, 4, 8, 12))
+    coverage_axis.set_xlabel("Stage")
+    coverage_axis.set_ylabel("Coverage")
+    coverage_axis.set_title(
+        f"{checkpoint.replace('joint_', '')} stagewise coverage", loc="left"
+    )
+    coverage_axis.set_ylim(
+        max(0.0, min(coverage_values) - 0.01),
+        min(1.0, max(coverage_values) + 0.01),
+    )
+    figure.legend(
+        coverage_handles,
+        coverage_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.895),
+        ncol=3,
+        frameon=False,
+        fontsize=5.5,
+        handlelength=2.2,
+        columnspacing=1.2,
+    )
+
+    ratio_order = (("joint_B", "B"), ("joint_2B", "2B"), ("joint_8SP", "8SP"))
+    ratio_values = [0.92, 1.0]
+    for x_position, (method, label) in enumerate(ratio_order):
+        ratio = analysis["ratios"][method]
+        if ratio is None:
+            state = (
+                "not run"
+                if method == "joint_8SP" and analysis["analysis_phase"] == "initial"
+                else "unavailable"
+            )
+            horizontal_alignment = ("left", "center", "right")[x_position]
+            ratio_axis.text(
+                x_position,
+                0.975,
+                state,
+                ha=horizontal_alignment,
+                va="center",
+                fontsize=5.5,
+                color="#767676",
+            )
+            continue
+        value = float(ratio["point_ratio"])
+        ratio_values.append(value)
+        ratio_axis.scatter(
+            x_position,
+            value,
+            s=22,
+            color="#0F4D92",
+            edgecolor="#272727",
+            linewidth=0.5,
             zorder=3,
         )
-        axis.set_xticks(range(len(ratio_items)), [name for name, _ in ratio_items])
-        axis.set_ylabel("Tail micro-width ratio")
-        axis.set_title(analysis["decision"])
+    ratio_axis.axhline(0.92, color="#B97824", linestyle="--", linewidth=0.9)
+    ratio_axis.axhline(1.0, color="#4D4D4D", linestyle=":", linewidth=0.9)
+    ratio_axis.set_yscale("log")
+    ratio_axis.set_ylim(min(ratio_values) * 0.96, max(ratio_values) * 1.04)
+    ratio_axis.yaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
+    ratio_axis.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+    ratio_axis.yaxis.set_minor_formatter(ticker.NullFormatter())
+    ratio_axis.set_xticks(range(3), [label for _, label in ratio_order])
+    ratio_axis.set_ylabel("Tail width ratio")
+    ratio_axis.set_title("Paired geometric width ratio (40 pairs)", loc="left")
+
+    gains = [item["value"] for item in analysis["convergence_gain_by_seed"]]
+    if gains:
+        convergence_axis.scatter(
+            np.linspace(-0.20, 0.20, len(gains)),
+            gains,
+            s=8,
+            facecolor="white",
+            edgecolor="#0F4D92",
+            linewidth=0.6,
+        )
+    else:
+        convergence_axis.text(
+            0.5,
+            0.5,
+            "unavailable",
+            transform=convergence_axis.transAxes,
+            ha="center",
+            va="center",
+            color="#606060",
+        )
+    convergence_axis.axhline(
+        0.005, color="#B97824", linestyle="--", linewidth=0.9
+    )
+    if analysis["delta_b"] is not None:
+        convergence_axis.text(
+            0.98,
+            0.86,
+            f"Registered Delta_B = {analysis['delta_b']['point_gain']:.4f}",
+            transform=convergence_axis.transAxes,
+            ha="right",
+            va="top",
+            fontsize=5.6,
+            color="#272727",
+        )
+    convergence_axis.set_xlim(-0.28, 0.28)
+    convergence_axis.set_xticks([])
+    convergence_axis.set_ylabel(r"Seed gain $1-W_{2B}/W_B$")
+    convergence_axis.set_title("B to 2B convergence (40 seeds)", loc="left")
+
+    checkpoint_audit = analysis["audit"]["checkpoints"].get(checkpoint)
+    runner_phase = (
+        "initial" if analysis["analysis_phase"] == "initial" else "extension"
+    )
+    runner = analysis["audit"]["runner"][runner_phase]
+    audit_lines = [f"Checkpoint: {checkpoint.replace('joint_', '')}"]
+    if checkpoint_audit is None:
+        audit_lines.append("Audit: unavailable")
+    else:
+        for scenario, values in checkpoint_audit["by_scenario"].items():
+            winners = values["winner_counts"]
+            audit_lines.append(
+                f"{scenario}: available {values['available_seed_count']}/40; "
+                f"feasible {values['joint_feasible_seed_count']}/40"
+            )
+            audit_lines.append(
+                f"  winner denominator {values['winner_denominator']}; P/G/E "
+                f"{winners['profiled']}/{winners['greedy']}/"
+                f"{winners['upper_endpoint']}"
+            )
+            audit_lines.append(
+                f"  endpoint {values['endpoint_stage_count']}/"
+                f"{values['endpoint_stage_denominator']} stages"
+            )
+    if runner is not None:
+        audit_lines.extend(
+            (
+                f"Runtime median {runner['elapsed_seconds']['median']:.1f} s; "
+                f"one value × {runner['n_seed_runs']} seed runs",
+                "Peak GPU reserved memory "
+                f"{runner['max_memory_reserved_bytes'] / 2**20:.0f} MiB; "
+                "maximum across seed processes",
+            )
+        )
+    audit_axis.axis("off")
+    audit_axis.set_title("Feasibility and resource audit", loc="left")
+    audit_axis.text(
+        0.0,
+        0.98,
+        "\n".join(audit_lines),
+        transform=audit_axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=5.8,
+        linespacing=1.35,
+    )
+    for axis in (coverage_axis, ratio_axis, convergence_axis):
+        axis.spines[["top", "right"]].set_visible(False)
+        axis.grid(axis="y", color="#D8D8D8", linewidth=0.45, alpha=0.7)
+        axis.tick_params(labelsize=5.8)
+        axis.xaxis.label.set_size(6.2)
+        axis.yaxis.label.set_size(6.2)
+        axis.title.set_size(6.8)
+    audit_axis.title.set_size(6.8)
+    return figure
+
+
+def _render_figure(analysis: dict[str, Any], output_dir: Path) -> None:
+    figure = _build_diagnostic_figure(analysis)
+    import matplotlib.pyplot as plt
+
+    try:
         fixed_time = datetime(2026, 8, 18, tzinfo=timezone.utc)
         figure.savefig(
             output_dir / "phase0c_joint_search.pdf",
@@ -855,9 +1148,10 @@ def _render_figure(analysis: dict[str, Any], output_dir: Path) -> None:
         )
         figure.savefig(
             output_dir / "phase0c_joint_search.png",
-            dpi=150,
+            dpi=300,
             metadata={"Software": "SC-PCP", "Creation Time": "2026-08-18"},
         )
+    finally:
         plt.close(figure)
 
 
