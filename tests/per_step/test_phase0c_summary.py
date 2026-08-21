@@ -341,6 +341,18 @@ def test_diagnostic_figure_has_registered_four_panel_semantics_and_geometry(
             and np.allclose(line.get_ydata(), [1.00, 1.00])
             for line in ratio_axis.lines
         )
+        ratio_tick_labels = {
+            label.get_text(): label for label in ratio_axis.get_yticklabels()
+        }
+        assert {"0.92", "1.00"} <= ratio_tick_labels.keys()
+        renderer = figure.canvas.get_renderer()
+        for reference in ("0.92", "1.00"):
+            label = ratio_tick_labels[reference]
+            label_bbox = label.get_window_extent(renderer)
+            assert label.get_visible()
+            assert label_bbox.width > 0.0 and label_bbox.height > 0.0
+            assert figure.bbox.contains(label_bbox.x0, label_bbox.y0)
+            assert figure.bbox.contains(label_bbox.x1, label_bbox.y1)
         assert any(
             len(line.get_ydata()) == 2
             and np.allclose(line.get_ydata(), [0.005, 0.005])
@@ -523,6 +535,43 @@ def test_convergence_and_audit_panels_state_registered_aggregations(
         plt.close(figure)
 
 
+def test_final_audit_separates_both_runner_phases_and_overall_gpu_peak(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    final = summary.load_validate_analyze(complete_initial_root.root)
+    final["analysis_phase"] = "final"
+    final["decision"] = "STOP_SCALAR_INSUFFICIENT"
+    final["coverage"]["joint_8SP"] = copy.deepcopy(
+        final["coverage"]["joint_2B"]
+    )
+    final["ratios"]["joint_8SP"] = copy.deepcopy(final["ratios"]["joint_2B"])
+    final["audit"]["checkpoints"]["joint_8SP"] = copy.deepcopy(
+        final["audit"]["checkpoints"]["joint_2B"]
+    )
+    initial_runner = final["audit"]["runner"]["initial"]
+    initial_runner["elapsed_seconds"]["median"] = 11.0
+    initial_runner["max_memory_reserved_bytes"] = 3 * 2**30
+    extension_runner = copy.deepcopy(initial_runner)
+    extension_runner["elapsed_seconds"]["median"] = 22.0
+    extension_runner["max_memory_reserved_bytes"] = 1 * 2**30
+    final["audit"]["runner"]["extension"] = extension_runner
+
+    figure = summary._build_diagnostic_figure(final)
+    try:
+        audit_text = _figure_text(figure.axes[3])
+        assert "P/G/E" not in audit_text
+        assert "profiled/greedy/upper endpoint" in audit_text
+        assert "Initial runtime median 11.0 s; one value × 40 seed runs" in audit_text
+        assert "Extension runtime median 22.0 s; one value × 40 seed runs" in audit_text
+        assert "Initial/extension GPU peaks 3072/1024 MiB" in audit_text
+        assert "Overall GPU peak 3072 MiB; maximum across seed processes" in audit_text
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
 def test_markdown_defines_all_registered_statistics_and_limits(
     complete_initial_root: SimpleNamespace,
 ) -> None:
@@ -549,6 +598,25 @@ def test_markdown_defines_all_registered_statistics_and_limits(
         "not deployable",
     ):
         assert required in report
+
+
+def test_markdown_preserves_boundary_adjacent_registered_gate_values(
+    complete_initial_root: SimpleNamespace,
+) -> None:
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    lcb = float(np.nextafter(0.90, 0.0))
+    ratio = float(np.nextafter(0.92, 1.0))
+    delta = float(np.nextafter(0.005, 0.0))
+    analysis["coverage"]["joint_2B"]["minimum_simultaneous_lcb"] = lcb
+    analysis["ratios"]["joint_B"]["point_ratio"] = ratio
+    analysis["delta_b"]["point_gain"] = delta
+
+    report = summary._markdown_report(analysis)
+
+    assert format(lcb, ".17g") in report
+    assert format(ratio, ".17g") in report
+    assert format(delta, ".17g") in report
 
 
 def test_initial_summary_publishes_exact_authorization_contract_and_manifest(
@@ -1021,6 +1089,33 @@ def test_render_fault_closes_figure_and_preserves_prior_bundle_byte_for_byte(
 
     monkeypatch.setattr(matplotlib.figure.Figure, "savefig", fail_svg_save)
     with pytest.raises(OSError, match="injected SVG save fault"):
+        summary.publish_summary(analysis, output)
+
+    assert tuple(plt.get_fignums()) == before_figures
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
+    summary.validate_summary_bundle(output)
+
+
+def test_figure_construction_fault_closes_figure_and_preserves_prior_bundle(
+    complete_initial_root: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matplotlib.axes
+    import matplotlib.pyplot as plt
+
+    summary = _load_summary()
+    analysis = summary.load_validate_analyze(complete_initial_root.root)
+    output = tmp_path / "construction-rollback"
+    summary.publish_summary(analysis, output)
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+    before_figures = tuple(plt.get_fignums())
+
+    def fail_plot(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected figure construction fault")
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "plot", fail_plot)
+    with pytest.raises(RuntimeError, match="injected figure construction fault"):
         summary.publish_summary(analysis, output)
 
     assert tuple(plt.get_fignums()) == before_figures

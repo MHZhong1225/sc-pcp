@@ -812,22 +812,30 @@ def _markdown_report(analysis: dict[str, Any]) -> str:
     def coverage_value(field: str) -> str:
         if coverage is None:
             return "unavailable"
-        return f"{coverage[field]:.6f}"
+        return format(coverage[field], ".17g")
 
     ratio_lines = []
     for method, label in (("joint_B", "R_B"), ("joint_2B", "R_2B")):
         summary = analysis["ratios"][method]
-        value = "unavailable" if summary is None else f"{summary['point_ratio']:.6f}"
+        value = (
+            "unavailable"
+            if summary is None
+            else format(summary["point_ratio"], ".17g")
+        )
         ratio_lines.append(f"- {label}: {value}.")
     ratio_8sp = analysis["ratios"]["joint_8SP"]
     if ratio_8sp is not None:
-        ratio_lines.append(f"- R_8SP: {ratio_8sp['point_ratio']:.6f}.")
+        ratio_lines.append(
+            f"- R_8SP: {format(ratio_8sp['point_ratio'], '.17g')}."
+        )
     elif analysis["analysis_phase"] == "initial":
         ratio_lines.append("- R_8SP: not run in the initial analysis.")
     else:
         ratio_lines.append("- R_8SP: unavailable in the final analysis.")
     delta = analysis["delta_b"]
-    delta_value = "unavailable" if delta is None else f"{delta['point_gain']:.6f}"
+    delta_value = (
+        "unavailable" if delta is None else format(delta["point_gain"], ".17g")
+    )
 
     return (
         "# Phase 0C joint-search audit\n\n"
@@ -873,7 +881,7 @@ def _markdown_report(analysis: dict[str, Any]) -> str:
     )
 
 
-def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
+def _construct_diagnostic_figure(analysis: dict[str, Any]) -> Any:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1023,8 +1031,16 @@ def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
     ratio_axis.axhline(0.92, color="#B97824", linestyle="--", linewidth=0.9)
     ratio_axis.axhline(1.0, color="#4D4D4D", linestyle=":", linewidth=0.9)
     ratio_axis.set_yscale("log")
-    ratio_axis.set_ylim(min(ratio_values) * 0.96, max(ratio_values) * 1.04)
-    ratio_axis.yaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
+    ratio_limits = (min(ratio_values) * 0.96, max(ratio_values) * 1.04)
+    ratio_axis.set_ylim(*ratio_limits)
+    automatic_ticks = ticker.MaxNLocator(nbins=5).tick_values(*ratio_limits)
+    visible_ticks = {
+        float(value)
+        for value in automatic_ticks
+        if ratio_limits[0] <= value <= ratio_limits[1]
+    }
+    visible_ticks.update((0.92, 1.0))
+    ratio_axis.yaxis.set_major_locator(ticker.FixedLocator(sorted(visible_ticks)))
     ratio_axis.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
     ratio_axis.yaxis.set_minor_formatter(ticker.NullFormatter())
     ratio_axis.set_xticks(range(3), [label for _, label in ratio_order])
@@ -1071,10 +1087,8 @@ def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
     convergence_axis.set_title("B to 2B convergence (40 seeds)", loc="left")
 
     checkpoint_audit = analysis["audit"]["checkpoints"].get(checkpoint)
-    runner_phase = (
-        "initial" if analysis["analysis_phase"] == "initial" else "extension"
-    )
-    runner = analysis["audit"]["runner"][runner_phase]
+    initial_runner = analysis["audit"]["runner"]["initial"]
+    extension_runner = analysis["audit"]["runner"]["extension"]
     audit_lines = [f"Checkpoint: {checkpoint.replace('joint_', '')}"]
     if checkpoint_audit is None:
         audit_lines.append("Audit: unavailable")
@@ -1086,7 +1100,8 @@ def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
                 f"feasible {values['joint_feasible_seed_count']}/40"
             )
             audit_lines.append(
-                f"  winner denominator {values['winner_denominator']}; P/G/E "
+                f"  winner denominator {values['winner_denominator']}; "
+                "profiled/greedy/upper endpoint "
                 f"{winners['profiled']}/{winners['greedy']}/"
                 f"{winners['upper_endpoint']}"
             )
@@ -1094,14 +1109,27 @@ def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
                 f"  endpoint {values['endpoint_stage_count']}/"
                 f"{values['endpoint_stage_denominator']} stages"
             )
-    if runner is not None:
+    audit_lines.append(
+        f"Initial runtime median {initial_runner['elapsed_seconds']['median']:.1f} s; "
+        f"one value × {initial_runner['n_seed_runs']} seed runs"
+    )
+    if extension_runner is None:
+        audit_lines.append(
+            f"Initial GPU peak {initial_runner['max_memory_reserved_bytes'] / 2**20:.0f} "
+            "MiB; maximum across seed processes"
+        )
+    else:
+        initial_peak = initial_runner["max_memory_reserved_bytes"]
+        extension_peak = extension_runner["max_memory_reserved_bytes"]
         audit_lines.extend(
             (
-                f"Runtime median {runner['elapsed_seconds']['median']:.1f} s; "
-                f"one value × {runner['n_seed_runs']} seed runs",
-                "Peak GPU reserved memory "
-                f"{runner['max_memory_reserved_bytes'] / 2**20:.0f} MiB; "
-                "maximum across seed processes",
+                "Extension runtime median "
+                f"{extension_runner['elapsed_seconds']['median']:.1f} s; one value × "
+                f"{extension_runner['n_seed_runs']} seed runs",
+                f"Initial/extension GPU peaks {initial_peak / 2**20:.0f}/"
+                f"{extension_peak / 2**20:.0f} MiB",
+                f"Overall GPU peak {max(initial_peak, extension_peak) / 2**20:.0f} "
+                "MiB; maximum across seed processes",
             )
         )
     audit_axis.axis("off")
@@ -1125,6 +1153,18 @@ def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
         axis.title.set_size(6.8)
     audit_axis.title.set_size(6.8)
     return figure
+
+
+def _build_diagnostic_figure(analysis: dict[str, Any]) -> Any:
+    import matplotlib.pyplot as plt
+
+    existing_figures = set(plt.get_fignums())
+    try:
+        return _construct_diagnostic_figure(analysis)
+    except BaseException:
+        for figure_number in set(plt.get_fignums()) - existing_figures:
+            plt.close(figure_number)
+        raise
 
 
 def _render_figure(analysis: dict[str, Any], output_dir: Path) -> None:
