@@ -1,85 +1,153 @@
-# SC-PCP：逐阶段 Performative Coverage
+# SC-PCP: per-step performative conformal calibration
 
-本仓库实现一套正式方法：**transport-refined profiled-scale ordered-IUT SC-PCP**。它面向 prediction set 会反过来改变治疗策略、后续状态与结局分布的顺序决策问题，并要求最终部署策略诱导的每个阶段都达到覆盖目标：
-
-\[
-\min_{0\le t<T}
-P_{P_{\widehat s}}
-\{Y_{t+1}\in C_{\widehat s,t}(S_t,A_t)\}
-\ge 1-\alpha.
-\]
-
-旧的 shared-scalar radius、full-grid max-\(t\) selector 和 \(K\times T\times K\) DCov surface 不属于主方法，也不进入正式结果。完整定义见 [`docs/final_method.md`](docs/final_method.md)，对照方法和冻结设置见 [`docs/baselines_and_settings.md`](docs/baselines_and_settings.md)。
-
-## 方法概览
-
-SC-PCP 不直接搜索一个任意的 \(T\) 维半径向量。它先在独立的 \(D_{\rm COT}\) 上得到 logged stage quantiles，再在同一个数据角色内部做患者级三折 cross-fitting：每折只在训练患者上拟合一个 pilot COT，并在 held-out 患者上估计该 pilot schedule 的 target-policy stage quantiles。有效样本量不足或 weight-cap hit rate 超阈值的 fold-stage 不参与更新；其余 log-quantile corrections 经一次预先规定的 0.5 under-relaxation，并限制最大与最小相对修正之比不超过 1.25。最终得到正的阶段轮廓
+This repository studies sequential prediction sets that change the policy using
+them and therefore change the distribution of future states, actions, and
+scores.  The paper target is **per-step marginal coverage**:
 
 \[
-b=(b_0,\ldots,b_{T-1}),
-\qquad
-\left(\prod_t b_t\right)^{1/T}=1,
+\Pr_{P_{q_{0:t}}}\!\left\{Y_{t+1}\in C_{q_t}(S_t,A_t)\right\}
+\ge 1-\alpha,\qquad t=0,\ldots,T-1.
 \]
 
-然后只选择一个全局尺度 \(s\)，部署半径为
+The sole final method is **SC-PCP**: uncapped committed-prefix
+importance-weighted marginal calibration with a free stagewise radius vector
+\(q=(q_0,\ldots,q_{T-1})\).  It does not constrain the schedule to a common
+scale or a prespecified stage profile.
+
+## Why historical calibration is insufficient
+
+The prediction set affects the behavior-anchored target policy.  A radius
+chosen from logged scores therefore changes not only set width, but also the
+action distribution and the downstream score law.  Standard CP calibrates the
+logged law; SC-PCP instead estimates the score quantile under the policy induced
+by the radius being considered.  The calibration is performed one stage at a
+time because the distribution at stage \(t\) depends on the radii already
+committed at stages \(0{:}t-1\).
+
+All methods share the same frozen heteroscedastic outcome model and normalized
+maximum score
 
 \[
-\boxed{q_t(s)=s b_t.}
+R_{it}=\max_j
+\frac{|Y_{i,t+1,j}-\hat\mu_j(S_{it},A_{it})|}
+{\hat\sigma_j(S_{it},A_{it})},
 \]
 
-这里没有再切一个顶层数据集：shape 完全由 \(D_{\rm COT}\) 的 out-of-fold evidence 学习，而安全仍由 untouched \(D_{\rm cert}\) 负责。最终 profile 确定后，代码在全 \(D_{\rm COT}\) 上从头重训 COT；旧 profile 的 transport heads 不会被复用。候选 grid 保留 0.50 和 0.999 empirical-quantile guards，并把 80% 的 101 个 knots 放到 pilot anchor 附近，以减少认证边界处的离散 overshoot。
+with rectangular prediction set
 
-这保留了阶段难度差异，同时把最终选择限制为一个预先冻结的一维候选族。每个候选尺度都完成以下闭环：
+\[
+C_{q_t}(s,a)=\left\{y:
+|y_j-\hat\mu_j(s,a)|\le q_t\hat\sigma_j(s,a),\ \forall j\right\}.
+\]
 
-1. 用实际阶段半径 \(s b_t\) 构造 prediction set 和 behavior-anchored target policy；
-2. 用 scale-conditioned COT 学习 target 与 logging policy 下的逐阶段 state-action marginal occupancy ratio；
-3. 在 untouched \(D_{\rm cert}\) 上估计每个阶段的 performative coverage lower bound；
-4. 对同一候选的全部阶段做 intersection--union test（IUT）；
-5. 按最宽到最窄的固定序列检验尺度，并在第一个失败处停止；
-6. 只在已经通过检验的 prefix 内选择 estimated normalized width 最小的候选。
+## Final SC-PCP procedure
 
-如果没有候选通过，方法返回 `UNCERTIFIED_ORDERED_IUT` 并 abstain，不用最大集合兜底。Stage multiplicity 由 IUT 处理，candidate multiplicity 由 fixed sequence 处理；主方法不使用 full-grid max-\(t\) correction，也不假设 coverage 随尺度单调。
+Patients are split before any fitting.  \(D_{\rm pred}\) fits and freezes the
+outcome model and, for clinical data, the behavior-policy nuisance model.
+\(D_{\rm COT}\) and \(D_{\rm cert}\) stay patient-disjoint, but the final
+calibration sample is
 
-## Evidence boundary
+\[
+D_{\rm cal}=D_{\rm COT}\cup D_{\rm cert}.
+\]
 
-仓库明确区分两类证据：
+The historical role name \(D_{\rm COT}\) is retained for artifact compatibility;
+the final SC-PCP path does not fit a COT model.  It uses \(D_{\rm COT}\) only to
+freeze a separate 101-point empirical score grid for each stage before final
+selection.  Both patient-disjoint parts of \(D_{\rm cal}\) then contribute to
+every calibration estimate.
 
-- **Practical branch（连续状态与临床主实验）**：对患者级 cluster 做 2,000 次重采样，构造逐候选、逐阶段的 Hájek marginal lower bounds，再执行 ordered-IUT。该结果是 frozen transported estimate 的 sampling guard；它不控制 learned COT、fitted propensity 或 clipping 的 transport error，因此 `certificate_formal=false`。
-- **Formal branch（有限 MDP 验证或外部有效误差界）**：使用 bounded raw-HT lower bounds，并扣除覆盖整个冻结 candidate-stage family 的 simultaneous transport-error bound。可完全枚举的 tabular MDP 用 population \(L_1\) discrepancy 验证这一 premise；证据仍写入同一个 `SC-PCP` record，不再生成第二条 scalar/max-\(t\) audit row。
+Suppose \(q_0,\ldots,q_{t-1}\) have been committed.  For candidate radius \(r\)
+at stage \(t\), SC-PCP computes the full observed-action prefix weight
 
-因此，clinical coverage 是在冻结的受控评估环境中的模型化实验结果，不是对真实患者实施算法所得的临床覆盖保证。
+\[
+W_{it}(r;q_{<t})=
+\prod_{h<t}
+\frac{\pi_{q_h,h}(A_{ih}\mid S_{ih})}
+     {\mu_h(A_{ih}\mid S_{ih})}
+\frac{\pi_{r,t}(A_{it}\mid S_{it})}
+     {\mu_t(A_{it}\mid S_{it})}.
+\]
 
-## Patient-level data roles
+These importance weights are not clipped or capped.  The implementation keeps
+raw log weights in float64 and subtracts the candidate-specific maximum before
+exponentiation.  This common rescaling leaves the Hájek estimate and effective
+sample size unchanged.  It is distinct from the target/reference policy-ratio
+cap used when defining the shared deployment policy.
 
-所有数据角色都先按患者划分，同一患者不会跨角色：
+The candidate's target-policy marginal coverage estimate is
 
-| Role | 用途 |
+\[
+\widehat C_t(r;q_{<t})=
+\frac{\sum_{i\in D_{\rm cal}}W_{it}(r;q_{<t})
+\mathbf 1\{R_{it}\le r\}}
+{\sum_{i\in D_{\rm cal}}W_{it}(r;q_{<t})}.
+\]
+
+SC-PCP retains candidates with \(\widehat C_t\ge 1-\alpha\), selects the one
+with the smallest importance-weighted normalized width, commits it, and moves
+to stage \(t+1\).  If no candidate is feasible, selection is unavailable for
+that seed.  It does not silently replace a failed selection with the largest
+set.  The final artifact records candidate coverages, widths, effective sample
+sizes, log-weight spans, endpoint selections, and any failure stage.
+
+## Guarantee boundary
+
+The method targets an **asymptotic per-step marginal guarantee**, not a
+finite-sample distribution-free, PAC, or data-conditional certificate.  For
+fixed \(T\), sequential identification and positivity, exact or consistently
+estimated uncapped prefix ratios, a fixed finite grid (or the corresponding
+uniform convergence for convergent empirical grids), and a stable population
+selector imply
+
+\[
+\min_{0\le t<T} C_t(\widehat q_{0:t})
+\ge 1-\alpha-o_p(1).
+\]
+
+This is the honest boundary of the current implementation: the selected radii
+and their induced deployment laws are learned from the same calibration sample,
+so no exact finite-sample conformal claim is made.  Clinical results are
+controlled evaluations in a frozen held-out empirical environment, not claims
+about an unobserved real-world intervention.
+
+## Data roles and comparison methods
+
+All roles are patient-disjoint.  Synthetic data use 40% \(D_{\rm pred}\), 20%
+\(D_{\rm COT}\), and 40% \(D_{\rm cert}\).  Clinical data use 40%
+\(D_{\rm pred}\), 15% \(D_{\rm COT}\), 30% \(D_{\rm cert}\), and 15%
+\(D_{\rm env}\).  \(D_{\rm env}\) is used only to construct the frozen clinical
+evaluator.
+
+Every complete seed contains exactly these six canonical paper names:
+
+| Method | Information regime |
 | --- | --- |
-| \(D_{\rm pred}\) | 拟合并冻结 outcome mean/scale model 与 behavior nuisance；两者分别读取结局与动作标签 |
-| \(D_{\rm COT}\) | 患者级 cross-fit 学习 transport-refined profile；冻结 focused scale grid；在全角色上重训并校准 final COT |
-| \(D_{\rm cert}\) | 计算 coverage evidence、候选宽度并选择最终尺度 |
-| \(D_{\rm env}\) | 只建立 clinical controlled evaluator，不参与选择 |
+| `Standard CP` | logged calibration data only |
+| `ACI` | logged initialization + 2,000 target-policy adaptation trajectories |
+| `MFCS` | logged calibration data only |
+| `SPCI` | logged initialization + 2,000 target-policy adaptation trajectories |
+| `PRC` | logged initialization + 2,000 target-policy adaptation trajectories |
+| `SC-PCP` | logged calibration data only |
 
-临床数据采用 40/15/30/15 的 \(D_{\rm pred}/D_{\rm COT}/D_{\rm cert}/D_{\rm env}\) 划分，不再为 propensity 单独牺牲一个 data split。Behavior nuisance 在 \(D_{\rm pred}\) 的动作标签上拟合，并在内部患者留出集上完成 decision-time calibration；outcome model 只读取同一角色中的结局标签。临床 Track A evaluator 是 **leave-one-patient-out conditional-residual-bootstrap controlled evaluation**：donor search 排除当前患者，并把 donor residual 在当前 query 的预测均值与尺度上重新组合。它只用于冻结后的评估，不能被解释为观察到的 target-policy deployment 或真实世界因果效果。
+MFCS, SPCI, and PRC are task-aligned adapters because their upstream interfaces
+do not directly accept this project's longitudinal treatment trajectories,
+radius-dependent policies, and common rectangular multivariate sets.  Figures
+and result records nevertheless use only the canonical names above.  The three
+online methods each receive their own 2,000 trajectories over three rounds;
+they do not share that budget.  See
+[`docs/baselines_and_settings.md`](docs/baselines_and_settings.md) for the exact
+algorithms and caveats.
 
-## Paper comparison
+## Final paper suite
 
-每个完整 paper seed 都必须包含六个方法行：SC-PCP 和五个对照方法。
+The default environment is `ucp`, and the runner uses both GPUs.  RQ1 contains
+Synthetic (\(T=12\), 100 seeds), eICU, INSPIRE, and MIMIC-IV (\(T=12\), 20 seeds
+each), and MIMIC-CXR (\(T=6\), 20 seeds).  RQ3 adds Synthetic feedback strengths
+\(\beta\in\{0,0.5,2\}\), 100 seeds each; \(\beta=1\) reuses RQ1.  RQ2 and RQ4
+reuse artifacts declared in the suite manifest.
 
-| Paper label | 角色 |
-| --- | --- |
-| `Standard CP` | 固定历史分布的逐阶段 split conformal baseline |
-| `ACI stagewise adaptation` | 使用额外 on-policy trajectories 的阶段式在线适应 baseline |
-| `MFCS task-adapted` | 使用 logged-data profile family 的有限深度 feedback baseline |
-| `MultiDimSPCI task-adapted` | 使用额外 on-policy trajectories 的多结局在线适应 baseline |
-| `PRC grid-adapted` | 在 logged-data profile-scale grid 上运行的 on-policy PRC adapter |
-| `SC-PCP` | 本文方法：cross-fit transport-refined profile + marginal COT + ordered-IUT |
-
-`baselines/` 中的上游代码用于核对算法来源；无法直接处理本任务的二维 logged clinical trajectories 时，paper record 明确使用 `task-adapted` 或 `grid-adapted` 名称，不声称是未经修改的 native reproduction。主表同时展示六个方法，不只报告 SC-PCP；online baselines 的额外 adaptation budget 与 offline 方法的信息条件分开标注。
-
-## 完整正式实验
-
-默认环境为 `ucp`，默认使用两张 GPU。下面的入口运行全部预设 RQ1 与 RQ3 作业；RQ2 和 RQ4 复用 manifest 中指定的冻结产物。它不是 smoke run：synthetic 主实验为 100 seeds，四个 clinical 数据集各 20 seeds，feedback stress 的每个额外 \(\beta\) 设置也使用 100 seeds。
+Start a new complete suite in an empty output root:
 
 ```bash
 conda run -n ucp python scripts/run_paper_suite.py \
@@ -89,7 +157,23 @@ conda run -n ucp python scripts/run_paper_suite.py \
   --output-root results/work/paper_final
 ```
 
-runner 会拒绝写入非空 output root，并且只有全部预设 seed 完成后才写 `COMPLETE`。完整运行结束后生成论文主表和图：
+Resume the exact same suite after interruption:
+
+```bash
+conda run -n ucp python scripts/run_paper_suite.py \
+  --sections rq1,rq3 \
+  --datasets synthetic,mimic_iv,mimic_cxr,eicu,inspire \
+  --devices cuda:0,cuda:1 \
+  --output-root results/work/paper_final \
+  --resume
+```
+
+Resume validates the stored suite manifest and every completed seed; it is not
+an invitation to change datasets, source, or configuration in place.  A fresh
+run refuses a nonempty output root, and the top-level `COMPLETE` marker is
+written only after all requested settings finish.
+
+Render the completed suite:
 
 ```bash
 conda run -n ucp python tools/render_paper_results.py \
@@ -97,31 +181,18 @@ conda run -n ucp python tools/render_paper_results.py \
   --output results/paper_final
 ```
 
-renderer 会 fail closed：缺少数据集、seed、六方法记录或 `COMPLETE` 标记时不会生成正式 PDF。输出包括 synthetic 主表、clinical 主表、逐阶段 coverage、feedback stress 和 self-consistent diagonal 机制图。
+The renderer fails closed on missing settings, seeds, canonical method rows, or
+completion markers.  Its final output directory contains PDF files only.
 
-### Exact finite-MDP theorem validation
+The frozen 2026-08-22 result table, interpretation, and limitations are recorded
+in [`docs/main_results_20260822.md`](docs/main_results_20260822.md).
 
-Tabular validation 使用同一 profiled ordered-IUT SC-PCP schema，配置为完整 200 seeds 和每个已选择 seed 50,000 条 fresh rollout：
-
-```bash
-conda run -n ucp python scripts/run_per_step.py \
-  --config configs/per_step_tabular_validation.yaml \
-  --devices cuda:0,cuda:1 \
-  --workers-per-device 2 \
-  --output-dir results/work/profiled_ordered_tabular_validation
-
-conda run -n ucp python tools/summarize_tabular_validation.py \
-  --input-root results/work/profiled_ordered_tabular_validation \
-  --expected-seeds 0:200 \
-  --output results/paper_final/tabular_theorem_validation
-```
-
-旧的 scalar/max-\(t\) validation artifacts 会被 summarizer 明确拒绝，必须用当前唯一方法的配置重跑。
-
-## 验证
+## Validation and entry points
 
 ```bash
 conda run -n ucp pytest -q
 ```
 
-核心实现位于 `src/scpcp/`；单数据集调度入口为 `scripts/run_per_step.py`，完整论文入口为 `scripts/run_paper_suite.py`，最终论文汇总入口为 `tools/render_paper_results.py`。
+The main method is implemented in `src/scpcp/marginal_prefix.py`, integrated by
+`src/scpcp/experiment.py`, scheduled by `scripts/run_paper_suite.py`, and
+rendered by `tools/render_paper_results.py`.

@@ -19,7 +19,7 @@ from scpcp.device import resolve_devices
 
 
 CONFIGS = {
-    "synthetic": ROOT / "configs" / "per_step_synthetic.yaml",
+    "synthetic": ROOT / "configs" / "per_step_synthetic_tail_shift.yaml",
     "mimic_iv": ROOT / "configs" / "per_step_mimic_iv.yaml",
     "mimic_cxr": ROOT / "configs" / "per_step_mimic_cxr.yaml",
     "eicu": ROOT / "configs" / "per_step_eicu.yaml",
@@ -38,20 +38,21 @@ def main() -> None:
     parser.add_argument("--datasets", default=",".join(CONFIGS), help="RQ1 datasets")
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--output-root", type=Path, default=Path("results/work/paper_final"))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume an exact suite and validate every completed setting",
+    )
     args = parser.parse_args()
 
     sections = _parse_choices(args.sections, {"rq1", "rq3"})
     datasets = _parse_choices(args.datasets, set(CONFIGS))
     devices = resolve_devices(args.devices)
     root = args.output_root
-    if root.exists():
-        existing = list(root.iterdir())
-        if existing:
-            raise FileExistsError(f"paper-suite output already contains files: {root}")
-    (root / "rq1").mkdir(parents=True, exist_ok=True)
+    mechanism_seed = ExperimentConfig.from_yaml(CONFIGS["synthetic"]).paper.mechanism_seed
     manifest = {
-        "protocol": "transport_refined_four_rq_paper_protocol",
-        "method": "transport_refined_profiled_scale_ordered_iut_scpcp",
+        "protocol": "committed_prefix_marginal_scpcp",
+        "method": "direct_committed_prefix_uncapped_importance_weighting",
         "experiment_tree_sha256": experiment_tree_sha256(),
         "sections": sections,
         "datasets": datasets,
@@ -61,15 +62,16 @@ def main() -> None:
             "rq2_mimic_iv": "rq1/mimic_iv",
             "rq2_synthetic_strong": "rq3/beta_2",
             "rq3_beta_1": "rq1/synthetic",
-            "rq4": "rq1/synthetic/seed_00000",
+            "rq4": (
+                f"rq1/synthetic/seed_{mechanism_seed:05d} "
+                "committed-prefix surfaces"
+            ),
         },
     }
-    (root / "suite_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    _prepare_suite_root(root, manifest, resume=args.resume)
 
     if "rq1" in sections:
         for dataset in datasets:
-            if dataset == "synthetic" and (root / "rq1" / "synthetic").exists():
-                continue
             config = ExperimentConfig.from_yaml(CONFIGS[dataset]).with_overrides(
                 devices=devices,
                 output_dir=root / "rq1" / dataset,
@@ -78,6 +80,7 @@ def main() -> None:
                 config,
                 config.output_dir,
                 workers_per_device=_workers_per_device(dataset),
+                resume=args.resume and config.output_dir.exists(),
             )
 
     if "rq3" in sections:
@@ -91,6 +94,7 @@ def main() -> None:
                 config,
                 config.output_dir,
                 workers_per_device=_workers_per_device("synthetic"),
+                resume=args.resume and config.output_dir.exists(),
             )
         for beta in FEEDBACK_LEVELS:
             if beta == 1.0:
@@ -108,10 +112,35 @@ def main() -> None:
                 config,
                 config.output_dir,
                 workers_per_device=_workers_per_device("synthetic"),
+                resume=args.resume and config.output_dir.exists(),
             )
 
     (root / "COMPLETE").write_text("complete\n")
     print(root)
+
+
+def _prepare_suite_root(
+    root: Path,
+    manifest: dict[str, object],
+    *,
+    resume: bool,
+) -> None:
+    """Create a new suite or validate an exact resumable suite manifest."""
+
+    manifest_path = root / "suite_manifest.json"
+    normalized_manifest = json.loads(json.dumps(manifest))
+    if resume:
+        if not root.is_dir() or not manifest_path.is_file():
+            raise FileNotFoundError(f"resumable paper suite is missing: {root}")
+        stored = json.loads(manifest_path.read_text())
+        if stored != normalized_manifest:
+            raise RuntimeError("paper-suite manifest differs from the active experiment")
+        return
+    if root.exists() and any(root.iterdir()):
+        raise FileExistsError(f"paper-suite output already contains files: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "rq1").mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(normalized_manifest, indent=2) + "\n")
 
 
 def _parse_choices(value: str, allowed: set[str]) -> tuple[str, ...]:

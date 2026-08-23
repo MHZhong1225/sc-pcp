@@ -12,6 +12,9 @@ from scpcp.config import ModelConfig
 from scpcp.data import TrajectoryBatch
 
 
+_ALL_ACTION_INFERENCE_CHUNK_SIZE = 4_096
+
+
 class GaussianOutcomeModel(nn.Module):
     def __init__(
         self,
@@ -93,10 +96,50 @@ class GaussianOutcomeModel(nn.Module):
     @torch.no_grad()
     def predict_all_actions(self, states: Tensor) -> tuple[Tensor, Tensor]:
         n = len(states)
-        repeated_states = states[:, None, :].expand(n, self.n_actions, self.state_dim).reshape(-1, self.state_dim)
-        repeated_actions = torch.arange(self.n_actions, device=states.device).repeat(n)
-        mean, scale = self(repeated_states, repeated_actions)
-        return mean.reshape(n, self.n_actions, 2), scale.reshape(n, self.n_actions, 2)
+        if n == 0:
+            shape = (0, self.n_actions, 2)
+            return states.new_empty(shape), states.new_empty(shape)
+        # Preserve the historical operation order for calibration-sized calls;
+        # only large batches need to avoid repeating state encodings by action.
+        if n <= _ALL_ACTION_INFERENCE_CHUNK_SIZE:
+            repeated_states = (
+                states[:, None, :]
+                .expand(n, self.n_actions, self.state_dim)
+                .reshape(-1, self.state_dim)
+            )
+            repeated_actions = torch.arange(
+                self.n_actions, device=states.device
+            ).repeat(n)
+            mean, scale = self(repeated_states, repeated_actions)
+            return (
+                mean.reshape(n, self.n_actions, 2),
+                scale.reshape(n, self.n_actions, 2),
+            )
+
+        mean = states.new_empty((n, self.n_actions, 2))
+        scale = states.new_empty((n, self.n_actions, 2))
+        actions = torch.arange(self.n_actions, device=states.device)
+        action_features = self.action_embedding(actions)
+        for start in range(0, n, _ALL_ACTION_INFERENCE_CHUNK_SIZE):
+            stop = min(start + _ALL_ACTION_INFERENCE_CHUNK_SIZE, n)
+            state_batch = states[start:stop]
+            batch_size = len(state_batch)
+            encoded = self.representation(state_batch)
+            static = self.static_features(state_batch)
+            features = torch.cat(
+                (
+                    encoded[:, None, :].expand(-1, self.n_actions, -1),
+                    static[:, None, :].expand(-1, self.n_actions, -1),
+                    action_features[None, :, :].expand(batch_size, -1, -1),
+                ),
+                dim=2,
+            ).reshape(batch_size * self.n_actions, -1)
+            output = self.head(features)
+            batch_mean, log_scale = output[:, :2], output[:, 2:]
+            batch_scale = functional.softplus(log_scale) + self.config.min_scale
+            mean[start:stop] = batch_mean.reshape(batch_size, self.n_actions, 2)
+            scale[start:stop] = batch_scale.reshape(batch_size, self.n_actions, 2)
+        return mean, scale
 
 
 def fit_outcome_model(

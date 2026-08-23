@@ -1,0 +1,55 @@
+data:
+  dataset: synthetic
+synthetic:
+  scenario: tail_shift
+  feedback_strength: 1.0
+  disease_treatment_effect: 0.75
+  toxicity_treatment_effect: 0.55
+policy:
+  tilt: 1.0
+  temperature: 1.0
+  action_costs: [0.0, 0.05, 0.10]
+  propensity_floor: 0.01
+  policy_ratio_cap: 10.0
+cot:
+  rho_cap: 4.0
+  weight_cap: 40.0
+  loss: huber
+profile:
+  refinement_folds: 3
+  refinement_strength: 0.5
+  maximum_profile_ratio: 1.25
+  minimum_effective_size: 25.0
+  maximum_cap_hit_rate: 0.01
+  grid_focus_fraction: 0.80
+  grid_focus_radius: 0.075
+certification:
+  alpha: 0.10
+  delta: 0.05
+  ratio_error_bound: 0.0
+  ratio_bound_source: none
+  ratio_delta: 0.0
+  practical_bootstrap_resamples: 2000
+samples:
+  logged: 5000
+  oracle_rollouts: 50000
+  oracle_surface_rollouts: 5000
+  online_rollouts: 2000
+baselines:
+  mfcs_depth: 3
+  aci_gamma: 0.01
+  multidim_buffer: 1000
+  online_rounds: 3
+  prc_maximum_step: 0.35
+paper:
+  save_mechanism_diagonal: false
+  mechanism_seed: 1000
+horizon: 12
+q_grid_size: 101
+q_quantile_min: 0.50
+q_quantile_max: 0.999
+seeds:
+  start: 1000
+  stop: 1100
+devices: [cuda:0, cuda:1]
+output_dir: results/work/paper_marginal_final/rq1/synthetic_tail_shift

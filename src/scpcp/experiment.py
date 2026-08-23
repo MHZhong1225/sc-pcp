@@ -18,41 +18,32 @@ from scpcp.baselines import (
     standard_cp_stagewise_radii,
 )
 from scpcp.behavior import fit_behavior_policy
-from scpcp.certification import (
-    CertificationResult,
-    exact_tabular_ordered_pointwise_l1_lower_bounds,
-    ordered_pointwise_bootstrap_lower_bounds,
-    ordered_pointwise_ht_lower_bounds,
-)
+from scpcp.certification import CertificationResult
 from scpcp.config import ExperimentConfig
 from scpcp.cot import (
     cot_state_action_weights,
-    exact_tabular_cot_l1_error_bound,
     fit_cot,
 )
 from scpcp.coverage import (
-    candidate_radius_schedules,
-    diagonal_coverage_estimates,
     effective_sample_sizes,
-    estimate_oracle_diagonal,
+    fixed_q_grid,
     per_step_oracle_metrics,
     profiled_local_scale_grid,
     profiled_scale_grid,
-    self_normalized_diagonal_coverage_estimates,
     stage_score_profile,
     stage_score_quantiles,
     transport_refined_stage_profile,
     weighted_stage_score_quantiles,
 )
 from scpcp.data import DataSplits, TrajectoryBatch, concatenate_trajectories, patient_level_splits
+from scpcp.marginal_prefix import (
+    MarginalPrefixSelection,
+    select_marginal_prefix_schedule,
+)
 from scpcp.outcome_model import fit_outcome_model
 from scpcp.policy import BehaviorAnchoredPolicy
-from scpcp.scores import fit_conformal_region, score_batch
-from scpcp.selection import (
-    RadiusSelection,
-    select_ordered_certified_radius,
-    select_ordered_lcb_radius,
-)
+from scpcp.scores import fit_conformal_region, predict_observed_actions, score_batch
+from scpcp.selection import RadiusSelection
 from scpcp.simulator import (
     EmpiricalTransitionEnvironment,
     SyntheticBehaviorPolicy,
@@ -108,6 +99,16 @@ class _RefinedScheduleFamily:
 
 
 @dataclass(frozen=True)
+class _ExperimentContext:
+    task: _Task
+    outcome_model: object
+    region: object
+    policy: object
+    logging_policy: object
+    outcome_sd: Tensor
+
+
+@dataclass(frozen=True)
 class _OracleContext:
     task: _Task
     outcome_model: object
@@ -125,7 +126,46 @@ def _prepare_oracle_context(
     seed: int,
     device: str,
 ) -> _OracleContext:
-    """Prepare the predictor, policy, and D_COT-frozen schedule family."""
+    """Prepare the retired profiled family for frozen oracle audits only."""
+
+    context = _prepare_experiment_context(config, seed=seed, device=device)
+    task = context.task
+    splits = task.splits
+    cot_scores = score_batch(
+        context.region,
+        splits.cot.current_states(),
+        splits.cot.actions,
+        splits.cot.outcomes,
+    )
+    schedule_family = _fit_transport_refined_schedule_family(
+        splits.cot,
+        cot_scores,
+        policy=context.policy,
+        logging_policy=context.logging_policy,
+        outcome_model=context.outcome_model,
+        config=config,
+        device=device,
+        seed=seed,
+    )
+    return _OracleContext(
+        task=task,
+        outcome_model=context.outcome_model,
+        region=context.region,
+        policy=context.policy,
+        logging_policy=context.logging_policy,
+        outcome_sd=context.outcome_sd,
+        cot_scores=cot_scores,
+        schedule_family=schedule_family,
+    )
+
+
+def _prepare_experiment_context(
+    config: ExperimentConfig,
+    *,
+    seed: int,
+    device: str,
+) -> _ExperimentContext:
+    """Prepare the frozen predictor and policies shared by all paper methods."""
 
     task = _prepare_task(config, seed=seed, device=device)
     splits = task.splits
@@ -192,39 +232,21 @@ def _prepare_oracle_context(
         raise RuntimeError("the OPE denominator is unavailable")
 
     outcome_sd = _training_outcome_sd(splits.predictor)
-    cot_scores = score_batch(
-        region,
-        splits.cot.current_states(),
-        splits.cot.actions,
-        splits.cot.outcomes,
-    )
-    schedule_family = _fit_transport_refined_schedule_family(
-        splits.cot,
-        cot_scores,
-        policy=policy,
-        logging_policy=logging_policy,
-        outcome_model=outcome_model,
-        config=config,
-        device=device,
-        seed=seed,
-    )
-    return _OracleContext(
+    return _ExperimentContext(
         task=task,
         outcome_model=outcome_model,
         region=region,
         policy=policy,
         logging_policy=logging_policy,
         outcome_sd=outcome_sd,
-        cot_scores=cot_scores,
-        schedule_family=schedule_family,
     )
 
 
 def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
-    """Run the sole ordered-IUT SC-PCP method and its five baselines."""
+    """Run committed-prefix marginal SC-PCP and the five paper baselines."""
 
     torch.manual_seed(seed)
-    context = _prepare_oracle_context(config, seed=seed, device=device)
+    context = _prepare_experiment_context(config, seed=seed, device=device)
     task = context.task
     splits = task.splits
     outcome_model = context.outcome_model
@@ -232,127 +254,56 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
     policy = context.policy
     logging_policy = context.logging_policy
     outcome_sd = context.outcome_sd
-    cot_scores = context.cot_scores
-    schedule_family = context.schedule_family
-    initial_stage_profile = schedule_family.initial_profile
-    baseline_scale_grid = schedule_family.baseline_scale_grid
-    stage_profile = schedule_family.profile
-    scale_grid = schedule_family.scale_grid
-    candidate_radii = candidate_radius_schedules(scale_grid, stage_profile)
-    fitted_cot = fit_cot(
-        splits.cot,
-        q_grid=scale_grid,
-        stage_profile=stage_profile,
-        target_policy=policy,
-        logging_policy=logging_policy,
-        outcome_model=outcome_model,
-        config=config.cot,
-        device=device,
-        seed=seed + 3,
+
+    cot_scores = score_batch(
+        region,
+        splits.cot.current_states(),
+        splits.cot.actions,
+        splits.cot.outcomes,
     )
-    exact_profiled_l1_error = None
-    if task.name == "tabular" and hasattr(task.environment, "exact_state_ratios"):
-        exact_profiled_l1_error = exact_tabular_cot_l1_error_bound(
-            fitted_cot,
-            task.environment,
-            q_grid=scale_grid,
-            target_policy=policy,
-            logging_policy=logging_policy,
-            weight_cap=config.cot.weight_cap,
-        )
-    # The profile, candidate grid, and final transport learner are now frozen.
-    # D_cert is first touched only after this point.
     cert_scores = score_batch(
         region,
         splits.certification.current_states(),
         splits.certification.actions,
         splits.certification.outcomes,
     )
-    cot_weights, cot_weight_diagnostics = cot_state_action_weights(
-        fitted_cot,
-        splits.certification,
-        q_grid=scale_grid,
+    calibration = concatenate_trajectories(splits.cot, splits.certification)
+    calibration_scores = torch.cat((cot_scores, cert_scores), dim=0)
+
+    # Keep the exact confirmed construction: D_COT freezes each 101-point
+    # stage grid, while D_COT union D_cert supplies every selection estimate.
+    stage_grids = _committed_prefix_stage_grids(cot_scores, config)
+    scpcp_selection = select_marginal_prefix_schedule(
+        calibration,
+        calibration_scores,
+        stage_grids=stage_grids.to(calibration_scores),
         target_policy=policy,
         logging_policy=logging_policy,
-        weight_cap=config.cot.weight_cap,
+        outcome_model=outcome_model,
+        outcome_sd=outcome_sd,
+        target=1.0 - config.certification.alpha,
     )
-    cot_ht_diagonal = diagonal_coverage_estimates(
-        cot_weights,
-        cert_scores.to(cot_weights),
-        candidate_radii.to(cot_weights),
-    )
-    cot_diagonal = self_normalized_diagonal_coverage_estimates(
-        cot_weights,
-        cert_scores.to(cot_weights),
-        candidate_radii.to(cot_weights),
-    )
-    candidate_widths = _estimated_candidate_normalized_widths(
-        outcome_model,
-        splits.certification,
-        cot_weights,
-        candidate_radii,
-        outcome_sd,
-    )
-    if exact_profiled_l1_error is not None:
-        cot_certificate = exact_tabular_ordered_pointwise_l1_lower_bounds(
-            cot_ht_diagonal,
-            n_trajectories=splits.certification.n,
-            weight_cap=config.cot.weight_cap,
-            exact_l1_error_bound=exact_profiled_l1_error,
-            delta=config.certification.delta,
-            cluster_ids=splits.certification.patient_ids,
-        )
-        cot_selection = select_ordered_certified_radius(
-            scale_grid,
-            cot_certificate,
-            alpha=config.certification.alpha,
-            widths=candidate_widths,
-        )
-        selection_evidence = "exact_finite_mdp_transport_audit"
-    elif config.certification.ratio_bound_source == "declared":
-        cot_certificate = ordered_pointwise_ht_lower_bounds(
-            cot_ht_diagonal,
-            n_trajectories=splits.certification.n,
-            weight_cap=config.cot.weight_cap,
-            config=config.certification,
-            cluster_ids=splits.certification.patient_ids,
-        )
-        cot_selection = select_ordered_certified_radius(
-            scale_grid,
-            cot_certificate,
-            alpha=config.certification.alpha,
-            widths=candidate_widths,
-        )
-        selection_evidence = "declared_simultaneous_transport_bound"
-    else:
-        cot_certificate = ordered_pointwise_bootstrap_lower_bounds(
-            cot_weights,
-            cert_scores.to(cot_weights),
-            candidate_radii.to(cot_weights),
-            lower_tail=config.certification.delta,
-            n_resamples=config.certification.practical_bootstrap_resamples,
-            seed=seed + 31_337,
-            cluster_ids=splits.certification.patient_ids,
-        )
-        cot_selection = select_ordered_lcb_radius(
-            scale_grid,
-            cot_certificate,
-            alpha=config.certification.alpha,
-            widths=candidate_widths,
-            status="PRACTICAL_CLUSTER_ORDERED_IUT_LCB",
-        )
-        selection_evidence = "practical_patient_cluster_bootstrap"
 
-    baseline_batch = concatenate_trajectories(splits.cot, splits.certification)
-    baseline_scores = torch.cat((cot_scores, cert_scores), dim=0)
+    # Baseline grids retain their prespecified D_COT construction.  Every
+    # baseline calibration/update nevertheless receives the same D_cal scores.
+    initial_stage_profile = stage_score_profile(
+        cot_scores,
+        alpha=config.certification.alpha,
+    )
+    baseline_scale_grid = profiled_scale_grid(
+        cot_scores,
+        initial_stage_profile,
+        size=config.q_grid_size,
+        lower_quantile=config.q_quantile_min,
+        upper_quantile=config.q_quantile_max,
+    )
     standard_radii = standard_cp_stagewise_radii(
-        baseline_scores,
+        calibration_scores,
         config.certification.alpha,
     )
-    mfcs_method = f"MFCS task-adapted (depth={config.baselines.mfcs_depth})"
     mfcs_selection, _ = finite_depth_mfcs_selection(
-        baseline_batch.to(device),
-        baseline_scores.to(device),
+        calibration.to(device),
+        calibration_scores.to(device),
         q_grid=baseline_scale_grid.to(device),
         stage_profile=initial_stage_profile.to(device),
         target_policy=policy,
@@ -370,7 +321,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         task.environment,
         policy,
         region,
-        baseline_scores,
+        calibration_scores,
         alpha=config.certification.alpha,
         gamma=config.baselines.aci_gamma,
         rounds=config.baselines.online_rounds,
@@ -383,7 +334,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         task.environment,
         policy,
         region,
-        baseline_scores,
+        calibration_scores,
         alpha=config.certification.alpha,
         rounds=config.baselines.online_rounds,
         total_rollouts=config.samples.online_rollouts,
@@ -425,8 +376,19 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             device,
             outcome_sd=outcome_sd,
         ),
+        _evaluate_stagewise_method(
+            "ACI",
+            aci,
+            task,
+            policy,
+            region,
+            config,
+            evaluation_seed,
+            device,
+            outcome_sd=outcome_sd,
+        ),
         _evaluate_radius_method(
-            mfcs_method,
+            "MFCS",
             None
             if mfcs_selection.radius is None
             else mfcs_selection.radius * initial_stage_profile,
@@ -442,18 +404,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             outcome_sd=outcome_sd,
         ),
         _evaluate_stagewise_method(
-            f"ACI stagewise adaptation (gamma={config.baselines.aci_gamma:g})",
-            aci,
-            task,
-            policy,
-            region,
-            config,
-            evaluation_seed,
-            device,
-            outcome_sd=outcome_sd,
-        ),
-        _evaluate_stagewise_method(
-            f"MultiDimSPCI task-adapted (buffer={config.baselines.multidim_buffer})",
+            "SPCI",
             multidim,
             task,
             policy,
@@ -464,7 +415,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             outcome_sd=outcome_sd,
         ),
         _evaluate_stagewise_method(
-            "PRC grid-adapted",
+            "PRC",
             prc,
             task,
             policy,
@@ -477,64 +428,60 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         ),
         _evaluate_radius_method(
             SCPCP_METHOD,
-            None
-            if cot_selection.radius is None
-            else cot_selection.radius * stage_profile,
+            scpcp_selection.radii,
             task,
             policy,
             region,
             config,
             evaluation_seed,
             device,
-            selection=cot_selection,
-            certificate=cot_certificate,
-            selected_scale=cot_selection.radius,
-            stage_profile=stage_profile,
             outcome_sd=outcome_sd,
         ),
     ]
+    _annotate_paper_records(
+        records,
+        config=config,
+        calibration_trajectories=calibration.n,
+        scpcp_selection=scpcp_selection,
+    )
 
     surfaces = {
-        "q_grid": scale_grid,
-        "scale_grid": scale_grid,
-        "stage_profile": stage_profile,
-        "initial_stage_quantiles": schedule_family.initial_quantiles,
+        "scpcp_stage_grids": stage_grids,
+        "scpcp_candidate_coverage": scpcp_selection.candidate_estimated_coverage,
+        "scpcp_candidate_normalized_width": (
+            scpcp_selection.candidate_estimated_normalized_width
+        ),
+        "scpcp_candidate_effective_sample_size": (
+            scpcp_selection.candidate_effective_sample_size
+        ),
+        "scpcp_candidate_maximum_raw_log_weight": (
+            scpcp_selection.candidate_maximum_raw_log_weight
+        ),
+        "scpcp_candidate_raw_log_weight_span": (
+            scpcp_selection.candidate_raw_log_weight_span
+        ),
+        "scpcp_selected_indices": torch.tensor(scpcp_selection.selected_indices),
+        "scpcp_selected_coverage": scpcp_selection.estimated_coverage,
+        "scpcp_selected_normalized_width": (
+            scpcp_selection.estimated_normalized_width
+        ),
+        "scpcp_selected_effective_sample_size": (
+            scpcp_selection.effective_sample_size
+        ),
+        "scpcp_selected_maximum_raw_log_weight": (
+            scpcp_selection.maximum_raw_log_weight
+        ),
+        "scpcp_selected_raw_log_weight_span": scpcp_selection.raw_log_weight_span,
         "initial_stage_profile": initial_stage_profile,
         "baseline_scale_grid": baseline_scale_grid,
-        "profile_anchor_scale": schedule_family.anchor_scale,
-        "profile_applied_log_correction": schedule_family.applied_log_correction,
-        "profile_fold_initial_quantiles": schedule_family.fold_initial_quantiles,
-        "profile_fold_transported_quantiles": schedule_family.fold_transported_quantiles,
-        "profile_fold_effective_sizes": schedule_family.fold_effective_sizes,
-        "profile_fold_refinement_weights": schedule_family.fold_refinement_weights,
-        "profile_fold_cap_hit_rates": schedule_family.fold_cap_hit_rates,
-        "candidate_radii": candidate_radii,
-        "cot_ht_diagonal": cot_ht_diagonal,
-        "cot_diagonal": cot_diagonal,
-        "cot_lower_bounds": cot_certificate.lower_bounds,
-        "estimated_candidate_widths": candidate_widths,
     }
-    if cot_selection.radius is not None:
-        surfaces["scpcp_selected_scale"] = torch.tensor(cot_selection.radius)
-        surfaces["scpcp_selected_radii"] = cot_selection.radius * stage_profile
-    if exact_profiled_l1_error is not None:
-        surfaces["exact_profiled_cot_l1_error"] = exact_profiled_l1_error
-    if config.paper.save_mechanism_diagonal and seed == config.paper.mechanism_seed:
-        if task.name not in {"synthetic", "tabular"}:
-            raise ValueError("the mechanism diagonal is available only in known environments")
-        surfaces["oracle_diagonal"] = estimate_oracle_diagonal(
-            task.environment,
-            policy,
-            region,
-            q_grid=candidate_radii,
-            horizon=config.horizon,
-            n_rollouts=config.samples.oracle_surface_rollouts,
-            seed=_paper_seed(seed, 1_100_001),
-            device=device,
-        )
+    if scpcp_selection.radii is not None:
+        surfaces["scpcp_selected_radii"] = scpcp_selection.radii
     diagnostics = {
         "dataset": task.name,
-        "protocol": "transport_refined_four_rq_paper_protocol",
+        "protocol": "committed_prefix_marginal_scpcp",
+        "method": "direct_committed_prefix_uncapped_importance_weighting",
+        "guarantee_scope": "asymptotic_per_step_marginal",
         "baseline_scope": "task_adapted_common_prediction_set_interface",
         "matched_evaluation_random_stream": True,
         "adaptation_seeds": {
@@ -544,32 +491,37 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         },
         "evaluation_seed": evaluation_seed,
         "training_outcome_sd": [float(value) for value in outcome_sd.tolist()],
-        "cot": fitted_cot.diagnostics,
-        "cot_cap_hit_rate": float(cot_weight_diagnostics.cap_hit_rate.mean().item()),
-        "selection_evidence": selection_evidence,
-        "profile_learning": "patient_crossfit_transport_refinement",
-        "initial_stage_profile": [
-            float(value) for value in initial_stage_profile.tolist()
-        ],
-        "stage_profile": [float(value) for value in stage_profile.tolist()],
-        "profile_anchor_scale": float(schedule_family.anchor_scale.item()),
-        "profile_applied_log_correction": [
-            float(value) for value in schedule_family.applied_log_correction.tolist()
-        ],
-        "profile_fold_minimum_effective_size": [
-            float(value)
-            for value in schedule_family.fold_effective_sizes.min(dim=1).values.tolist()
-        ],
-        "profile_fold_mean_cap_hit_rate": [
-            float(value) for value in schedule_family.fold_cap_hit_rates.mean(dim=1).tolist()
-        ],
-        "profile_gated_fold_stage_count": int(
-            (schedule_family.fold_refinement_weights == 0.0).sum().item()
+        "calibration_roles": ["D_COT", "D_cert"],
+        "calibration_trajectories": calibration.n,
+        "stage_grid_role": "D_COT",
+        "stage_grid_candidate_count": config.q_grid_size,
+        "importance_weights": (
+            "uncapped exact-or-fitted-propensity prefix RN with float64 "
+            "column-max log stabilization"
+        ),
+        "scpcp_selection_available": scpcp_selection.selection_available,
+        "scpcp_selected_indices": list(scpcp_selection.selected_indices),
+        "scpcp_selected_endpoint": scpcp_selection.selected_endpoint,
+        "scpcp_failure_stage": scpcp_selection.failure_stage,
+        "scpcp_minimum_effective_sample_size": _tensor_min_or_nan(
+            scpcp_selection.effective_sample_size
+        ),
+        "scpcp_minimum_candidate_effective_sample_size": _tensor_min_or_nan(
+            scpcp_selection.candidate_effective_sample_size
+        ),
+        "scpcp_maximum_raw_log_weight": _tensor_max_or_nan(
+            scpcp_selection.maximum_raw_log_weight
+        ),
+        "scpcp_maximum_raw_log_weight_span": _tensor_max_or_nan(
+            scpcp_selection.raw_log_weight_span
         ),
         "baseline_candidate_count": len(baseline_scale_grid),
-        "ordered_candidate_count": len(scale_grid),
-        "ordered_certified_indices": list(cot_selection.certified_indices),
-        "ordered_stopped_index": cot_selection.stopped_index,
+        "baseline_settings": {
+            "MFCS": {"depth": config.baselines.mfcs_depth},
+            "ACI": {"gamma": config.baselines.aci_gamma},
+            "SPCI": {"buffer": config.baselines.multidim_buffer},
+            "PRC": {"maximum_step": config.baselines.prc_maximum_step},
+        },
         "split_sizes": {
             "pred": splits.predictor.n,
             "beh": 0 if splits.behavior is None else splits.behavior.n,
@@ -585,6 +537,107 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         surfaces=surfaces,
         diagnostics=diagnostics,
     )
+
+
+def _committed_prefix_stage_grids(
+    cot_scores: Tensor,
+    config: ExperimentConfig,
+) -> Tensor:
+    """Freeze the confirmed per-stage candidate grids using D_COT only."""
+
+    return torch.stack(
+        [
+            fixed_q_grid(
+                cot_scores[:, stage],
+                size=config.q_grid_size,
+                lower_quantile=config.q_quantile_min,
+                upper_quantile=config.q_quantile_max,
+            )
+            for stage in range(config.horizon)
+        ]
+    )
+
+
+def _annotate_paper_records(
+    records: list[dict[str, Any]],
+    *,
+    config: ExperimentConfig,
+    calibration_trajectories: int,
+    scpcp_selection: MarginalPrefixSelection,
+) -> None:
+    settings = {
+        "Standard CP": {"alpha": config.certification.alpha},
+        "MFCS": {
+            "depth": config.baselines.mfcs_depth,
+            "weight_cap": config.cot.weight_cap,
+        },
+        "ACI": {"gamma": config.baselines.aci_gamma},
+        "SPCI": {"buffer": config.baselines.multidim_buffer},
+        "PRC": {"maximum_step": config.baselines.prc_maximum_step},
+        SCPCP_METHOD: {
+            "candidate_count": config.q_grid_size,
+            "weights": "uncapped_committed_prefix",
+        },
+    }
+    for record in records:
+        record["method_setting"] = json.dumps(settings[record["method"]], sort_keys=True)
+        record["calibration_trajectories"] = calibration_trajectories
+
+    scpcp_record = next(record for record in records if record["method"] == SCPCP_METHOD)
+    available = scpcp_selection.selection_available
+    scpcp_record.update(
+        {
+            "selection_estimand": "per_step_marginal",
+            "selection_parameter": "stagewise_radii",
+            "selection_status": (
+                "SELECTED_MARGINAL_POINT"
+                if available
+                else "UNAVAILABLE_NO_FEASIBLE_CANDIDATE"
+            ),
+            "certificate_type": "",
+            "certificate_formal": False,
+            "certified": False,
+            "guarantee_scope": "asymptotic_per_step_marginal",
+            "selection_evidence": "committed_prefix_uncapped_hajek_point_estimate",
+            "selected_indices": json.dumps(list(scpcp_selection.selected_indices)),
+            "selected_endpoint": scpcp_selection.selected_endpoint,
+            "failure_stage": scpcp_selection.failure_stage,
+            "estimated_coverage_by_time": _json_tensor(
+                scpcp_selection.estimated_coverage
+            ),
+            "estimated_normalized_width_by_time": _json_tensor(
+                scpcp_selection.estimated_normalized_width
+            ),
+            "estimated_min_coverage": _tensor_min_or_nan(
+                scpcp_selection.estimated_coverage
+            ),
+            "mean_ess": _tensor_mean_or_nan(
+                scpcp_selection.effective_sample_size
+            ),
+            "minimum_ess": _tensor_min_or_nan(
+                scpcp_selection.effective_sample_size
+            ),
+            "minimum_candidate_ess": _tensor_min_or_nan(
+                scpcp_selection.candidate_effective_sample_size
+            ),
+        }
+    )
+
+
+def _json_tensor(values: Tensor) -> str:
+    return json.dumps([float(value) for value in values.detach().cpu().tolist()])
+
+
+def _tensor_min_or_nan(values: Tensor) -> float:
+    return float("nan") if values.numel() == 0 else float(values.min().item())
+
+
+def _tensor_max_or_nan(values: Tensor) -> float:
+    return float("nan") if values.numel() == 0 else float(values.max().item())
+
+
+def _tensor_mean_or_nan(values: Tensor) -> float:
+    return float("nan") if values.numel() == 0 else float(values.mean().item())
 
 
 def _fit_transport_refined_schedule_family(
@@ -1053,7 +1106,7 @@ def _logged_descriptive_metrics(
     states = batch.current_states().reshape(-1, batch.state_dim).to(device)
     actions = batch.actions.reshape(-1).to(device)
     outcomes = batch.outcomes.reshape(-1, batch.outcome_dim).to(device)
-    _, scales = policy.outcome_model(states, actions)
+    _, scales = predict_observed_actions(policy.outcome_model, states, actions)
     radii = torch.full((len(scales),), float(radius), device=device, dtype=scales.dtype)
     log_volumes = policy.region.log_volume(scales, radii)
     volumes = log_volumes.exp()
@@ -1115,7 +1168,7 @@ def _deployment_record(
     ).mean()
     flat_states, flat_actions, _ = deployed.flat_transitions()
     predictor = outcome_model.outcome_model if hasattr(outcome_model, "outcome_model") else outcome_model
-    _, scales = predictor(flat_states, flat_actions)
+    _, scales = predict_observed_actions(predictor, flat_states, flat_actions)
     if isinstance(radius, Tensor):
         step_radius = radius.to(scales)[None, :].expand(deployed.n, -1).reshape(-1)
         pathwise_coverage = (scores <= radius.to(scores)[None, :]).all(dim=1).float().mean()
