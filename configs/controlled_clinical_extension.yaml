@@ -1,0 +1,78 @@
+protocol: controlled_clinical_extension_v2
+
+split_fractions:
+  predictor: 0.40
+  fidelity: 0.20
+  environment: 0.40
+
+science:
+  bootstrap_resamples: 10000
+  gammas: [-4.0, -2.0, 0.0, 2.0, 4.0]
+  calibration_trajectories: 3000
+  grid_trajectories: 1000
+  reference_trajectories: 20000
+  online_trajectories: 2000
+  q_low_source_quantile: 0.80
+  q_high_source_quantile: 0.95
+  alternative_policy_tilt: 20.0
+  maximum_policy_response: 1.0
+  policy_ratio_cap: 3.0
+  transition_ridge: 0.001
+
+support_gate:
+  minimum_unique_patients_per_stage_action: 20
+  minimum_available_seed_fraction: 0.95
+  neighbors: 100
+
+donor_overlap_gate:
+  gamma: -4.0
+  probe_trajectories: 3000
+  probe_radius_fractions: [0.50, 1.00]
+  amendment: q_high_max_response_probe_added_before_any_coverage_launch
+  local_ess_quantile: 0.01
+  minimum_local_ess_quantile: 10.0
+  minimum_median_ess_fraction: 0.25
+  maximum_donor_probability: 0.25
+
+k0_fidelity_gate:
+  systematic_replays: 16
+  maximum_score_ks: 0.10
+  maximum_signed_residual_w1: 0.25
+  maximum_successor_mean_w1: 0.25
+  maximum_successor_q95_w1: 0.50
+  minimum_available_seed_fraction: 0.95
+  active_coordinate_sd_floor: 0.0001
+
+datasets:
+  mimic_iv:
+    base_config: configs/per_step_mimic_iv.yaml
+    horizon: 12
+    late_stage_start: 4
+    seed_start: 93600
+    seed_stop: 93800
+    seed_step: 10
+    bootstrap_seed: 9361019
+  eicu:
+    base_config: configs/per_step_eicu.yaml
+    horizon: 12
+    late_stage_start: 4
+    seed_start: 92000
+    seed_stop: 92200
+    seed_step: 10
+    bootstrap_seed: 9201019
+  inspire:
+    base_config: configs/per_step_inspire.yaml
+    horizon: 12
+    late_stage_start: 4
+    seed_start: 92300
+    seed_stop: 92500
+    seed_step: 10
+    bootstrap_seed: 9231019
+  mimic_cxr:
+    base_config: configs/per_step_mimic_cxr.yaml
+    horizon: 6
+    late_stage_start: 2
+    seed_start: 92600
+    seed_stop: 92800
+    seed_step: 10
+    bootstrap_seed: 9261019

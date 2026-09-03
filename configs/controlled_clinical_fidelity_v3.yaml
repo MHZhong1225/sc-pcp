@@ -1,0 +1,88 @@
+protocol: controlled_clinical_fidelity_v3
+parent_v2_root: results/work/controlled_clinical_extension_v2
+
+datasets: [mimic_iv, eicu, inspire, mimic_cxr]
+devices_required: 2
+
+development:
+  role: k0_only_reuse_of_v2_prespecified_seed_bank
+  seeds:
+    mimic_iv: {start: 93600, stop: 93800, step: 10}
+    eicu: {start: 92000, stop: 92200, step: 10}
+    inspire: {start: 92300, stop: 92500, step: 10}
+    mimic_cxr: {start: 92600, stop: 92800, step: 10}
+
+confirmation:
+  role: fresh_split_confirmation
+  seeds:
+    mimic_iv: {start: 111000, stop: 111200, step: 10}
+    eicu: {start: 112000, stop: 112200, step: 10}
+    inspire: {start: 113000, stop: 113200, step: 10}
+    mimic_cxr: {start: 114000, stop: 114200, step: 10}
+  bootstrap_seeds:
+    mimic_iv: 11100019
+    eicu: 11200019
+    inspire: 11300019
+    mimic_cxr: 11400019
+
+stage_a:
+  metric_order: [raw, stagewise_zscore]
+  neighbor_order: [100, 200]
+  weight_order: [gaussian_b2, gaussian_b4, uniform]
+  stagewise_zscore:
+    source: D_env_only
+    pooling: per_stage_pooled_over_actions
+    center_dtype: float64
+    scale_dtype: float64
+    population_sd: true
+    sd_floor: 0.0001
+  ridge: {mode: v2_raw, value: 0.001, penalize_intercept: true}
+
+stage_b:
+  ridge_order:
+    - raw_ridge_1e-3
+    - normalized_ridge_1e-3
+    - normalized_ridge_1e-2
+  normalized_penalty:
+    gram: XTX_over_n
+    right_hand_side: XTY_over_n
+    penalize_intercept: false
+
+k0_gate:
+  systematic_replays: 16
+  maximum_score_ks: 0.10
+  maximum_signed_residual_w1: 0.25
+  maximum_successor_mean_w1: 0.25
+  maximum_successor_q95_w1: 0.50
+  minimum_available_seed_fraction: 0.95
+  active_coordinate_sd_floor: 0.0001
+
+support_gate:
+  minimum_unique_patients_per_stage_action: 20
+  minimum_available_seed_fraction: 0.95
+
+selection:
+  version: controlled_clinical_fidelity_v3_selector_v1
+  seed_ratio_quantile: 0.95
+  seed_ratio_quantile_method: linear
+  shared_stage_a_order:
+    - maximize_minimum_dataset_pass_count
+    - minimize_maximum_dataset_q95_seed_ratio
+    - minimize_global_mean_seed_ratio
+    - minimize_change_from_v2
+    - candidate_index
+  dataset_fallback_order:
+    - maximize_pass_count
+    - minimize_q95_seed_ratio
+    - minimize_mean_seed_ratio
+    - minimize_change_from_v2
+    - candidate_index
+  shared_admissibility:
+    repaired_dataset_minimum_pass_count: 19
+    mimic_iv_exact_pass_count: 20
+  failure: DEVELOPMENT_NO_GO
+
+information_firewall:
+  allowed: [support, k0_fidelity, context_identity, provenance]
+  forbidden: [science, coverage, width, method_selection]
+  coverage_generation_permitted: false

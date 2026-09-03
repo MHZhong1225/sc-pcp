@@ -1,0 +1,143 @@
+protocol: controlled_clinical_fidelity_v5_mimic_cxr
+dataset: mimic_cxr
+
+parent_v4:
+  development:
+    root: results/work/controlled_clinical_fidelity_v4_development
+    file_sha256:
+      COMPLETE: 6d05b9e8e1411c7d75f2247a5d8c8fc2479557fb3d365165682e4e706efff610
+      FINAL_STATUS.json: a098c77436b8ad8415ad081e6a5af9b5a4dfb329a9eecd4956cd9718c347b368
+      frozen_settings.json: 0d2f0e676cd19c88772b6972af480b3c431938eed1d10a98db88645f90237ee8
+      manifest.json: f7d207418590cbb947705caec4c777a0895d710b0665e7323c9a72ff623cc0be
+      metadata.json: a7b452b80e13670c5d845fd7ccad0a97a0b39e805869e1c0c884960bd3dfeebc
+      selection/mimic_cxr.json: 1b7d30389a84d38255ea15395430eb99d74ddb4259c20a9451e9aebca99fec63
+  confirmation_retry:
+    root: results/work/controlled_clinical_fidelity_v4_confirmation_administrative_retry_r1
+    file_sha256:
+      COMPLETE: e156b19e9cc086a0506aa8cef34f9807ddad66ef670a2b1571705b97924b3fcf
+      FINAL_STATUS.json: 25df7a510a929d65847f3d65294bfb7b436cf6bc96b0433bd4b82800425a51ca
+      administrative_retry_amendment.json: 528fb9f19ca158c4ff255e50cde8c577256e35da358ad282f1cb6cc8b83eb363
+      manifest.json: fe48c9d7f9d356db9765245b62472cc64ce34d7bd0d2b8fb5d900acd9433c69a
+      metadata.json: 1648e829d8c1cbb8ac4bc174c62b686a1f9403cead6b337c7bf4e09f80b351ca
+      support_replay_verification.json: e1f6d78ec707d7391445cc4d14f56b9b94a11775b3884931e1c9537ef48a7412
+      mimic_cxr/COMPLETE: 9f0f4cf6ea28485b6f322b5c52755352d7a1f45d5201be22e966e247928fdd91
+      mimic_cxr/gate.json: a5824cc58334539b598114ae87e1e640c97dea4bb7b105a096c1aab9f5a7b3d6
+
+development:
+  role: exact_authorized_reuse_of_v4_cxr_development_lineage
+  seeds: {start: 92600, stop: 92800, step: 10}
+  rng_audit:
+    base_seed_count: 20
+    stream_count: 100
+    mapping_sha256: 88ff47c1cf4516777b63cfc892155b426e0a34b3268414c27e2911b3ecdda9c6
+    rng_id_set_sha256: bfafe31040f154d3f4a157f74cb441d0c535b494463779a6cc359b9c1f2e18cc
+    common_random_numbers_across_candidates: true
+    scientific_freshness_claimed: false
+
+confirmation:
+  role: fresh_split_confirmation
+  seeds: {start: 119000, stop: 119200, step: 10}
+  bootstrap_seed: 11900019
+  independent_patient_confirmation_claimed: false
+  rng_audit:
+    derived_stream_count: 341
+    mapping_sha256: 43d832a650352de3e97fc6694178c61969e707a3658abb33958668080cf3e40e
+    rng_id_set_sha256: c3caf2b4e5137b62c52fe71e97a559ff2fff513cdcd597865819f21852a80742
+    base_seed_set_sha256: 8724d28e631cda56727563b6904abd3407a32c6484672a72b634e83b08d719bd
+    required_collision_count: 0
+
+# This exact snapshot was recorded after an independent read-only audit found
+# P0=0/P1=0 while both formal roots were absent and no formal RNG was consumed.
+independent_audit:
+  status: GO
+  attestation_sha256: 9d65ed56c161d8b1f944590d5b73dff318b95f0c953999cfa61fc0777990aa05
+  expected_prior_count: 6842
+  expected_prior_sha256: d88631f2c8ebcb9ea76c97b74f58701460d7b3053ed9ca9766c95fd7f132749e
+  expected_artifact_count: 6700
+  expected_artifact_sha256: 1de55ef1cc76fa4c33c35c81eb683c4f10bbce9ce1fd1bf6b71d46c5d0631978
+  expected_source_count: 874
+  expected_source_sha256: adf39a60e043bf6ae3a04470775208fe134781fefe5a4e4de4291e6758612fe3
+
+candidate_order:
+  - B00_exact_c13_anchor
+  - B01_stagewise_successor_bridge
+  - B02_pooled_successor_bridge_stage_one_hot
+
+state_kernel:
+  metric: raw
+  neighbors: 10000
+  uses_full_cell: true
+  donor_weighting: uniform
+  bandwidth: 2.0
+  transition_mode: ridge_residual
+  outcome_residual_mode: raw
+  ridge_mode: sample_normalized_no_intercept
+  ridge_value: 0.001
+  penalize_intercept: false
+
+outcome_bridge:
+  source: D_env_only
+  successor_source_feature_names:
+    - spo2_last
+    - spo2_mean
+    - spo2_min
+    - spo2_max
+    - rr_last
+    - rr_mean
+    - rr_min
+    - rr_max
+  successor_source_feature_indices: [48, 49, 50, 51, 44, 45, 46, 47]
+  clinical_coordinate_count: 16
+  spo2_hinge: {threshold: 92.0, scale: 10.0, direction: lower_tail}
+  rr_hinge: {threshold: 22.0, scale: 15.0, direction: upper_tail}
+  current_action_one_hot:
+    included_for: [B01_stagewise_successor_bridge, B02_pooled_successor_bridge_stage_one_hot]
+    action_order: [0, 1, 2]
+    penalized: true
+  stage_one_hot:
+    included_for: [B02_pooled_successor_bridge_stage_one_hot]
+    stage_order: [0, 1, 2, 3, 4, 5]
+    penalized: true
+  ridge_mode: sample_normalized_no_intercept
+  ridge_value: 0.001
+  intercept_penalized: false
+  joint_two_outcome_donor_residual: true
+
+k0_gate:
+  systematic_replays: 16
+  maximum_score_ks: 0.10
+  maximum_signed_residual_w1: 0.25
+  maximum_successor_mean_w1: 0.25
+  maximum_successor_q95_w1: 0.50
+  active_coordinate_sd_floor: 0.0001
+
+diagnostics:
+  aggregate_gate_unchanged: true
+  score_ks: stage_scalar
+  outcome_coordinate_arrays:
+    - signed_residual_w1
+    - successor_mean_w1
+    - successor_q95_w1
+  action_stratification: descriptive_non_gating
+  unavailable_cells: explicit
+
+selection:
+  version: controlled_clinical_fidelity_v5_mimic_cxr_selector_v1
+  seed_ratio_quantile: 0.95
+  seed_ratio_quantile_method: linear
+  order:
+    - maximize_pass_count
+    - minimize_q95_seed_ratio
+    - minimize_mean_seed_ratio
+    - minimize_change_from_c13
+    - candidate_id
+  development_seed_count: 20
+  development_minimum_pass_count: 19
+  development_required_structural_pass_count: 20
+  candidate_seed_deletion_permitted: false
+  development_gate_interpretation: operational_not_confidence_interval
+
+information_firewall:
+  allowed: [support, k0_fidelity, context_identity, provenance, descriptive_diagnostics]
+  forbidden: [science, coverage, width, method_selection]
+  scientific_outputs_permitted: false

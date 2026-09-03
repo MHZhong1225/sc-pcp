@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -20,6 +21,22 @@ from scpcp.data import TrajectoryBatch
 from scpcp.policy import BehaviorAnchoredPolicy
 from scpcp.selection import RadiusSelection, select_empirical_radius
 from scpcp.simulator import rollout
+
+
+class BaselineRollout(Protocol):
+    """Rollout interface used by online baseline adapters."""
+
+    def __call__(
+        self,
+        environment: object,
+        policy: BehaviorAnchoredPolicy,
+        *,
+        n: int,
+        horizon: int,
+        seed: int,
+        device: str | torch.device,
+        q: Tensor,
+    ) -> TrajectoryBatch: ...
 
 
 def standard_cp_stagewise_radii(scores: Tensor, alpha: float) -> Tensor:
@@ -144,6 +161,7 @@ def aci_style_controller(
     horizon: int,
     seed: int,
     device: str | torch.device,
+    rollout_fn: BaselineRollout | None = None,
 ) -> OnlineBaselineResult:
     """Stagewise online ACI adaptation; it intentionally consumes on-policy data."""
 
@@ -153,7 +171,7 @@ def aci_style_controller(
     adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         radii = torch.stack([_finite_quantile(history, 1.0 - float(alpha_time[t])) for t, history in enumerate(histories)])
-        deployed = rollout(
+        deployed = _online_rollout(
             environment,
             policy,
             n=rollout_size,
@@ -161,6 +179,7 @@ def aci_style_controller(
             seed=seed + 17_923 * round_index,
             device=device,
             q=radii.to(device),
+            rollout_fn=rollout_fn,
         )
         from scpcp.scores import score_batch
 
@@ -188,6 +207,7 @@ def multidim_spci_style_controller(
     seed: int,
     device: str | torch.device,
     residual_window: int = 1_000,
+    rollout_fn: BaselineRollout | None = None,
 ) -> OnlineBaselineResult:
     """Online multivariate-score adaptation when native MultiDimSPCI is unavailable.
 
@@ -201,7 +221,7 @@ def multidim_spci_style_controller(
     adaptation = _CoverageAccumulator.create(horizon)
     for round_index, rollout_size in enumerate(round_sizes):
         radii = torch.stack([_finite_quantile(history, 1.0 - alpha) for history in histories])
-        deployed = rollout(
+        deployed = _online_rollout(
             environment,
             policy,
             n=rollout_size,
@@ -209,6 +229,7 @@ def multidim_spci_style_controller(
             seed=seed + 47_021 * round_index,
             device=device,
             q=radii.to(device),
+            rollout_fn=rollout_fn,
         )
         from scpcp.scores import score_batch
 
@@ -237,6 +258,7 @@ def prc_profile_scale(
     seed: int,
     device: str | torch.device,
     maximum_step: float = 0.35,
+    rollout_fn: BaselineRollout | None = None,
 ) -> OnlineBaselineResult:
     """PRC-MaxTime adapter on the same frozen ``q_t(s)=s b_t`` family."""
 
@@ -251,7 +273,7 @@ def prc_profile_scale(
     for round_index, rollout_size in enumerate(round_sizes):
         margin = math.sqrt(math.log(len(scale_grid) * horizon / delta) / (2.0 * rollout_size))
         radii = current_scale * profile
-        deployed = rollout(
+        deployed = _online_rollout(
             environment,
             policy,
             n=rollout_size,
@@ -259,6 +281,7 @@ def prc_profile_scale(
             seed=seed + 61_103 * round_index,
             device=device,
             q=radii.to(device),
+            rollout_fn=rollout_fn,
         )
         from scpcp.scores import score_batch
 
@@ -296,3 +319,26 @@ def _online_round_sizes(total_rollouts: int, rounds: int) -> tuple[int, ...]:
         raise ValueError("online total_rollouts must be at least the number of adaptation rounds")
     base, remainder = divmod(total_rollouts, rounds)
     return tuple(base + (round_index < remainder) for round_index in range(rounds))
+
+
+def _online_rollout(
+    environment: object,
+    policy: BehaviorAnchoredPolicy,
+    *,
+    n: int,
+    horizon: int,
+    seed: int,
+    device: str | torch.device,
+    q: Tensor,
+    rollout_fn: BaselineRollout | None,
+) -> TrajectoryBatch:
+    selected_rollout = rollout if rollout_fn is None else rollout_fn
+    return selected_rollout(
+        environment,
+        policy,
+        n=n,
+        horizon=horizon,
+        seed=seed,
+        device=device,
+        q=q,
+    )

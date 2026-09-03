@@ -1,0 +1,24 @@
+protocol: rq6_ncal_convergence_v1
+state_count: 8
+action_count: 3
+horizon: 4
+grid_size: 7
+alpha: 0.10
+radius_minimum: 1.40
+radius_maximum: 3.50
+q_quantile_minimum: 0.50
+q_quantile_maximum: 0.999
+policy_reference_tv: 0.05
+n_calibration: [250, 500, 1000, 2000, 5000, 10000]
+cot_role_parts: 1
+certification_role_parts: 2
+problem_seed_start: 97000
+problem_count: 100
+logged_replicates: 20
+logged_rng_start: 97100000
+bootstrap_rng: 97900000
+bootstrap_resamples: 10000
+surface_chunk_size: 128
+workers: 4
+output_dir: results/work/rq6_ncal_convergence_v1
+seed_namespace: "rq6_ncal_convergence_v1:97000"

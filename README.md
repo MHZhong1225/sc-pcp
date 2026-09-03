@@ -9,9 +9,10 @@ scores.  The paper target is **per-step marginal coverage**:
 \ge 1-\alpha,\qquad t=0,\ldots,T-1.
 \]
 
-The sole final method is **SC-PCP**: uncapped committed-prefix
-importance-weighted marginal calibration with a free stagewise radius vector
-\(q=(q_0,\ldots,q_{T-1})\).  It does not constrain the schedule to a common
+The sole final method is **SC-PCP**: marginal calibration with an unclipped
+cumulative committed-prefix importance product under a structurally
+ratio-capped target policy, using a free stagewise radius vector
+\(q=(q_0,\ldots,q_{T-1})\). It does not constrain the schedule to a common
 scale or a prespecified stage profile.
 
 ## Why historical calibration is insufficient
@@ -52,10 +53,12 @@ D_{\rm cal}=D_{\rm COT}\cup D_{\rm cert}.
 \]
 
 The historical role name \(D_{\rm COT}\) is retained for artifact compatibility;
-the final SC-PCP path does not fit a COT model.  It uses \(D_{\rm COT}\) only to
-freeze a separate 101-point empirical score grid for each stage before final
-selection.  Both patient-disjoint parts of \(D_{\rm cal}\) then contribute to
-every calibration estimate.
+the final SC-PCP path does not fit a COT model. It uses \(D_{\rm COT}\) to
+construct a separate 101-point empirical score grid for each stage. Both
+patient-disjoint parts of \(D_{\rm cal}\) then contribute to every calibration
+estimate. Because \(D_{\rm COT}\) is reused, the validity argument relies on
+uniform convergence over the complete compact radius class, not independence
+of the empirical grid.
 
 Suppose \(q_0,\ldots,q_{t-1}\) have been committed.  For candidate radius \(r\)
 at stage \(t\), SC-PCP computes the full observed-action prefix weight
@@ -69,11 +72,12 @@ W_{it}(r;q_{<t})=
      {\mu_t(A_{it}\mid S_{it})}.
 \]
 
-These importance weights are not clipped or capped.  The implementation keeps
-raw log weights in float64 and subtracts the candidate-specific maximum before
-exponentiation.  This common rescaling leaves the Hájek estimate and effective
-sample size unchanged.  It is distinct from the target/reference policy-ratio
-cap used when defining the shared deployment policy.
+The cumulative importance products are not clipped or capped. The
+implementation keeps raw log weights in float64 and subtracts the
+candidate-specific maximum before exponentiation. This common rescaling leaves
+the Hájek estimate and effective sample size unchanged. It is distinct from
+the per-action target/reference policy-ratio cap that is part of the deployed
+policy definition.
 
 The candidate's target-policy marginal coverage estimate is
 
@@ -95,19 +99,21 @@ sizes, log-weight spans, endpoint selections, and any failure stage.
 
 The method targets an **asymptotic per-step marginal guarantee**, not a
 finite-sample distribution-free, PAC, or data-conditional certificate.  For
-fixed \(T\), sequential identification and positivity, exact or consistently
-estimated uncapped prefix ratios, a fixed finite grid (or the corresponding
-uniform convergence for convergent empirical grids), and a stable population
-selector imply
+fixed \(T\), sequential identification and positivity, exact or uniformly
+ratio-consistent fitted logging propensities, a uniform LLN over the compact
+prefix-radius class, and selection availability with probability tending to
+one imply
 
 \[
 \min_{0\le t<T} C_t(\widehat q_{0:t})
 \ge 1-\alpha-o_p(1).
 \]
 
+The proof uses empirical feasibility plus a uniform bound on the complete
+coverage surface; it does not require a unique or stable population selector.
 This is the honest boundary of the current implementation: the selected radii
-and their induced deployment laws are learned from the same calibration sample,
-so no exact finite-sample conformal claim is made.  Clinical results are
+and their induced deployment laws are learned from the same calibration
+sample, so no exact finite-sample conformal claim is made. Clinical results are
 controlled evaluations in a frozen held-out empirical environment, not claims
 about an unobserved real-world intervention.
 
@@ -186,12 +192,99 @@ completion markers.  Its final output directory contains PDF files only.
 
 The frozen 2026-08-22 result table, interpretation, and limitations are recorded
 in [`docs/main_results_20260822.md`](docs/main_results_20260822.md).
+The complete artifact map—formal suite, controlled-shift diagnostics, and
+explicit NO-GO studies—is maintained in
+[`docs/experiment_data_inventory_20260824.md`](docs/experiment_data_inventory_20260824.md).
+
+The three formal studies completed on 2026-08-25—an exact finite-MDP
+identification audit, a controlled six-method comparison, and a predeclared
+equal-marginal copula gate—are reported in
+[`docs/formal_experiments_20260825.md`](docs/formal_experiments_20260825.md).
+In the fresh controlled all-six study, SC-PCP improves WSC over Standard CP by
+3.46 and 1.86 percentage points at \(\gamma=-4,-2\), but reaches only 0.8983
+and 0.8974 rather than uniformly attaining 0.90. The orthogonal copula gate is
+a formal NO-GO because its directional effect is statistically clear but too
+small under the frozen practical-magnitude thresholds. These are controlled
+semi-synthetic diagnostics, not natural clinical treatment-effect evidence or
+a universal SOTA claim.
+
+For paper-facing presentation, \(\gamma=-4\) is the default displayed hero
+stress case within the controlled semi-synthetic study. This is a presentation
+choice only: \(\gamma=-2\) remains the frozen primary cell, \(\gamma=-4\)
+remains the prespecified stress endpoint, and the complete five-point signed
+curve remains authoritative. No controlled semi-synthetic cell replaces the
+separate five-setting production-style suite.
+
+Earlier two-method confirmation and post-confirmatory ablation artifacts remain
+documented in [the experimental evidence ledger](docs/experimental_evidence_20260824.md),
+but their protocol-specific values must not replace the later all-six results.
+The manuscript structure and claim boundary are collected in
+[the ICLR paper blueprint](docs/paper_blueprint_20260824.md).
+
+The four theory- and robustness-facing studies completed on 2026-08-26 are
+reported in
+[`docs/formal_experiments_20260826.md`](docs/formal_experiments_20260826.md).
+They quantify the horizon--overlap loss of effective sample size, fixed-grid
+coverage-surface convergence as calibration size grows, fitted-propensity
+sensitivity under a fixed target law, and an independent-calibration
+strict-split variant. These diagnostics leave the canonical SC-PCP selector
+unchanged. They strengthen the empirical support for its asymptotic theory but
+do not create a finite-sample, distribution-free, PAC, clinical, or universal
+SOTA claim.
+
+The completed dataset-native controlled clinical extension is also recorded in
+[`docs/formal_experiments_20260826.md`](docs/formal_experiments_20260826.md#10-dataset-native-controlled-clinical-extension-v2).
+All four clinical settings pass the support gate, but only MIMIC-IV passes the
+logging-mixture K0 fidelity gate (20/20) and the donor-overlap screen. At its
+confirmatory \(\gamma=-4\) endpoint, Standard CP has WSC 0.86358 and SC-PCP
+0.90089 (+3.73 percentage points) with a 1.204 width ratio; SC-PCP's 95% WSC
+interval still crosses 0.90. eICU, INSPIRE, and MIMIC-CXR + IV/ED are formal
+K0 NO-GO results (12/20, 13/20, and 10/20), so no scientific coverage rows were
+generated for them. These NO-GO panels must not be filled with production-style,
+Synthetic \(\beta=2\), or older MIMIC v1 curves.
+
+The corresponding deterministic paper figures are
+[`figure_theory_diagnostics.pdf`](results/paper_theorem_robustness_20260826/figure_theory_diagnostics.pdf)
+and
+[`figure_robustness_audits.pdf`](results/paper_theorem_robustness_20260826/figure_robustness_audits.pdf).
+Their editable exports, source-data CSVs, and QA report are in
+[`results/work/theorem_robustness_report_20260826`](results/work/theorem_robustness_report_20260826).
+
+The complete submission figure portfolio is indexed in
+[`docs/figure_portfolio_20260826.md`](docs/figure_portfolio_20260826.md). Newly
+rendered frozen-artifact outputs include the
+[`method schematic`](results/paper_method_schematic_20260826/figure_method_schematic.pdf),
+[`five-setting Pareto figure`](results/paper_main_suite_figures_20260826/figure_main_pareto.pdf),
+[`dataset-native gated controlled-stress grid`](results/paper_five_setting_stage_profiles_20260826/figure_controlled_stress_grid.pdf),
+[`all-five production/native stagewise profiles`](results/paper_five_setting_stage_profiles_20260826/figure_stagewise_profiles.pdf),
+[`exact-prefix identification heatmap`](results/paper_formal_mechanism_20260826/figure_exact_prefix_identification.pdf),
+[`controlled all-six figure`](results/paper_formal_mechanism_20260826/figure_controlled_signed_all_six.pdf),
+and the
+[`controlled all-six table`](results/paper_formal_mechanism_20260826/table_controlled_signed_all_six.pdf).
+The older single-panel
+[`controlled stress profile`](results/paper_controlled_stress_stage_profile_20260826/figure_controlled_stress_stage_profile.pdf)
+remains a valid 2026-08-25 MIMIC v1 render, but it is protocol-specific and is
+not the all-dataset figure.
+Every paper directory is PDF-only; editable SVG, 600-dpi TIFF, source CSV,
+analysis, QA, and hash manifests remain in the corresponding `results/work`
+bundle. These renderers do not rerun scientific seeds.
 
 ## Validation and entry points
 
 ```bash
 conda run -n ucp pytest -q
 ```
+
+Re-render the frozen theory/robustness figures into fresh empty output roots:
+
+```bash
+conda run -n ucp python tools/render_theorem_robustness_results.py \
+  --work-output results/work/theorem_robustness_report_rerender \
+  --paper-output results/paper_theorem_robustness_rerender
+```
+
+Re-render commands for the method, main-suite, and formal-mechanism figures are
+listed in [`docs/figure_portfolio_20260826.md`](docs/figure_portfolio_20260826.md).
 
 The main method is implemented in `src/scpcp/marginal_prefix.py`, integrated by
 `src/scpcp/experiment.py`, scheduled by `scripts/run_paper_suite.py`, and

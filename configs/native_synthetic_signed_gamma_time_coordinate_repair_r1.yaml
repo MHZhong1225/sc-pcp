@@ -1,0 +1,82 @@
+repair_protocol: native_synthetic_signed_gamma_time_coordinate_repair_r1
+role: administrative_validator_repair_replay
+administrative_only: true
+
+parent:
+  root: results/work/native_synthetic_signed_gamma_v1
+  scientific_protocol: native_synthetic_signed_gamma_v1
+  decision: NO_GO
+  config_payload_sha256: b23bde3bbeb882a8f9c4d8ca3d40b7a528a7798ab1ba6ace5b7b41d2d7acfcf8
+  rng_audit_sha256: 9a0a0e2f0ed4d0f2e4b841ae9f38bd147f352d863d23fe57d46e3ad20c35d5ad
+  source_tree_sha256: c30b98a128283a9d07eb0fa06a1372ce0c90478cda1261c49ac998443986e61b
+  source_snapshot_sha256: 51b72e19e15a311077f44217cb35060917809a1c6379e7d3cba968f12cabc681
+  artifact_count: 25
+  artifact_inventory_sha256: 2d189f1277cde6f92e2c2035facc18d670d52f566dece508e2b6a30fb31d703d
+  bundle_files:
+    artifact_schema.json: 05cd17e10a59f3b73892d4de6d6258824d19c377501e6463180f6dabf2591885
+    metadata.json: 27278b8807348ed21d78d68ee6d76b9b8de6ab987136d593d8f3817990ceadb6
+    summary.json: 64b6864eddb74d29e12376efa1bcf37496a9604655294555d1fc38e5aa822eb1
+    manifest.json: f05be7cbf357f242ceb1c5ba45bf3c14c9586ddbd4c42c0a30850daeccff221e
+    COMPLETE: a9d6565e585d821eb8715d8ad71c6697f134597de5e4f84ade6312a8e99dbfed
+  artifact_inventory:
+    - {path: artifact_schema.json, sha256: 05cd17e10a59f3b73892d4de6d6258824d19c377501e6463180f6dabf2591885, size_bytes: 982}
+    - {path: mechanism/seed_121000.json, sha256: 773b9c41ac413d46b23ea301728c51cf251edf673d1818440ac5933cf9def4b2, size_bytes: 3193}
+    - {path: mechanism/seed_121010.json, sha256: 2d235ac17ce505346674e637e384a0dbc374c0d5ce99e40ff8204511fa3341e4, size_bytes: 3171}
+    - {path: mechanism/seed_121020.json, sha256: 525b80ef1ccb66bf1dbe2e4bef66811cd7e4bc262a07af659e9fa41d245c6b7e, size_bytes: 3200}
+    - {path: mechanism/seed_121030.json, sha256: 4ee88c787cab91ebb00509aa8c221fecfc2f1f2f6f1f6e881ea859952f0fe75d, size_bytes: 3183}
+    - {path: mechanism/seed_121040.json, sha256: 0fda80e9fbbad1e190d84dbe36053f67dd194ae7104f14a50b73968448469f8f, size_bytes: 3183}
+    - {path: mechanism/seed_121050.json, sha256: ae2e320181820e9dd4fab185d5c9ab36234090d37a74d11ec6ac1c22f2e78239, size_bytes: 3183}
+    - {path: mechanism/seed_121060.json, sha256: 0ef930252a2102b8ecca5f2fcd226c1c72baf7b2103b342f92d7943fa3a82f84, size_bytes: 3193}
+    - {path: mechanism/seed_121070.json, sha256: 4424e4574444796c7bea32bcb80559570d7fd08cbbff0e8a82531a4b1882281e, size_bytes: 3204}
+    - {path: mechanism/seed_121080.json, sha256: f7ba2dec26aa850972b46b20fb1323e525f02e527f4c7b03c34cabafb60c3eee, size_bytes: 3182}
+    - {path: mechanism/seed_121090.json, sha256: f7a5c969c57794ad227697d20d4747b8530c3099deae740f25259ee15ec73c7e, size_bytes: 3189}
+    - {path: mechanism/seed_121100.json, sha256: 21a006955bc92beab721955ff8155ccb969e26e428fef13634329a92e62f2215, size_bytes: 3181}
+    - {path: mechanism/seed_121110.json, sha256: 52a120676009c7a6df6fd0f8a76e8e7693ec9507c678271e75c5c42d1b2cba8c, size_bytes: 3195}
+    - {path: mechanism/seed_121120.json, sha256: cbf644a622ec136f7cf7273729d6d5800528e23bc006f845b56cc92c8d24acf2, size_bytes: 3176}
+    - {path: mechanism/seed_121130.json, sha256: 7771dfe89e34ab6514b5b34ad681c66d1c7487e9e6e153a7a3bc67b5e78dfc4d, size_bytes: 3205}
+    - {path: mechanism/seed_121140.json, sha256: 6587ed7025dae6de63e43d853fc5160dd823d31ec97d33457dbced2a9d01824b, size_bytes: 3193}
+    - {path: mechanism/seed_121150.json, sha256: 0fbeafdd3f0cbfdf76a6a71296ce05dc527c460be110b3b7ece5079b3541ae15, size_bytes: 3168}
+    - {path: mechanism/seed_121160.json, sha256: 0989dbe61035e4f2ce1bfbb601ab6437653fdc92c2c95e75eded43d8e476875e, size_bytes: 3178}
+    - {path: mechanism/seed_121170.json, sha256: 6a4af48ab3418b168df0651a77850907dba7a12cd9c4d8a2f5a61e37e5193452, size_bytes: 3206}
+    - {path: mechanism/seed_121180.json, sha256: b5bcf5b952cf52a54dd6f5a5f3fdd17753405700873c0a22df51d89085c11140, size_bytes: 3203}
+    - {path: mechanism/seed_121190.json, sha256: 444648d761046c23cf18cdaa5ff211182a3e1b52391197d17e73b1edb6bb03c6, size_bytes: 3190}
+    - {path: metadata.json, sha256: 27278b8807348ed21d78d68ee6d76b9b8de6ab987136d593d8f3817990ceadb6, size_bytes: 197631}
+    - {path: provenance/source_manifest_32a7f88b025a6df9ab31a1e3a85ea19c1faaae0a62af5da07310cab35017a4fc.json, sha256: 32a7f88b025a6df9ab31a1e3a85ea19c1faaae0a62af5da07310cab35017a4fc, size_bytes: 14454}
+    - {path: provenance/source_snapshot_51b72e19e15a311077f44217cb35060917809a1c6379e7d3cba968f12cabc681.tar, sha256: 51b72e19e15a311077f44217cb35060917809a1c6379e7d3cba968f12cabc681, size_bytes: 2918400}
+    - {path: summary.json, sha256: 64b6864eddb74d29e12376efa1bcf37496a9604655294555d1fc38e5aa822eb1, size_bytes: 399}
+  formal_rng_ids: [121000, 121010, 121020, 121030, 121040, 121050, 121060, 121070, 121080, 121090, 121100, 121110, 121120, 121130, 121140, 121150, 121160, 121170, 121180, 121190]
+
+repair:
+  defect: time_coordinate_reference_used_torch_arange_division_rounding
+  scope: gamma_rows[*].finite_and_structural
+  old_reference: torch.arange(T+1,dtype=state.dtype,device=state.device)/T
+  corrected_reference: state.new_tensor([stage/T for stage in range(T+1)])
+  expected_parent_values: [false, false, false, false, false]
+  expected_replay_values: [true, true, true, true, true]
+  exact_probe_comparison: remove_only_gamma_rows_finite_and_structural
+  scientific_changes: []
+  reused_rng_authority: exact_pinned_parent_bundle_only
+
+replay:
+  output_root: results/work/native_synthetic_signed_gamma_v1_time_coordinate_repair_r1
+  required_passed_rng_ids: 19
+  devices: [cuda:0, cuda:1]
+
+downstream_rng_reservation:
+  status: reserved_not_consumed
+  namespace: native_synthetic_signed_gamma_science_v1:121400..121590:step10
+  reserved_base_seeds: [121400, 121410, 121420, 121430, 121440, 121450, 121460, 121470, 121480, 121490, 121500, 121510, 121520, 121530, 121540, 121550, 121560, 121570, 121580, 121590]
+  reserved_bootstrap_seed: 12140019
+  mapping_formula:
+    paper_seed_multiplier: 1000003
+    paper_seed_modulus: 2147483647
+    calibration_stream: 1700101
+    reference_stream: 1700401
+    adaptation_stream: 700001
+    methods:
+      ACI: {offset: 101, round_stride: 17923}
+      SPCI: {offset: 211, round_stride: 47021}
+      PRC: {offset: 307, round_stride: 61103}
+    rounds: [0, 1, 2]
+  reserved_rng_id_count: 241
+  reserved_rng_mapping_sha256: c17c3098ee47b5f530300505198983393b95a51b7ffbdb4c3d399c7b43a5546a

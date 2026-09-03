@@ -1,0 +1,173 @@
+protocol: controlled_clinical_fidelity_v6_mimic_cxr
+dataset: mimic_cxr
+terminal_protocol: true
+further_bridge_repair_permitted: false
+terminal_no_v7: true
+
+parent_v5:
+  development:
+    role: development_evidence
+    root: results/work/controlled_clinical_fidelity_v5_mimic_cxr_development
+    file_sha256:
+      COMPLETE: a9d968ba1ca338c9f417887bba48a3c003d5c5b23eabace5feb2189efdeb44d2
+      FINAL_STATUS.json: 661261a8970e36be82fc7746d05886d9724857806f0c6568f4e5d7ae84b448de
+      frozen_settings.json: 24db41f5ec974a833989793808121fbbdb1e4c7aa6a4afab5174c10edc22c1ce
+      manifest.json: 5cab76c1341148ad58ee2de6821455ac7738acb65968b249107d30dde49369af
+      metadata.json: 4b64cd6ad7d861bed5aaa739a137ac037a539ab5f5fd2ab3aa02b7fce8a09d0b
+      selection.json: e26fc40c63d7529e200fccb8ac80b1114438312fffcbd3498ddb4fe066095b57
+  failed_confirmation:
+    role: reclassified_as_development_only
+    root: results/work/controlled_clinical_fidelity_v5_mimic_cxr_confirmation
+    file_sha256:
+      COMPLETE: 638b0ba296deabed76d62921d46f6174a8444e15ffd89efe6d5bc39e1a64a3f4
+      FINAL_STATUS.json: 5f104c0dff121174b52e5ce0c082583744d544cda47a296f5ad0329474472f18
+      gate.json: d663b2c5b5d6a7280efe2dceb31c743b94a7ec674825caf3eaad7701d04e6a5b
+      manifest.json: a1a89634c268bd3b4b480db49b481bc3cf135025155e06bd85e4369fa9c6baec
+      metadata.json: 927212270de9215b5b36b112cd59f7ac46701fe96cd2fac8edfb6280ba5db726
+    public_failure_record:
+      support_pass_count: 20
+      k0_pass_count: 18
+      structural_pass_count: 20
+      failed_seeds:
+        - {seed: 119120, stage: 1, outcome: 0, maximum_signed_residual_w1: 0.2956583463636382}
+        - {seed: 119180, stage: 3, outcome: 0, maximum_signed_residual_w1: 0.3200767965422734}
+
+development:
+  role: two_exposed_lineages_development_only
+  lineages:
+    v5_development: {start: 92600, stop: 92800, step: 10}
+    v5_failed_confirmation: {start: 119000, stop: 119200, step: 10}
+  rng_audit:
+    base_seed_count: 40
+    stream_count: 200
+    mapping_sha256: 23d506013a014b1f62b072da87512d38cf741c3a5de6e5a07258a2c1f5ae9dee
+    rng_id_set_sha256: 3056d442a6e0ab0afe087a057ce2c4c5fb149fe8a486a9230d88ff675c58e767
+    base_seed_set_sha256: a4d22c564d82cf93a13e4c25ea026b919b38f33668a6332ec2cc3bbfe8b27142
+    exact_authorized_reuse: true
+    scientific_freshness_claimed: false
+
+confirmation:
+  role: fresh_split_terminal_confirmation
+  seeds: {start: 120000, stop: 120200, step: 10}
+  bootstrap_seed: 12000019
+  independent_patient_confirmation_claimed: false
+  rng_audit:
+    derived_stream_count: 341
+    mapping_sha256: 7ebd9467ddb8f05edd44762c16d85e3506d9bbc263034981278e760da36f45d9
+    rng_id_set_sha256: 2c4eca8a8a20e1f911723dc7b17c6a82b25b32aab2d14b918f9ad57d8fd860d8
+    base_seed_set_sha256: 91d90f120a5628dd0d07190a949cad4c76827b16bde3bccfc4f3e729468e170b
+    required_collision_count: 0
+
+independent_audit:
+  status: GO
+  attestation_sha256: 01e7656bd15da2e6fd289e071b939c8ba7d575dd20235bdac4f97ae232d3749d
+  expected_prior_count: 7463
+  expected_prior_sha256: ae560778f3d53aa95716227ed59e5571e92005ca502ad40f93af90d4d92115ec
+  expected_artifact_count: 7041
+  expected_artifact_sha256: 6ca1d3ec378c894dc283ed8b6f8d7badcac07ba3c6e30b232d1fec5d5dcb3778
+  expected_source_count: 1275
+  expected_source_sha256: d73288e8b3ddc2e159feadd1849f7f3d556828cff08d87cdb1f8e5337a08da7f
+  expected_v6_source_contract_sha256: 1890314b1ae59f58cc416e3aa410f7b639b7ed50d5cffe10df23796d5daef89d
+
+scientific_candidate:
+  candidate_id: R01_o0_stagewise_supported_spo2_slopes_o1_b02
+  candidate_count: 1
+  selector_present: false
+  grid_present: false
+  anchor:
+    candidate_id: B02_pooled_successor_bridge_stage_one_hot
+    role: regression_only_not_a_candidate
+  outcome0:
+    fit_scope: one_model_per_stage
+    stage_order: [0, 1, 2, 3, 4, 5]
+    design_order:
+      - intercept
+      - clinical_X16
+      - current_action_one_hot_0_1_2
+      - action1_times_spo2_X8
+      - action2_times_spo2_X8
+    design_width: 36
+    spo2_interaction_indices_in_X16: [0, 1, 2, 3, 8, 9, 10, 11]
+    supported_action_reference: action0_none
+  outcome1:
+    fit_scope: pooled_over_stages
+    stage_row_order: [0, 1, 2, 3, 4, 5]
+    design_order:
+      - intercept
+      - clinical_X16
+      - current_action_one_hot_0_1_2
+      - stage_one_hot_0_1_2_3_4_5
+    design_width: 26
+    exact_v5_b02_regression: true
+
+state_kernel:
+  metric: raw
+  neighbors: 10000
+  uses_full_cell: true
+  donor_weighting: uniform
+  bandwidth: 2.0
+  transition_mode: ridge_residual
+  outcome_residual_mode: raw
+  ridge_mode: sample_normalized_no_intercept
+  ridge_value: 0.001
+  penalize_intercept: false
+
+outcome_bridge:
+  source: D_env_only
+  successor_source_feature_names:
+    - spo2_last
+    - spo2_mean
+    - spo2_min
+    - spo2_max
+    - rr_last
+    - rr_mean
+    - rr_min
+    - rr_max
+  successor_source_feature_indices: [48, 49, 50, 51, 44, 45, 46, 47]
+  clinical_coordinate_count: 16
+  spo2_interaction_indices_in_X16: [0, 1, 2, 3, 8, 9, 10, 11]
+  spo2_hinge: {threshold: 92.0, scale: 10.0, direction: lower_tail}
+  rr_hinge: {threshold: 22.0, scale: 15.0, direction: upper_tail}
+  current_action_one_hot: {action_order: [0, 1, 2], penalized: true}
+  stage_one_hot: {stage_order: [0, 1, 2, 3, 4, 5], penalized: true}
+  supported_action_interactions: {action_order: [1, 2], penalized: true}
+  ridge_mode: sample_normalized_no_intercept
+  ridge_value: 0.001
+  intercept_penalized: false
+  joint_two_outcome_donor_residual: true
+  same_donor_state_and_outcome_innovation: true
+
+k0_gate:
+  systematic_replays: 16
+  maximum_score_ks: 0.10
+  maximum_signed_residual_w1: 0.25
+  maximum_successor_mean_w1: 0.25
+  maximum_successor_q95_w1: 0.50
+  active_coordinate_sd_floor: 0.0001
+
+gates:
+  development:
+    per_lineage_seed_count: 20
+    per_lineage_numeric_pass_count: 20
+    per_lineage_structural_pass_count: 20
+    seed_deletion_permitted: false
+  confirmation:
+    prespecified_seed_count: 20
+    support_minimum_pass_count: 19
+    k0_minimum_pass_count: 19
+    structural_pass_count: 20
+    seed_deletion_permitted: false
+
+diagnostics:
+  aggregate_gate_unchanged: true
+  score_ks: stage_scalar
+  outcome_coordinate_arrays:
+    - signed_residual_w1
+    - successor_mean_w1
+    - successor_q95_w1
+  action_stratification: descriptive_non_gating
+
+information_firewall:
+  allowed: [support, k0_fidelity, context_identity, provenance, descriptive_diagnostics]
+  forbidden: [science, coverage, width, method_selection]
+  scientific_outputs_permitted: false

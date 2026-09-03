@@ -21,7 +21,7 @@ import torch
 
 from scpcp.config import ExperimentConfig
 from scpcp.cxr import index_cxr_embeddings
-from scpcp.data import TrajectoryBatch, patient_level_splits
+from scpcp.data import TrajectoryBatch
 
 
 MIMIC_VITAL_KIND = {
@@ -272,7 +272,11 @@ def _mimic_lab_item_kinds(root: Path) -> dict[int, str]:
 
 
 def load_clinical_trajectories(
-    config: ExperimentConfig, *, seed: int, device: str | torch.device
+    config: ExperimentConfig,
+    *,
+    seed: int,
+    device: str | torch.device,
+    predictor_fraction: float = 0.40,
 ) -> tuple[
     TrajectoryBatch,
     int,
@@ -286,7 +290,11 @@ def load_clinical_trajectories(
     raw = _load_or_build_raw(config, seed=seed)
     if config.data.dataset == "mimic_cxr":
         raw = _coarsen_cxr_actions(raw)
-    predictor_rows = _predictor_rows(raw, seed)
+    predictor_rows = _predictor_rows(
+        raw,
+        seed,
+        predictor_fraction=predictor_fraction,
+    )
     if raw.cxr_paths:
         if raw.cxr_labels is None:
             raise RuntimeError("CXR task is missing CheXpert supervision labels")
@@ -427,15 +435,35 @@ def _atomic_torch_save(value: object, destination: Path) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _predictor_rows(raw: _RawClinicalBatch, seed: int) -> torch.Tensor:
-    placeholder = TrajectoryBatch(
-        raw.states,
-        torch.zeros(raw.states.shape[:2][0], raw.states.shape[1] - 1, dtype=torch.long),
-        raw.outcomes,
-        raw.patient_ids,
+def _predictor_rows(
+    raw: _RawClinicalBatch,
+    seed: int,
+    *,
+    predictor_fraction: float = 0.40,
+) -> torch.Tensor:
+    """Return the first role from the same seeded patient permutation.
+
+    The configurable fraction lets controlled-clinical protocols bind action
+    discretization and CXR encoder training to their actual D_pred patients.
+    The 0.40 default is exactly the historical split.
+    """
+
+    fraction = float(predictor_fraction)
+    if not np.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError("predictor_fraction must be finite and strictly between 0 and 1")
+    unique_ids = torch.unique(raw.patient_ids.cpu(), sorted=True)
+    generator = torch.Generator().manual_seed(seed)
+    shuffled = unique_ids[torch.randperm(len(unique_ids), generator=generator)]
+    predictor_count = max(1, int(fraction * len(shuffled)))
+    if predictor_count >= len(shuffled):
+        raise ValueError("predictor_fraction leaves no patients for other roles")
+    predictor_ids = shuffled[:predictor_count]
+    return (
+        torch.isin(raw.patient_ids.cpu(), predictor_ids)
+        .nonzero()
+        .squeeze(1)
+        .to(raw.patient_ids.device)
     )
-    roles = patient_level_splits(placeholder, seed=seed, include_environment=True)
-    return torch.isin(raw.patient_ids, roles.predictor.patient_ids).nonzero().squeeze(1)
 
 
 def _discretize_actions(

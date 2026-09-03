@@ -1,0 +1,118 @@
+incident_protocol: native_synthetic_signed_gamma_science_failed_publish_replay_r1
+role: administrative_exact_failed_publish_replay
+administrative_only: true
+
+incident:
+  original_root: results/work/native_synthetic_signed_gamma_six_method_science_v1
+  quarantine_root: results/work/native_synthetic_signed_gamma_six_method_science_v1_FAILED_PUBLISH_VALIDATION_20260827
+  quarantine_reason: COMPLETE_was_published_before_final_dependency_validation
+  failure: simulator_dependency_omitted_from_metadata
+  invalid_complete_present: true
+  scientific_values_generated: true
+  scientific_values_human_inspected: false
+  scientific_values_must_not_be_printed: true
+  artifact_count: 31
+  total_size_bytes: 10379251
+  artifact_inventory_sha256: c36da6ac2700c5da0fe907e303a7864e85466aea912d661c5a216604625a2314
+  old_source_tree_sha256: 51bada1aebf4bc2fe07059858bb5c1af7fcf393bfd9e3e7dfa06ee842a0035f3
+  old_science_runner_sha256: fc0d02257b505b84cc885a562c5e477891f3973827f27952fb7d9e33570dff07
+  science_config_sha256: cc79e7a6b8433ddc530edc483445ab2ae176021f44dd8d914770b22e13546bdf
+  source_snapshot_sha256: 6f8d67601d83990cf75dc1cc899601cce8f3db5421615a38596e3aa54455a16a
+  simulator_sha256: 34460a98c24f45dfaf9b2f5e069094caafd4a12c4bec4482f8c804448bf860de
+  repair_gate_binding_sha256: 92be89446da7933f57449336c60eebde2023f675e39d57255d5c87b70736fe35
+  invalid_complete_sha256: d738d5aa3a52e3e6a23667ae5b90bcc875e786172948a858a660d51f74328f0a
+  manifest_sha256: 067347b141702bb40ac693d5e61a9ec7cc3e3f6bcb88e63f5fac0bd5ab5a7862
+  summary_sha256: 911640d859165647d61f6060b2ca277afbc577ebe8ce8df3779306ec3c8da30e
+  metadata_sha256: f408cc46b4379a27f5691bffb109fe7475eabee112d4592071cb887810b97c4d
+  artifact_inventory:
+    - {path: COMPLETE, sha256: d738d5aa3a52e3e6a23667ae5b90bcc875e786172948a858a660d51f74328f0a, size_bytes: 1665}
+    - {path: FINAL_STATUS.json, sha256: f9fa12ea91b475d9b0e2330e798f7226717fe6766135fcfd87da6d220b3feae4, size_bytes: 732}
+    - {path: artifact_schema.json, sha256: 280cd9fde57bcda2ac2241f0524a58124e929a1c3b58c736f1dd782ca19647a3, size_bytes: 2206}
+    - {path: bootstrap_indices.npy, sha256: cc3c79ada14fa329934079ce9c9ebe3167c42484b792027d6df949d38844aad1, size_bytes: 1600128}
+    - {path: bootstrap_uniforms.npy, sha256: d658afe9083be5e1741df6bc853e3d55e59ff852b0ef36e6559b1d0252f482fd, size_bytes: 1600128}
+    - {path: coverage_audit.json, sha256: 1655af03461991272c6b562a1ac29f48ea0631f1872a84e1388ae5906dcc5309, size_bytes: 2512}
+    - {path: manifest.json, sha256: 067347b141702bb40ac693d5e61a9ec7cc3e3f6bcb88e63f5fac0bd5ab5a7862, size_bytes: 5392}
+    - {path: metadata.json, sha256: f408cc46b4379a27f5691bffb109fe7475eabee112d4592071cb887810b97c4d, size_bytes: 400421}
+    - {path: provenance/source_manifest_0268d5d9097997bc81959dfdf91e38940061e259df74b4bb16337df800385a9d.json, sha256: 0268d5d9097997bc81959dfdf91e38940061e259df74b4bb16337df800385a9d, size_bytes: 15121}
+    - {path: provenance/source_snapshot_6f8d67601d83990cf75dc1cc899601cce8f3db5421615a38596e3aa54455a16a.tar, sha256: 6f8d67601d83990cf75dc1cc899601cce8f3db5421615a38596e3aa54455a16a, size_bytes: 3123200}
+    - {path: seeds/seed_121400.json, sha256: a81dcdfdeb9807713a81578d77bdf3cd5709b5dfb94afef2b33ac4a9e1aa4a24, size_bytes: 174455}
+    - {path: seeds/seed_121410.json, sha256: 54ada0351be0daf0c6412bfd5cadbf473dd0ff689492629a3f470909fd607296, size_bytes: 173820}
+    - {path: seeds/seed_121420.json, sha256: 42cb19059a1bb29c58e254fefff3a63d60ebff7abf00cb064b01e9b80b258f2b, size_bytes: 175010}
+    - {path: seeds/seed_121430.json, sha256: ebaa0d9c43d164e96dcfce352595daf89d98794fa16fb9675d45105a6e022690, size_bytes: 173450}
+    - {path: seeds/seed_121440.json, sha256: 2de8a688cc61fcc05417aba149290e237a3d95a8e90c68715cc1fce647b6bdc5, size_bytes: 174164}
+    - {path: seeds/seed_121450.json, sha256: 2815ecf38ad019f9b050fa4b3387f5193c006d9013d4b8db9cfdb2a29dbcc8ee, size_bytes: 174913}
+    - {path: seeds/seed_121460.json, sha256: f898e80abb13d4fc21966633a6e1475dfd46156b425fb39ae979444276292e97, size_bytes: 174357}
+    - {path: seeds/seed_121470.json, sha256: 378b370d7dc9c8196fccaa8208276b1042513da30906e53f98b6babfa8e10f66, size_bytes: 173678}
+    - {path: seeds/seed_121480.json, sha256: 9ccf1c1d72afd06de0400ee800d540c4fa4c414c6cbe1fcdbfed5c893283cb20, size_bytes: 175310}
+    - {path: seeds/seed_121490.json, sha256: b8dc4fe05701675ddeb91124778db2f1b2985bacbafc15e96817320dce99a912, size_bytes: 173695}
+    - {path: seeds/seed_121500.json, sha256: fcb35c0803d5e2c2a688a159336b1d21bb6d037b90e010473012f189b5edf16a, size_bytes: 173919}
+    - {path: seeds/seed_121510.json, sha256: 12a652566bbb37aa4e7031de0c73094e0d38787dbab0dd43eea2d538a2e0aa5f, size_bytes: 174625}
+    - {path: seeds/seed_121520.json, sha256: c4c7c47c424ae26e38eaa60f6fba1af4c43b3ee9af8cddbadd21a63c08f0fc4f, size_bytes: 174026}
+    - {path: seeds/seed_121530.json, sha256: 5f4500557cab0e17fe140ea8770c65b06c812e72285ead83c82c06f3b3c055fb, size_bytes: 174192}
+    - {path: seeds/seed_121540.json, sha256: c2ce99c35e9b1a6ea5129914a638122506408ffd090d1e3b65276154f2f261b2, size_bytes: 173666}
+    - {path: seeds/seed_121550.json, sha256: 5f32840ffd6bd8a6b4f22fbb3fbab76b0d95879650e41f6c06231cd6c9d641be, size_bytes: 174311}
+    - {path: seeds/seed_121560.json, sha256: 0bce3450f1e933d2726c2c78f78f49650ff8ab62926f7609d202cf4c749e5b7d, size_bytes: 173956}
+    - {path: seeds/seed_121570.json, sha256: bdad1fd33fcad5dab5d9006b704e8ad95c6cb21959e847d28703cfabe1f0a1a6, size_bytes: 174420}
+    - {path: seeds/seed_121580.json, sha256: 04ddb862e8ef201a92b95109a4e75a0730521402df454fd1615eb9225b1c217e, size_bytes: 174384}
+    - {path: seeds/seed_121590.json, sha256: c4ec591064e0e09060a5e87fdb96dcd6ef818daa7e36abf8a70aef1ff1f63a93, size_bytes: 174353}
+    - {path: summary.json, sha256: 911640d859165647d61f6060b2ca277afbc577ebe8ce8df3779306ec3c8da30e, size_bytes: 143042}
+
+repair_gate:
+  root: results/work/native_synthetic_signed_gamma_v1_time_coordinate_repair_r1
+  decision: GO
+  downstream_authorized: true
+  artifact_count: 28
+  total_size_bytes: 3259967
+  artifact_inventory_sha256: bd005380fab3e3efd776fa34de2d24a10214ddd43126d4ac93ff66ad295c8806
+  metadata_sha256: 2bc0ac74111a416c0e44763600854cf340e9f5351c1ca7fb99a14d4c6aead1ad
+  summary_sha256: 536fda1ee4a0df7120a1059bc232656a1dd0ba8a6f38b2c12c9d259824cc0d1e
+  manifest_sha256: f83ff2281ccb23828c8f19ce738b4d4e8aed9cdc7b85044547e6170f20a2ae8e
+  complete_sha256: 8e424ea770ffaeee275b1cf227740bf8076232c85627a033d83e21f2c128ab82
+  source_tree_sha256: 51bada1aebf4bc2fe07059858bb5c1af7fcf393bfd9e3e7dfa06ee842a0035f3
+  source_snapshot_sha256: 6f8d67601d83990cf75dc1cc899601cce8f3db5421615a38596e3aa54455a16a
+  amendment_sha256: 00b1631e72327d7675f58c4cc49e160ef41612c6aa40b3be57bd6dd94fe45fd9
+  binding_sha256: 92be89446da7933f57449336c60eebde2023f675e39d57255d5c87b70736fe35
+
+allowed_source_repair:
+  old_science_runner_sha256: fc0d02257b505b84cc885a562c5e477891f3973827f27952fb7d9e33570dff07
+  repaired_science_runner_sha256: a39da352f9ed7c390bb3cef66a124b2e7d866af2da712226af6c0a0441ce6a78
+  old_preflight_runner_sha256: 01a83d16995c3da155bb5e4f30607ac8183a4682be63eeb52b1d256b14e822ab
+  repaired_preflight_runner_sha256: 68286680065fc80ab48e6376ac9707e5356c76d5072584cf404f543d031f1708
+  unchanged_science_config_sha256: cc79e7a6b8433ddc530edc483445ab2ae176021f44dd8d914770b22e13546bdf
+  unchanged_simulator_sha256: 34460a98c24f45dfaf9b2f5e069094caafd4a12c4bec4482f8c804448bf860de
+  exactly_changed_existing_sources:
+    - scripts/run_native_synthetic_signed_gamma_preflight.py
+    - scripts/run_native_synthetic_signed_gamma_science.py
+  permitted_changes:
+    - add_simulator_dependency_binding
+    - validate_all_nonterminal_artifacts_before_COMPLETE
+    - remove_COMPLETE_if_postpublish_validation_fails
+    - ignore_exact_source_dependency_contracts_in_artifact_rng_scan
+    - recurse_exact_structured_rng_config_by_child_field
+  permitted_added_administrative_sources:
+    - configs/native_synthetic_signed_gamma_science_exact_replay_r1.yaml
+    - configs/native_synthetic_signed_gamma_science_failed_publish_replay_r1.yaml
+    - scripts/run_native_synthetic_signed_gamma_science_exact_replay_r1.py
+  full_retry_tree_binding: launch_metadata_and_content_addressed_source_snapshot
+
+retry:
+  config: configs/native_synthetic_signed_gamma_science_exact_replay_r1.yaml
+  config_sha256: db03be19302274ddc14dd0e952a6c29d1dce244e8479d2e8bab262349948c8de
+  runner: scripts/run_native_synthetic_signed_gamma_science_exact_replay_r1.py
+  output_root: results/work/native_synthetic_signed_gamma_six_method_science_v1_exact_replay_r1
+  scientific_config_difference: output_root_only
+  reused_rng_authority: exact_pinned_quarantine_only
+  rng_reused: true
+  rng_fresh: false
+  rng_independent: false
+  raw_collision_count: 241
+  authorized_quarantine_collision_count: 241
+  unauthorized_collision_count: 0
+  missing_quarantine_collision_count: 0
+  payload_comparison:
+    seed_rows: exact_canonical_json_per_seed_per_gamma
+    summary: exact_canonical_json
+    bootstrap_uniforms: exact_array_and_file_sha256
+    bootstrap_indices: exact_array_and_file_sha256
+    mismatch_status: NO_GO
+  complete_publication: true_last_after_precommit_validation

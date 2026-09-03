@@ -1,0 +1,174 @@
+protocol: controlled_clinical_fidelity_v4
+
+parent_v3:
+  root: results/work/controlled_clinical_fidelity_v3_development
+  required_protocol: controlled_clinical_fidelity_v3
+  required_phase: development
+  required_status: DEVELOPMENT_NO_GO
+  file_sha256:
+    FINAL_STATUS.json: cd7cfa7ec21814c01a847e24f3b706beb0a70916f8d75754a770b6b2e3bc1308
+    manifest.json: 9d01274c652a6eab3c13cdfdc62b6b79114ef8878ad3d0627b95e7812bca8d6f
+    COMPLETE: c2278657ed61e7d8a182f2e0424c2cb2f63a27f15f139269ec520a65b8492ccf
+
+datasets: [mimic_iv, eicu, inspire, mimic_cxr]
+devices_required: 2
+
+development:
+  role: k0_only_reuse_of_v3_development_banks
+  datasets: [eicu, mimic_cxr]
+  seeds:
+    eicu: {start: 92000, stop: 92200, step: 10}
+    mimic_cxr: {start: 92600, stop: 92800, step: 10}
+  rng_reuse_audit:
+    role: exact_authorized_v3_k0_lineage_reuse
+    base_seed_count: 40
+    stream_count: 180
+    mapping_sha256: c5d2f96cd8b33339b9abfb2bc572c61bf183048f8b27ff331ca8651a364234e3
+    rng_id_set_sha256: c75733a9a8d2e69122804e1b2800e4f4f7ab7a51d60ebb37e993ea1f527dcbff
+    parent_seed_envelope_sha256: 2547b7f476b1fd9aa05809860e9729b51dc3b8a22d6adfac7f70cec6e5395946
+    required_authorized_lineage_collision_count: 180
+    required_missing_lineage_collision_count: 0
+    required_unauthorized_collision_count: 0
+    common_random_numbers_across_candidates: true
+    scientific_freshness_claimed: false
+
+anchors:
+  mimic_iv:
+    dataset: mimic_iv
+    source_json_pointer: /shared_stage_b/winner
+    pass_count_json_pointer: /shared_pass_counts/mimic_iv
+    theta_id: A03_raw_k200_gaussian_b2__normalized_ridge_1e-2
+    stage_a_id: A03_raw_k200_gaussian_b2
+    metric: raw
+    neighbors: 200
+    weight: gaussian_b2
+    bandwidth: 2.0
+    donor_weighting: gaussian
+    ridge: normalized_ridge_1e-2
+    ridge_mode: sample_normalized_no_intercept
+    ridge_value: 0.01
+    penalize_intercept: false
+    transition_mode: ridge_residual
+    outcome_residual_mode: standardized
+    development_pass_count: 20
+  inspire:
+    dataset: inspire
+    source_json_pointer: /dataset_stage_b_fallbacks/inspire/winner
+    pass_count_json_pointer: /fallback_pass_counts/inspire
+    theta_id: A03_raw_k200_gaussian_b2__raw_ridge_1e-3
+    stage_a_id: A03_raw_k200_gaussian_b2
+    metric: raw
+    neighbors: 200
+    weight: gaussian_b2
+    bandwidth: 2.0
+    donor_weighting: gaussian
+    ridge: raw_ridge_1e-3
+    ridge_mode: v2_raw
+    ridge_value: 0.001
+    penalize_intercept: true
+    transition_mode: ridge_residual
+    outcome_residual_mode: standardized
+    development_pass_count: 20
+
+confirmation:
+  role: fresh_split_confirmation
+  decision_scope: per_dataset_independent
+  independent_patient_confirmation_claimed: false
+  seeds:
+    mimic_iv: {start: 115000, stop: 115200, step: 10}
+    eicu: {start: 116000, stop: 116200, step: 10}
+    inspire: {start: 117000, stop: 117200, step: 10}
+    mimic_cxr: {start: 118000, stop: 118200, step: 10}
+  bootstrap_seeds:
+    mimic_iv: 11500019
+    eicu: 11600019
+    inspire: 11700019
+    mimic_cxr: 11800019
+  rng_audit:
+    scope: v2_full_derived_mapping_against_current_artifacts_and_source
+    derived_stream_count: 1304
+    prior_stream_count: 5476
+    collision_count: 0
+    mapping_sha256: 3a78ec5afe69f57928de894a38803f5c369b33ab1db3f7c37bd403b974f75c72
+
+repair_grids:
+  eicu:
+    metric_order: [raw, stagewise_zscore]
+    neighbor_order: [200, 10000]
+    full_cell_neighbor_sentinel: 10000
+    weight_order: [gaussian_b2, uniform]
+    transition_order: [ridge_residual, local_delta]
+    outcome_residual_order: [standardized]
+    bandwidth: 2.0
+    ridge_mode: sample_normalized_no_intercept
+    ridge_value: 0.001
+    penalize_intercept: false
+    semantic_deduplication: omit_stagewise_zscore_k10000_uniform
+    candidate_count: 14
+  mimic_cxr:
+    metric_order: [raw, stagewise_zscore]
+    neighbor_order: [200, 10000]
+    full_cell_neighbor_sentinel: 10000
+    weight_order: [gaussian_b2, uniform]
+    transition_order: [ridge_residual, local_delta]
+    outcome_residual_order: [standardized, raw]
+    bandwidth: 2.0
+    ridge_mode: sample_normalized_no_intercept
+    ridge_value: 0.001
+    penalize_intercept: false
+    semantic_deduplication: omit_stagewise_zscore_k10000_uniform
+    candidate_count: 28
+
+representation:
+  stagewise_zscore:
+    source: D_env_only
+    pooling: per_stage_pooled_over_actions
+    center_dtype: float64
+    scale_dtype: float64
+    population_sd: true
+    sd_floor: 0.0001
+
+default_parity:
+  controlled_transition_defaults:
+    transition_mode: ridge_residual
+    outcome_residual_mode: standardized
+  inherited_anchor_datasets: [mimic_iv, inspire]
+  archived_v3_controlled_transition_sha256: ba878ad3ae89a9a3aef84734a6347f321baf3fce84f7ec13089ff4c41e0a4fd0
+  current_controlled_transition_sha256: e6b433cda750fa745893eafafa429bbacfc504f603585b02ae4d68105c6a8a70
+  required_bitwise_test: tests/per_step/test_controlled_transition.py::test_explicit_legacy_modes_match_the_default_bitwise
+
+k0_gate:
+  systematic_replays: 16
+  maximum_score_ks: 0.10
+  maximum_signed_residual_w1: 0.25
+  maximum_successor_mean_w1: 0.25
+  maximum_successor_q95_w1: 0.50
+  minimum_available_seed_fraction: 0.95
+  active_coordinate_sd_floor: 0.0001
+
+support_gate:
+  minimum_unique_patients_per_stage_action: 20
+  minimum_available_seed_fraction: 0.95
+
+selection:
+  version: controlled_clinical_fidelity_v4_dataset_selector_v1
+  scope: per_dataset_independent
+  seed_ratio_quantile: 0.95
+  seed_ratio_quantile_method: linear
+  order:
+    - maximize_pass_count
+    - minimize_q95_seed_ratio
+    - minimize_mean_seed_ratio
+    - minimize_change_from_v3
+    - candidate_id
+  development_seed_count: 20
+  development_minimum_pass_count: 19
+  development_required_structural_pass_count: 20
+  development_gate_interpretation: operational_not_confidence_interval
+  failure: DATASET_DEVELOPMENT_NO_GO
+  cross_dataset_conjunction_permitted: false
+
+information_firewall:
+  allowed: [support, k0_fidelity, context_identity, provenance]
+  forbidden: [science, coverage, width, method_selection]
+  scientific_outputs_permitted: false

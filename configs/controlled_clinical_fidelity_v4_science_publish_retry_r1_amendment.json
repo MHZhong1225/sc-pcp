@@ -1,0 +1,961 @@
+{
+  "administrative_only": true,
+  "authorized_source_delta": {
+    "added_administrative_executable_sources": [
+      "configs/controlled_clinical_fidelity_v4_science_publish_retry_r1.yaml",
+      "scripts/run_controlled_clinical_fidelity_v4_science_publish_retry_r1.py"
+    ],
+    "added_or_changed_non_experiment_tree_sources": [
+      "configs/controlled_clinical_fidelity_v4_science_publish_retry_r1_amendment.json",
+      "tests/per_step/test_controlled_clinical_fidelity_v4_science.py",
+      "tests/per_step/test_controlled_clinical_fidelity_v4_science_publish_retry_r1.py"
+    ],
+    "changed_existing_executable_sources": [
+      {
+        "archived_sha256": "b9b910137439fa18a61f59aecd9437f7452883218495dcaed55d3de79c45d709",
+        "only_change": "canonical JSON roundtrip at _science_metadata return boundary",
+        "path": "scripts/run_controlled_clinical_fidelity_v4_science.py",
+        "repaired_sha256": "d329537ccbf53040fb87c1707e01569266dea0f3c81ac273dc9dad6ab4ef74e6",
+        "strict_equality_checks_preserved": true
+      }
+    ],
+    "dgp_changed": false,
+    "rng_mapping_changed": false,
+    "science_contract_changed": false,
+    "scientific_results_changed": false,
+    "seeds_changed": false
+  },
+  "incident": {
+    "archived_science_runner_sha256": "b9b910137439fa18a61f59aecd9437f7452883218495dcaed55d3de79c45d709",
+    "confirmation_binding_sha256": "189da5223816ff26db521936260503e801105fa9a2a5b2bdceecac855b0191b2",
+    "dataset_artifact_sha256": {
+      "eicu": {
+        "bootstrap_indices": "5155be349aef2a6cdc99e73e658e088dbc07d474aa38bd0a08b1d7dd1ca199fa",
+        "bootstrap_uniforms": "adbdb7a778674d7089f00a616d41b3c089cb84a4d8e5b43454712da169607714",
+        "coverage_audit": "d38c35eddca420964ab57554d190e9ee74910d78a3670d93ef17f0373620c7a6",
+        "final_status": "58760ca38bd6658c7f8830c0aef168885ed54a236f86e55c93362c2428235932",
+        "summary": "4192d904bcf28cad8cb5cba230c8ffbdd7f68ccd780b57b8c700353f5a748f49"
+      },
+      "inspire": {
+        "bootstrap_indices": "b169d7100e69d77d7bc0c3daa68cfc415d42a8dd3f15b467f8ec2fb7a5327f6c",
+        "bootstrap_uniforms": "917fdbe17afa43d23f0c024d59c3489bf973320c7576fc513d323655cb750b3d",
+        "coverage_audit": "e6b091b3ac98cd466adad67467821db8225c1db1a7a01e71eb58a33ef72ff958",
+        "final_status": "20a0815c245b53c81a8eabc13b93293fb2263099397c84a6a44bf7e24db1a5ef",
+        "summary": "a931be5aea28a2fd01d2cd594a56ea51d829615d3c57c198123a453a2caa9c2f"
+      },
+      "mimic_iv": {
+        "bootstrap_indices": "bad62141f8c66babc30caf60b000045550711aca03441ac2dbed7bb90fe09556",
+        "bootstrap_uniforms": "eaf70ac74bafc7328fbbcb26ee8c98d1fa9c0fb075ed68562fa7378c1eca4c48",
+        "coverage_audit": "b50e2eaa6d9ca082aaac2d17a2afc2d65bc4ef20ca2b990443f3f7cc68a0d056",
+        "final_status": "b1e0f12a02bda6acaa9b94e07d9054ae8e7ed8aeabbc3ad16dfe7a17566e6c28",
+        "summary": "f9960f34e720287b5c0fc29a61204d0860dc7b576206e5cd9693254fb878ea46"
+      }
+    },
+    "failure_class": "metadata_json_roundtrip_representation_mismatch",
+    "failure_stage": "root_precommit_validation_after_all_dataset_bundles_completed",
+    "final_status_canonical_sha256": "c0e87b05d0284defb4aa3767614e0565ec308a6bbf98fd8ac584154e5187368f",
+    "final_status_file_sha256": "24ccbd2038b8eb50b7aca02f0ca29ada9ddf6c377bb3590fcdeb6c94df48ce7c",
+    "formal_science_completed": true,
+    "gate_contract_sha256": "54dafe39e6835f638f2ba478cd29b8717814d7ed479e5a8067ad98b033920ad1",
+    "metadata_canonical_sha256": "0688765f8fc3f3b234cf6b017b2b0a58e685c9ea391215b668ecd6a0432159fa",
+    "metadata_file_sha256": "ad0a7ea3a35228580c98d931e913b4092507e99fd5c4ba65abfed83a13341001",
+    "mismatch_count": 12,
+    "mismatch_kind": "Python tuple versus deserialized JSON list only",
+    "mismatch_paths": [
+      "gate_contract.data_contracts.mimic_iv.active_config.cot.hidden_dims",
+      "gate_contract.data_contracts.mimic_iv.active_config.devices",
+      "gate_contract.data_contracts.mimic_iv.active_config.policy.action_costs",
+      "gate_contract.data_contracts.mimic_iv.active_config.seeds",
+      "gate_contract.data_contracts.eicu.active_config.cot.hidden_dims",
+      "gate_contract.data_contracts.eicu.active_config.devices",
+      "gate_contract.data_contracts.eicu.active_config.policy.action_costs",
+      "gate_contract.data_contracts.eicu.active_config.seeds",
+      "gate_contract.data_contracts.inspire.active_config.cot.hidden_dims",
+      "gate_contract.data_contracts.inspire.active_config.devices",
+      "gate_contract.data_contracts.inspire.active_config.policy.action_costs",
+      "gate_contract.data_contracts.inspire.active_config.seeds"
+    ],
+    "missing_root_commits": [
+      "manifest.json",
+      "COMPLETE"
+    ],
+    "original_root": "results/work/controlled_clinical_fidelity_v4_signed_gamma_science",
+    "phase_inventories": {
+      "donor_overlap_all": {
+        "bytes": 717894,
+        "files": 67,
+        "inventory_sha256": "24127bacabc23a986acbf00a593adfa18790f2dd70def609bc481d7cf35b0a0f",
+        "seed_files": 59
+      },
+      "donor_overlap_eicu": {
+        "bytes": 224751,
+        "files": 21,
+        "inventory_sha256": "276e5a306f0272225f3d8e4b13d14e6c498ff4c3eb7bc70ffe9952b948195067",
+        "seed_files": 19
+      },
+      "donor_overlap_inspire": {
+        "bytes": 231562,
+        "files": 22,
+        "inventory_sha256": "58fa7cfde7a95bf62ce1c06f58dedcb81111c07629ff94da782b17fbca4f4e2f",
+        "seed_files": 20
+      },
+      "donor_overlap_mimic_iv": {
+        "bytes": 260903,
+        "files": 22,
+        "inventory_sha256": "55cb69d2a838ac35151cac05c59209e13f5ed34a3cfb5d7c0d29d2c354eee4cc",
+        "seed_files": 20
+      },
+      "eligibility": {
+        "bytes": 11273,
+        "files": 3,
+        "inventory_sha256": "ffb20698c67949f96468d6766841a47a6aaa33807e79101e2cd1c9d8ca079289"
+      },
+      "science_all": {
+        "bytes": 19912680,
+        "files": 80,
+        "inventory_sha256": "131dc4adacdb3811f3f5c50c1c9cef97b417f044e1d1316daf05a9876f315ce5",
+        "seed_files": 59
+      },
+      "science_eicu": {
+        "bytes": 6526985,
+        "files": 26,
+        "inventory_sha256": "b3664afc9ff99adb680b6df1b555f57946af6c39684cd8ee40208337d3f83586",
+        "seed_files": 19
+      },
+      "science_inspire": {
+        "bytes": 6606360,
+        "files": 27,
+        "inventory_sha256": "4992b78ceaf02c0ccc5771b2bab8abe29398e6fa6c7b943d5777c199a2cc0d28",
+        "seed_files": 20
+      },
+      "science_mimic_iv": {
+        "bytes": 6779335,
+        "files": 27,
+        "inventory_sha256": "97befa7dea0b5b4ad088eea5499abde200af60dbbc87df2c783b811772619aaa",
+        "seed_files": 20
+      }
+    },
+    "present_file_count": 154,
+    "present_inventory_sha256": "dfc88c08a2f55f73c0c0ad50a06d196b64778577dd6ff8ce6f63107fa5394771",
+    "present_total_bytes": 24426407,
+    "reconstructed_metadata_canonical_sha256": "0688765f8fc3f3b234cf6b017b2b0a58e685c9ea391215b668ecd6a0432159fa",
+    "rng_binding": {
+      "eligible_inherited_mapping_sha256": "4790e4c2f8954cde2ce66efcb66063c4671b1e02a780af43923595127edf0d08",
+      "eligible_inherited_stream_count": 947,
+      "fresh": false,
+      "full_inherited_mapping_sha256": "3a78ec5afe69f57928de894a38803f5c369b33ab1db3f7c37bd403b974f75c72",
+      "full_inherited_stream_count": 1304,
+      "independent": false,
+      "publish_retry_rng_streams_executed": 0,
+      "role": "inherited_non_independent_science_artifacts"
+    },
+    "science_scope": {
+      "eligible_seed_counts": {
+        "eicu": 19,
+        "inspire": 20,
+        "mimic_iv": 20
+      },
+      "row_identity_map_sha256": "ab8fec1156d8dc83919c7bc4d709e480f6c4e4d4a6238ef8a237101c46c2add4",
+      "seed_gamma_method_cell_count": 1770,
+      "seed_gamma_row_count": 295,
+      "seed_payload_count": 59,
+      "seed_payload_map_sha256": "83532c259143ae9fab9d56690d464b15d66c6d5b5e7d2c16fc771f9dcb0e6b8a",
+      "seed_to_device_map_sha256": "a476f681ecfce0ddaf15353040a04dc2b29b889f4a6fb387e9b8a1b5ba91645e"
+    },
+    "scientific_artifact_inventory": [
+      {
+        "bytes": 3048,
+        "path": "FINAL_STATUS.json",
+        "sha256": "24ccbd2038b8eb50b7aca02f0ca29ada9ddf6c377bb3590fcdeb6c94df48ce7c"
+      },
+      {
+        "bytes": 104,
+        "path": "donor_overlap/COMPLETE",
+        "sha256": "747dc4d5fd5b83914dc8fa216e1b35bf5fca2cbb009647367c123e038c960183"
+      },
+      {
+        "bytes": 9,
+        "path": "donor_overlap/eicu/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 11964,
+        "path": "donor_overlap/eicu/seed_116000.json",
+        "sha256": "df382ce77c0254e36ffc2b9b39ef9c24fe23aa25a62e9fc1e82e0a365c0181b5"
+      },
+      {
+        "bytes": 11860,
+        "path": "donor_overlap/eicu/seed_116010.json",
+        "sha256": "983f98549087bd6c7f532991e44a2bc3dd0f3d68978014b51317874bab19b8e3"
+      },
+      {
+        "bytes": 11953,
+        "path": "donor_overlap/eicu/seed_116020.json",
+        "sha256": "2c4fe81a4ce2f0e253d14f3b99233aaaab1d09b5c4b2ae0efd6afca497424452"
+      },
+      {
+        "bytes": 11424,
+        "path": "donor_overlap/eicu/seed_116030.json",
+        "sha256": "bae462ede46e7a25f5c9711f28d66a64dcc361e003bd22edf7b09f28e18947e2"
+      },
+      {
+        "bytes": 11414,
+        "path": "donor_overlap/eicu/seed_116040.json",
+        "sha256": "e6cf44b49f2a5e45c52844c4851579ddc01f8c523d0be532b8c478c70268f9f1"
+      },
+      {
+        "bytes": 11432,
+        "path": "donor_overlap/eicu/seed_116050.json",
+        "sha256": "208305987269ac262079eff967ddda16706cc793d36143357d460731ee315022"
+      },
+      {
+        "bytes": 11939,
+        "path": "donor_overlap/eicu/seed_116060.json",
+        "sha256": "12b91172cc2d371e398d14253768628337d8d291584d8b3cac1447b505e59295"
+      },
+      {
+        "bytes": 11427,
+        "path": "donor_overlap/eicu/seed_116070.json",
+        "sha256": "0f7cdafc20b117d9481d584a78d5df48036fc5a776680fe27470dc27e5858fb5"
+      },
+      {
+        "bytes": 11963,
+        "path": "donor_overlap/eicu/seed_116080.json",
+        "sha256": "ba9c58ac92975944e2cf49b22d129540536c4e064886bec1cad61293a89a2d93"
+      },
+      {
+        "bytes": 11949,
+        "path": "donor_overlap/eicu/seed_116090.json",
+        "sha256": "1ae2a4110192466a9ecd1d84e1d66785708e2a66848a6d009e1c243002392a4d"
+      },
+      {
+        "bytes": 11424,
+        "path": "donor_overlap/eicu/seed_116100.json",
+        "sha256": "d047f198342459741bee6ffbc6891f16cb0fff98bfc1f8123b4901280bcb5bf6"
+      },
+      {
+        "bytes": 11964,
+        "path": "donor_overlap/eicu/seed_116110.json",
+        "sha256": "2a408b8117ea718450840a84ce24501e501221f53fbb91ace978444ab92216c1"
+      },
+      {
+        "bytes": 11954,
+        "path": "donor_overlap/eicu/seed_116120.json",
+        "sha256": "c9766f8ffe20bdb0c6e022632b9cf6f8f6de6999bac104c34b5f3c9aabe87930"
+      },
+      {
+        "bytes": 11963,
+        "path": "donor_overlap/eicu/seed_116130.json",
+        "sha256": "53ec2b50156fb6ec8cc3294cf060059204a2044777bafc7916129c485793a9c2"
+      },
+      {
+        "bytes": 12332,
+        "path": "donor_overlap/eicu/seed_116140.json",
+        "sha256": "e25a682954c88907cbfcea17d934d2ab55cf2105707ef1e88d8a769d9aa510ca"
+      },
+      {
+        "bytes": 11419,
+        "path": "donor_overlap/eicu/seed_116160.json",
+        "sha256": "24c80a1b8057010b3cc22feadaf92562e5cee40af631a69b260b8eba8e5e4007"
+      },
+      {
+        "bytes": 11431,
+        "path": "donor_overlap/eicu/seed_116170.json",
+        "sha256": "c9d0bf29aa20852d74a2ddc3965e817b44e4ab5a56e43450a13d11382ffef184"
+      },
+      {
+        "bytes": 11968,
+        "path": "donor_overlap/eicu/seed_116180.json",
+        "sha256": "333877806af675733da6e93852db759104da3f8fa48fa1fa6b6126065793b8ed"
+      },
+      {
+        "bytes": 11919,
+        "path": "donor_overlap/eicu/seed_116190.json",
+        "sha256": "a63d840e91ca37035a3862637e0c967c700f96c7a534db976c97f92dcce767d7"
+      },
+      {
+        "bytes": 1043,
+        "path": "donor_overlap/eicu/summary.json",
+        "sha256": "4b6f1746303ba10372846ad9022b61f5c8a21ec6527d1dc254b6f442bf87d8fc"
+      },
+      {
+        "bytes": 9,
+        "path": "donor_overlap/inspire/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 11506,
+        "path": "donor_overlap/inspire/seed_117000.json",
+        "sha256": "988794b1a0fdbade46b2c4009ee07410b479c6be4e9a5f1dedd42a82f4a9bbe9"
+      },
+      {
+        "bytes": 11523,
+        "path": "donor_overlap/inspire/seed_117010.json",
+        "sha256": "98724fb5adbd77a26fbdd8f82fd18e62b01a34c47c2c29e42972ce2eb6f46781"
+      },
+      {
+        "bytes": 11528,
+        "path": "donor_overlap/inspire/seed_117020.json",
+        "sha256": "07d18d4319ac39df7419a64e3eba29b9e878cf17e3eb3b2a87ca36b1ba3bdfd2"
+      },
+      {
+        "bytes": 11520,
+        "path": "donor_overlap/inspire/seed_117030.json",
+        "sha256": "c399e3189052b13b5657a292edbd78685868b8ab5813aa9fe1ba04b40b5306ba"
+      },
+      {
+        "bytes": 11527,
+        "path": "donor_overlap/inspire/seed_117040.json",
+        "sha256": "e57bb0d2865373c59b18e0012a6f4c2561613ca0f79f0b2267e94364151e0ba9"
+      },
+      {
+        "bytes": 11526,
+        "path": "donor_overlap/inspire/seed_117050.json",
+        "sha256": "04c1a23a360b7d02ac8174c4ddabfd87b04562c33da2fd0278060eca12e68880"
+      },
+      {
+        "bytes": 11532,
+        "path": "donor_overlap/inspire/seed_117060.json",
+        "sha256": "eb64cd0da312b9adb074507f0f6e8e782e09d4f3006e93176aef6142473cca7b"
+      },
+      {
+        "bytes": 11524,
+        "path": "donor_overlap/inspire/seed_117070.json",
+        "sha256": "23db28471a93ad56be2b1d0b0d27367c3c103f702c0a5d4e3f209d856e232435"
+      },
+      {
+        "bytes": 11522,
+        "path": "donor_overlap/inspire/seed_117080.json",
+        "sha256": "7122e80035d24961f20d9d1299beec8d93c1abe7cc4e06ee32959e333ce5363f"
+      },
+      {
+        "bytes": 11530,
+        "path": "donor_overlap/inspire/seed_117090.json",
+        "sha256": "873cbd3749ec234e7fb0593a3cc4bb8bcabed66ae2e79d3be4c341f7e1c8953b"
+      },
+      {
+        "bytes": 11524,
+        "path": "donor_overlap/inspire/seed_117100.json",
+        "sha256": "db71521073519dd35a953e00bd90a32d9c767e0da7e42490e7b0673567bf49b2"
+      },
+      {
+        "bytes": 11523,
+        "path": "donor_overlap/inspire/seed_117110.json",
+        "sha256": "cc76b0cdf7157d3db22678e2a9b4275ed48b6a1475af5126910ac08181c713fd"
+      },
+      {
+        "bytes": 11528,
+        "path": "donor_overlap/inspire/seed_117120.json",
+        "sha256": "ba51906b3e6f18b41687b20fa67255e4f4ec85cb8de00785cee87500c0dcdc66"
+      },
+      {
+        "bytes": 11530,
+        "path": "donor_overlap/inspire/seed_117130.json",
+        "sha256": "af09037385bc95662a5da5defd0a14cea3b48a7b2ce75f5475dfd04ddb47a613"
+      },
+      {
+        "bytes": 11523,
+        "path": "donor_overlap/inspire/seed_117140.json",
+        "sha256": "e1870f87187376e7945b58bf166afcfb301191725ef4c1a34e77de1d7f5a6fd2"
+      },
+      {
+        "bytes": 11525,
+        "path": "donor_overlap/inspire/seed_117150.json",
+        "sha256": "0aff66ba2306c8ff494f72b93c5854757c01237d5ec42ff0a3f91813e995f324"
+      },
+      {
+        "bytes": 11530,
+        "path": "donor_overlap/inspire/seed_117160.json",
+        "sha256": "82673a8ea36e1a4c6e30fa1b3c5f483d1f0090f08a4be3568f0637414f19f042"
+      },
+      {
+        "bytes": 11528,
+        "path": "donor_overlap/inspire/seed_117170.json",
+        "sha256": "2df41b770e25efc11846bda50e4f3aaa443dba3c99fab991b9c089e885ed941a"
+      },
+      {
+        "bytes": 11524,
+        "path": "donor_overlap/inspire/seed_117180.json",
+        "sha256": "32b79b3963a273d5ac1a2cdd6c82dcce33091858e502d88b8bf24076efb9137a"
+      },
+      {
+        "bytes": 11524,
+        "path": "donor_overlap/inspire/seed_117190.json",
+        "sha256": "e1323723837cb8b6ea313b2bdb785870e7d685496e9f6bf0fa4011e1137f14fd"
+      },
+      {
+        "bytes": 1056,
+        "path": "donor_overlap/inspire/summary.json",
+        "sha256": "8df8b591ebac2c73d78d8b86d09a4748cb52c73d3eb396f72b4412f52c9f7602"
+      },
+      {
+        "bytes": 9,
+        "path": "donor_overlap/mimic_iv/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 12994,
+        "path": "donor_overlap/mimic_iv/seed_115000.json",
+        "sha256": "3a5f09bf2579e5e9aa29ca705ecf8259002c60a73565c2cb2cc361b0013c20e0"
+      },
+      {
+        "bytes": 12992,
+        "path": "donor_overlap/mimic_iv/seed_115010.json",
+        "sha256": "0fe8457e67a9eb3f3fa5038ab11e3da63d4ae7261ceb480289f0c21dd9dcecf0"
+      },
+      {
+        "bytes": 12983,
+        "path": "donor_overlap/mimic_iv/seed_115020.json",
+        "sha256": "a23e825ac47036cd7c62b504c1679abd1135cd4485c9d68ece7351d28ed4e385"
+      },
+      {
+        "bytes": 12992,
+        "path": "donor_overlap/mimic_iv/seed_115030.json",
+        "sha256": "8ad1a7a88a61ec41f409b8668e98ba2a9d812b1b86e36429238f3606d04cef58"
+      },
+      {
+        "bytes": 12991,
+        "path": "donor_overlap/mimic_iv/seed_115040.json",
+        "sha256": "dd831247efb697eaa52189845b059bd9b448d4ad7c0358035ae21ea8b42a2eba"
+      },
+      {
+        "bytes": 12989,
+        "path": "donor_overlap/mimic_iv/seed_115050.json",
+        "sha256": "0a0c5c0ddd2453f0fb967a4d9e8f14dade7fedc05e3f12e0f048d97c70af00ee"
+      },
+      {
+        "bytes": 12996,
+        "path": "donor_overlap/mimic_iv/seed_115060.json",
+        "sha256": "5d8ac1046f508441e8151b54defa3a359ac5098629a78731cdacc000f9215f33"
+      },
+      {
+        "bytes": 12993,
+        "path": "donor_overlap/mimic_iv/seed_115070.json",
+        "sha256": "8bca956d084a461fa29ac4ba3526b459cc61b7025d9f977a7bbe85a27b35851a"
+      },
+      {
+        "bytes": 12991,
+        "path": "donor_overlap/mimic_iv/seed_115080.json",
+        "sha256": "36eea6a9504a3da2abaa315225a0557e8bc2073140bedd6a7bdeb22ecbe45ff7"
+      },
+      {
+        "bytes": 12992,
+        "path": "donor_overlap/mimic_iv/seed_115090.json",
+        "sha256": "7c3df41002355b2ee26ff5c021698c64a3234b66873dac44cec6e8e8ccc05dcf"
+      },
+      {
+        "bytes": 13002,
+        "path": "donor_overlap/mimic_iv/seed_115100.json",
+        "sha256": "4b0a00f6d30cd9527aa86970c517867b8d5027962e8b028d82ed77badf425a85"
+      },
+      {
+        "bytes": 12998,
+        "path": "donor_overlap/mimic_iv/seed_115110.json",
+        "sha256": "bc2cab2372c735a32be7aef988e2aa9c3b48564494fa0688544351bbb5c90295"
+      },
+      {
+        "bytes": 12995,
+        "path": "donor_overlap/mimic_iv/seed_115120.json",
+        "sha256": "7f2fd8e6292a5994ee1c611f99fcf392c608a39796c8a9f42d5db0506456e482"
+      },
+      {
+        "bytes": 12996,
+        "path": "donor_overlap/mimic_iv/seed_115130.json",
+        "sha256": "b3fcf50eafe21295493ff202e7e218f7c531f4a20913fee51a1e20ec351a9e16"
+      },
+      {
+        "bytes": 12992,
+        "path": "donor_overlap/mimic_iv/seed_115140.json",
+        "sha256": "92820271a7116cc8ce7bbd7997fe137b61d125ad68fccf663e5bac05bb6255f1"
+      },
+      {
+        "bytes": 12989,
+        "path": "donor_overlap/mimic_iv/seed_115150.json",
+        "sha256": "05eb7e03d737367c18f492e4b264e6aeb12efd8cc148540d292451bed28d9f40"
+      },
+      {
+        "bytes": 12995,
+        "path": "donor_overlap/mimic_iv/seed_115160.json",
+        "sha256": "b8ac4bf50171048b866de5447a37442627816f40265e495e7ae1fb4a42fda552"
+      },
+      {
+        "bytes": 12995,
+        "path": "donor_overlap/mimic_iv/seed_115170.json",
+        "sha256": "9a7ddfdb74c1aab14027a7a8b496305133b3893febf0e86b2fd815afdab8f757"
+      },
+      {
+        "bytes": 12983,
+        "path": "donor_overlap/mimic_iv/seed_115180.json",
+        "sha256": "d99cda6b83fbedd561146cd4cd29481b5896f26d6320707017e810df51152170"
+      },
+      {
+        "bytes": 12979,
+        "path": "donor_overlap/mimic_iv/seed_115190.json",
+        "sha256": "08909b116018f6b2b99f5323eaaf65b4e2124b034ca7b144fec1a5ff0fbc3fb3"
+      },
+      {
+        "bytes": 1057,
+        "path": "donor_overlap/mimic_iv/summary.json",
+        "sha256": "397b5782e0209d385e822651e07e93f5001d483af185ca9166ff90edf758a94f"
+      },
+      {
+        "bytes": 574,
+        "path": "donor_overlap/summary.json",
+        "sha256": "68808ff81d866ba2fcbe1249bccbb56523aef0369d33783bd7a63520196c4dc1"
+      },
+      {
+        "bytes": 3918,
+        "path": "eligibility/eicu.json",
+        "sha256": "12fd085651678f570eed9ec4f63563508fed39c7bd303e1367347ee471d74160"
+      },
+      {
+        "bytes": 3677,
+        "path": "eligibility/inspire.json",
+        "sha256": "2178cd8d1a0061ebcca1e49794029cfedd7930e75d000f989b8e43eb6b194deb"
+      },
+      {
+        "bytes": 3678,
+        "path": "eligibility/mimic_iv.json",
+        "sha256": "ae65ba3123a51e6822df84dc96e9651f8945816e743847902e81453bf9b89c35"
+      },
+      {
+        "bytes": 130124,
+        "path": "metadata.json",
+        "sha256": "ad0a7ea3a35228580c98d931e913b4092507e99fd5c4ba65abfed83a13341001"
+      },
+      {
+        "bytes": 16188,
+        "path": "provenance/source_manifest_94f7e7c4c8bf0d9404d06453e2018562bfcf9f7c49c8f0470280d7f89193d7f3.json",
+        "sha256": "94f7e7c4c8bf0d9404d06453e2018562bfcf9f7c49c8f0470280d7f89193d7f3"
+      },
+      {
+        "bytes": 3635200,
+        "path": "provenance/source_snapshot_0f22e9ac134a12e61ad607bc5cf24ae4261e19e61fb6739132dc6ee01a575782.tar",
+        "sha256": "0f22e9ac134a12e61ad607bc5cf24ae4261e19e61fb6739132dc6ee01a575782"
+      },
+      {
+        "bytes": 7,
+        "path": "science/eicu/COMPLETE",
+        "sha256": "ee07f7cec880e05a7da9f834d6b4806301e742169805f23087c73d68cd074601"
+      },
+      {
+        "bytes": 630,
+        "path": "science/eicu/FINAL_STATUS.json",
+        "sha256": "58760ca38bd6658c7f8830c0aef168885ed54a236f86e55c93362c2428235932"
+      },
+      {
+        "bytes": 400128,
+        "path": "science/eicu/bootstrap_indices.npy",
+        "sha256": "5155be349aef2a6cdc99e73e658e088dbc07d474aa38bd0a08b1d7dd1ca199fa"
+      },
+      {
+        "bytes": 1600128,
+        "path": "science/eicu/bootstrap_uniforms.npy",
+        "sha256": "adbdb7a778674d7089f00a616d41b3c089cb84a4d8e5b43454712da169607714"
+      },
+      {
+        "bytes": 30656,
+        "path": "science/eicu/coverage_audit.json",
+        "sha256": "d38c35eddca420964ab57554d190e9ee74910d78a3670d93ef17f0373620c7a6"
+      },
+      {
+        "bytes": 9,
+        "path": "science/eicu/seeds/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 227386,
+        "path": "science/eicu/seeds/seed_116000.json",
+        "sha256": "71cd22cee525456ffeea46d30716a0707b76ab0d81b48eb454402ccfbc51a385"
+      },
+      {
+        "bytes": 226831,
+        "path": "science/eicu/seeds/seed_116010.json",
+        "sha256": "67ef4bae767020791c382a6dfbb34c1b74d48863f5fa1e25fb20937229ccbcef"
+      },
+      {
+        "bytes": 227273,
+        "path": "science/eicu/seeds/seed_116020.json",
+        "sha256": "68df38c93f414e22b0fe928d82ca43542d3dac07bcdd82e13879fcf96bb85826"
+      },
+      {
+        "bytes": 226431,
+        "path": "science/eicu/seeds/seed_116030.json",
+        "sha256": "30124e69407e6be0b030563ea2a80f947f4a19a1d67d014d44d2ffe988247883"
+      },
+      {
+        "bytes": 226877,
+        "path": "science/eicu/seeds/seed_116040.json",
+        "sha256": "1f008a1f58a6c02afd45665fad902516792e04e779a0bf7f483c2b8c30d5bfd2"
+      },
+      {
+        "bytes": 226387,
+        "path": "science/eicu/seeds/seed_116050.json",
+        "sha256": "10b506b00786632b0653e50751bba69e5f5d049e4152b829222149579adebb85"
+      },
+      {
+        "bytes": 227539,
+        "path": "science/eicu/seeds/seed_116060.json",
+        "sha256": "256cc9e854a183b5852090024244bfbfbc3836453e7bb3dc225aceea9771576f"
+      },
+      {
+        "bytes": 227036,
+        "path": "science/eicu/seeds/seed_116070.json",
+        "sha256": "efe8f0ecb338dc8b5c85e37a33e6e43ffd8503c0ebdebdfdece8569a0b0e7f27"
+      },
+      {
+        "bytes": 226455,
+        "path": "science/eicu/seeds/seed_116080.json",
+        "sha256": "8ee5cc12afb25ae7868033540586afc69e4d6638e38f5c956686b2228ae23e9d"
+      },
+      {
+        "bytes": 227351,
+        "path": "science/eicu/seeds/seed_116090.json",
+        "sha256": "5649bd9404c59c3d4e6ba8db2130ab6740d55ee6f9288582b021cebcd2658e5b"
+      },
+      {
+        "bytes": 226623,
+        "path": "science/eicu/seeds/seed_116100.json",
+        "sha256": "b8152a0492289c257ec5b4cc256de518e853f4007efdb903619336a523c828aa"
+      },
+      {
+        "bytes": 227412,
+        "path": "science/eicu/seeds/seed_116110.json",
+        "sha256": "a4533e4490734a56713d064ae787885131f8bfe9469a3b2de2ff2e6960c4029d"
+      },
+      {
+        "bytes": 227094,
+        "path": "science/eicu/seeds/seed_116120.json",
+        "sha256": "ec72c536480af884ffa2682c533116b64157c13d674da999204327d84e7eacb5"
+      },
+      {
+        "bytes": 227117,
+        "path": "science/eicu/seeds/seed_116130.json",
+        "sha256": "aa00d2f7fdaa5e347f911470e467bca8d7f59e298485f8cf312e7e3832fac385"
+      },
+      {
+        "bytes": 227318,
+        "path": "science/eicu/seeds/seed_116140.json",
+        "sha256": "69a09035c2498dbc103c689b954d6f3dd58631ee3d0753e5d26632adc0daa7f7"
+      },
+      {
+        "bytes": 226475,
+        "path": "science/eicu/seeds/seed_116160.json",
+        "sha256": "3c721ed9b6ead1620cce7f91546a6a4cd38743c48f71888e855b6d4977a690d3"
+      },
+      {
+        "bytes": 226239,
+        "path": "science/eicu/seeds/seed_116170.json",
+        "sha256": "7e128f8e8ca4aaa7362825a78d6127b394d19cc0196d858cc600e93d34a31040"
+      },
+      {
+        "bytes": 227504,
+        "path": "science/eicu/seeds/seed_116180.json",
+        "sha256": "df67558dedc5342e205690e70528ff8f847962e674d8a4148dbae94c85e01ffa"
+      },
+      {
+        "bytes": 227444,
+        "path": "science/eicu/seeds/seed_116190.json",
+        "sha256": "8412b9ce232d07b8eb23e36dccb782952efd3fb9bf02e1ca0318ee43dbe9a78c"
+      },
+      {
+        "bytes": 182635,
+        "path": "science/eicu/summary.json",
+        "sha256": "4192d904bcf28cad8cb5cba230c8ffbdd7f68ccd780b57b8c700353f5a748f49"
+      },
+      {
+        "bytes": 7,
+        "path": "science/inspire/COMPLETE",
+        "sha256": "ee07f7cec880e05a7da9f834d6b4806301e742169805f23087c73d68cd074601"
+      },
+      {
+        "bytes": 620,
+        "path": "science/inspire/FINAL_STATUS.json",
+        "sha256": "20a0815c245b53c81a8eabc13b93293fb2263099397c84a6a44bf7e24db1a5ef"
+      },
+      {
+        "bytes": 400128,
+        "path": "science/inspire/bootstrap_indices.npy",
+        "sha256": "b169d7100e69d77d7bc0c3daa68cfc415d42a8dd3f15b467f8ec2fb7a5327f6c"
+      },
+      {
+        "bytes": 1600128,
+        "path": "science/inspire/bootstrap_uniforms.npy",
+        "sha256": "917fdbe17afa43d23f0c024d59c3489bf973320c7576fc513d323655cb750b3d"
+      },
+      {
+        "bytes": 30205,
+        "path": "science/inspire/coverage_audit.json",
+        "sha256": "e6b091b3ac98cd466adad67467821db8225c1db1a7a01e71eb58a33ef72ff958"
+      },
+      {
+        "bytes": 9,
+        "path": "science/inspire/seeds/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 219039,
+        "path": "science/inspire/seeds/seed_117000.json",
+        "sha256": "0d5ecc3860ec8bcc7b029f253a39a30099c52a676a9d865d4ec20a6fc1a08207"
+      },
+      {
+        "bytes": 221487,
+        "path": "science/inspire/seeds/seed_117010.json",
+        "sha256": "e548f48b88ff71e05d18660bb93ae0543eedb7119c83a72018d9fa7596c68414"
+      },
+      {
+        "bytes": 219345,
+        "path": "science/inspire/seeds/seed_117020.json",
+        "sha256": "71369737b01835d5cf90f601590540826e967a25f44c9358febe06b16ffbc744"
+      },
+      {
+        "bytes": 219712,
+        "path": "science/inspire/seeds/seed_117030.json",
+        "sha256": "9dd4aa9af3bae21501e4f3b447197269ab5a0f616a66ade787fdd19fa9ccba92"
+      },
+      {
+        "bytes": 220280,
+        "path": "science/inspire/seeds/seed_117040.json",
+        "sha256": "1b19a4a02388b38c8be6454185efcc75036fbf2e66f922058325dd10a3b874d6"
+      },
+      {
+        "bytes": 221158,
+        "path": "science/inspire/seeds/seed_117050.json",
+        "sha256": "181494e03d8078e2297a382e9c3ca7b0a4e8229aba18d89d9726969afac2cd21"
+      },
+      {
+        "bytes": 219094,
+        "path": "science/inspire/seeds/seed_117060.json",
+        "sha256": "c7bd162c6ce614d082ad03e677f576c91f985f67b56ea80b38ed7de44cbfbd37"
+      },
+      {
+        "bytes": 219254,
+        "path": "science/inspire/seeds/seed_117070.json",
+        "sha256": "deddcc92adf3e6e9669fea63444ece8df5731c7599aafdf81c27f9859434d98b"
+      },
+      {
+        "bytes": 219293,
+        "path": "science/inspire/seeds/seed_117080.json",
+        "sha256": "39a49aa0086be0a6bb9e35639409a3bef3c6eded65cd77b129d576f59f16cbf7"
+      },
+      {
+        "bytes": 219383,
+        "path": "science/inspire/seeds/seed_117090.json",
+        "sha256": "19e4a6dc68f74a628b75051ab3a5165ce086fd1e26753c4baae48727dd4c2570"
+      },
+      {
+        "bytes": 219350,
+        "path": "science/inspire/seeds/seed_117100.json",
+        "sha256": "0d4b9bb5d8da2f73d1cc7e757148e8b7e40f400d3b2111e5d0099a433ccae79d"
+      },
+      {
+        "bytes": 219505,
+        "path": "science/inspire/seeds/seed_117110.json",
+        "sha256": "e8d92b793880458b7dd261ff8d15a6b6b609f9d83c9fbca670a17a801391dec4"
+      },
+      {
+        "bytes": 219261,
+        "path": "science/inspire/seeds/seed_117120.json",
+        "sha256": "bf656e1a4d11036b06dbfaa11909fe28dbe7b7482a7430046a106749d60dafd2"
+      },
+      {
+        "bytes": 219453,
+        "path": "science/inspire/seeds/seed_117130.json",
+        "sha256": "6be313b5ca3d3be4c2f8c4066cc84518da6b6b15477444d5df4cc5884d894590"
+      },
+      {
+        "bytes": 219403,
+        "path": "science/inspire/seeds/seed_117140.json",
+        "sha256": "fce436fae474f6e690a68858abed2a2554aed436bf55b9ae1d9cfac4f6fa33ac"
+      },
+      {
+        "bytes": 219350,
+        "path": "science/inspire/seeds/seed_117150.json",
+        "sha256": "346777379e6969ad6dc08138a10ba0da520f5b9a650d223e6b7150dd9ba0bf98"
+      },
+      {
+        "bytes": 219384,
+        "path": "science/inspire/seeds/seed_117160.json",
+        "sha256": "bbccb66cab404d6bde42f0a96dc18a319a578b54e933fa991722b13669eb1af7"
+      },
+      {
+        "bytes": 220049,
+        "path": "science/inspire/seeds/seed_117170.json",
+        "sha256": "3a079a5e01f41b5933421bee345e693da4df00f6728e6fb8790a681d02607379"
+      },
+      {
+        "bytes": 220096,
+        "path": "science/inspire/seeds/seed_117180.json",
+        "sha256": "f5badf21a8134ee41e00f4bd07cf539329147ad7062463667660081a93271ac9"
+      },
+      {
+        "bytes": 218895,
+        "path": "science/inspire/seeds/seed_117190.json",
+        "sha256": "3fda03c2635510d7979c7f51ae8ff3e658b1f1352e3a85663ae56abb71a693d0"
+      },
+      {
+        "bytes": 182472,
+        "path": "science/inspire/summary.json",
+        "sha256": "a931be5aea28a2fd01d2cd594a56ea51d829615d3c57c198123a453a2caa9c2f"
+      },
+      {
+        "bytes": 7,
+        "path": "science/mimic_iv/COMPLETE",
+        "sha256": "ee07f7cec880e05a7da9f834d6b4806301e742169805f23087c73d68cd074601"
+      },
+      {
+        "bytes": 621,
+        "path": "science/mimic_iv/FINAL_STATUS.json",
+        "sha256": "b1e0f12a02bda6acaa9b94e07d9054ae8e7ed8aeabbc3ad16dfe7a17566e6c28"
+      },
+      {
+        "bytes": 400128,
+        "path": "science/mimic_iv/bootstrap_indices.npy",
+        "sha256": "bad62141f8c66babc30caf60b000045550711aca03441ac2dbed7bb90fe09556"
+      },
+      {
+        "bytes": 1600128,
+        "path": "science/mimic_iv/bootstrap_uniforms.npy",
+        "sha256": "eaf70ac74bafc7328fbbcb26ee8c98d1fa9c0fb075ed68562fa7378c1eca4c48"
+      },
+      {
+        "bytes": 30182,
+        "path": "science/mimic_iv/coverage_audit.json",
+        "sha256": "b50e2eaa6d9ca082aaac2d17a2afc2d65bc4ef20ca2b990443f3f7cc68a0d056"
+      },
+      {
+        "bytes": 9,
+        "path": "science/mimic_iv/seeds/COMPLETE",
+        "sha256": "37a40f08d8548dba289b9b0bb35bcf63b359f6d37ee86044ebc6b6da080b9ec1"
+      },
+      {
+        "bytes": 228319,
+        "path": "science/mimic_iv/seeds/seed_115000.json",
+        "sha256": "748e56c0e2d8910969c5ebf6d341e5d05ff14b66f4a169627bde5d91123ad694"
+      },
+      {
+        "bytes": 228410,
+        "path": "science/mimic_iv/seeds/seed_115010.json",
+        "sha256": "218474e8c031900425b9940b0f0136a1f403547cd3ba96c21cb40b6054a75d05"
+      },
+      {
+        "bytes": 228335,
+        "path": "science/mimic_iv/seeds/seed_115020.json",
+        "sha256": "65ec7909d5d69e27e3ce9e432e43bddfbfd9cb3e01d2b98e2beb1696646c6932"
+      },
+      {
+        "bytes": 228245,
+        "path": "science/mimic_iv/seeds/seed_115030.json",
+        "sha256": "dac5c239a689dadf9b584a5860ba16f51cb61482e9b00cfd41ef070827bb71ea"
+      },
+      {
+        "bytes": 228361,
+        "path": "science/mimic_iv/seeds/seed_115040.json",
+        "sha256": "c14de76a7bea31cf127de99d910fa7a52d1e9de85c73a42e694929c9bd0bac60"
+      },
+      {
+        "bytes": 228313,
+        "path": "science/mimic_iv/seeds/seed_115050.json",
+        "sha256": "5cd117c11fdc05b36e26f9ec77d894a00f7b31acfa07832fa29ee63a596ff18a"
+      },
+      {
+        "bytes": 227992,
+        "path": "science/mimic_iv/seeds/seed_115060.json",
+        "sha256": "b458ace560da6cb2f2aa3715844fa02efed5bae2613aaead87b7b437c5ddf64e"
+      },
+      {
+        "bytes": 228498,
+        "path": "science/mimic_iv/seeds/seed_115070.json",
+        "sha256": "5eadd5793f51a71f4986e66d7aa77e5d284a71fd73a1e8704f29672c8838f12b"
+      },
+      {
+        "bytes": 228126,
+        "path": "science/mimic_iv/seeds/seed_115080.json",
+        "sha256": "8f998443bde10c8f570658779a6b830fd6327cefbce2f2c0f3b21c0263103e19"
+      },
+      {
+        "bytes": 228303,
+        "path": "science/mimic_iv/seeds/seed_115090.json",
+        "sha256": "01ef4455096c48e483255727efd6324e0b2d1ee3eb224e99339d714711eccb8f"
+      },
+      {
+        "bytes": 228358,
+        "path": "science/mimic_iv/seeds/seed_115100.json",
+        "sha256": "2897fc5df16ccd432a8fec89aa41cf3be8e3108ed5d47f5b42c771e0302f912e"
+      },
+      {
+        "bytes": 228378,
+        "path": "science/mimic_iv/seeds/seed_115110.json",
+        "sha256": "c819ac3294c93bf77d349bb4a3017f08c08c3ca3fbbbbd451e1b910a71468ad5"
+      },
+      {
+        "bytes": 228353,
+        "path": "science/mimic_iv/seeds/seed_115120.json",
+        "sha256": "46b3961c13cc17b682b3d8440e08fb078e16f590fc8cec34a9f7d69ad2ef310d"
+      },
+      {
+        "bytes": 228273,
+        "path": "science/mimic_iv/seeds/seed_115130.json",
+        "sha256": "6ebded2110d7424b1140225d865a19bd209061704bdf59f33b204404f3256d15"
+      },
+      {
+        "bytes": 228176,
+        "path": "science/mimic_iv/seeds/seed_115140.json",
+        "sha256": "b8c21d1aee83a8763bcd5f856d42ad52d05798249bc9027b78b5a7a67c57ade8"
+      },
+      {
+        "bytes": 228324,
+        "path": "science/mimic_iv/seeds/seed_115150.json",
+        "sha256": "f9a5885ec7f986c5abe669df1b45b17f47accbd50ad3092733d5ef8230053eeb"
+      },
+      {
+        "bytes": 228334,
+        "path": "science/mimic_iv/seeds/seed_115160.json",
+        "sha256": "8ad0a583967689afad4e8f4a20ed263500e75f8f33cf6e2217bf344c317af215"
+      },
+      {
+        "bytes": 228247,
+        "path": "science/mimic_iv/seeds/seed_115170.json",
+        "sha256": "d5f5f840466822a81f710f35b071e0f34686a2f5dc2c4ab41a1ad708098d7c76"
+      },
+      {
+        "bytes": 228407,
+        "path": "science/mimic_iv/seeds/seed_115180.json",
+        "sha256": "9e9e593482439f53bee55f7a62e668cfdb39a1e8ca563d6cf2f2eef89f0d90f9"
+      },
+      {
+        "bytes": 228242,
+        "path": "science/mimic_iv/seeds/seed_115190.json",
+        "sha256": "e1aceaf618936155bccfca599219e60d40ad0641371fa945ff283b9d6df3a5a8"
+      },
+      {
+        "bytes": 182266,
+        "path": "science/mimic_iv/summary.json",
+        "sha256": "f9960f34e720287b5c0fc29a61204d0860dc7b576206e5cd9693254fb878ea46"
+      }
+    ],
+    "scientific_values_human_inspected_for_retry": false,
+    "scientific_values_must_not_be_printed": true,
+    "source_manifest_sha256": "94f7e7c4c8bf0d9404d06453e2018562bfcf9f7c49c8f0470280d7f89193d7f3",
+    "source_snapshot_sha256": "0f22e9ac134a12e61ad607bc5cf24ae4261e19e61fb6739132dc6ee01a575782",
+    "source_tree_sha256": "67db90c1a310ee7bacdd91e82204c931f00fd69dd04853844bd52991e204706f"
+  },
+  "protocol": "controlled_clinical_fidelity_v4_signed_gamma_science_publish_retry_r1",
+  "retry": {
+    "coverage_value_logging_permitted": false,
+    "formal_science_execution_permitted": false,
+    "fresh_science_claimed": false,
+    "independent_science_claimed": false,
+    "launch_requires_exact_read_only_audit_sha256": true,
+    "old_root_mutation_permitted": false,
+    "operation": "exact_byte_copy_then_administrative_publish",
+    "output_root": "results/work/controlled_clinical_fidelity_v4_signed_gamma_science_publish_retry_r1",
+    "root_complete_true_last": true,
+    "scientific_artifact_count": 154,
+    "scientific_bytes_preserved": true,
+    "scientific_inventory_sha256": "dfc88c08a2f55f73c0c0ad50a06d196b64778577dd6ff8ce6f63107fa5394771",
+    "scientific_relative_paths_preserved": true,
+    "semantic_validation": "recompute_existing_artifact_invariants_with_canonical_JSON_boundary_without_RNG"
+  },
+  "role": "administrative_exact_byte_publish_retry"
+}
