@@ -18,12 +18,13 @@ from scpcp.config import ExperimentConfig
 from scpcp.device import resolve_devices
 
 
+_PRIVATE_CONFIGS = ROOT / "internal" / "configs"
 CONFIGS = {
-    "synthetic": ROOT / "configs" / "per_step_synthetic_tail_shift.yaml",
-    "mimic_iv": ROOT / "configs" / "per_step_mimic_iv.yaml",
-    "mimic_cxr": ROOT / "configs" / "per_step_mimic_cxr.yaml",
-    "eicu": ROOT / "configs" / "per_step_eicu.yaml",
-    "inspire": ROOT / "configs" / "per_step_inspire.yaml",
+    "synthetic": _PRIVATE_CONFIGS / "per_step_synthetic_tail_shift.yaml",
+    "mimic_iv": _PRIVATE_CONFIGS / "per_step_mimic_iv.yaml",
+    "mimic_cxr": _PRIVATE_CONFIGS / "per_step_mimic_cxr.yaml",
+    "eicu": _PRIVATE_CONFIGS / "per_step_eicu.yaml",
+    "inspire": _PRIVATE_CONFIGS / "per_step_inspire.yaml",
 }
 FEEDBACK_LEVELS = (0.0, 0.5, 1.0, 2.0)
 
@@ -44,6 +45,13 @@ def main() -> None:
         help="resume an exact suite and validate every completed setting",
     )
     args = parser.parse_args()
+
+    missing_configs = [str(path) for path in CONFIGS.values() if not path.is_file()]
+    if missing_configs:
+        raise FileNotFoundError(
+            "the paper-scale runner is a private research compatibility path; "
+            "restore internal/configs before using it"
+        )
 
     sections = _parse_choices(args.sections, {"rq1", "rq3"})
     datasets = _parse_choices(args.datasets, set(CONFIGS))

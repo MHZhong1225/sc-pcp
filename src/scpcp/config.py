@@ -1,8 +1,7 @@
-"""Configuration for the per-step SC-PCP experiments.
+"""Configuration objects for per-step SC-PCP calibration.
 
-Paper-scale settings live in ``configs/per_step_synthetic.yaml`` and
-``configs/per_step_{dataset}.yaml`` so the normal command line only needs a
-config path, seed range, and devices.
+Paper-scale frozen YAML files are kept in the local ``internal/configs``
+archive. The public package accepts any compatible caller-supplied YAML file.
 """
 
 from __future__ import annotations
