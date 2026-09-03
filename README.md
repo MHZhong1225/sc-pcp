@@ -84,13 +84,6 @@ See
 complete runnable example, including the required policy interfaces and tensor
 shapes.
 
-## **Documentation**
-
-```text
-docs/final_method.md        full method definition and guarantee boundary
-docs/evaluation_metrics.md  coverage, width, selection, and uncertainty metrics
-```
-
 The core implementation is in
 [`src/scpcp/marginal_prefix.py`](src/scpcp/marginal_prefix.py). The stable
 experiment-facing wrapper is in

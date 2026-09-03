@@ -6,17 +6,12 @@ import json
 from dataclasses import dataclass, replace
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor
 
-from scpcp.baselines import (
-    OnlineBaselineResult,
-    aci_style_controller,
-    finite_depth_mfcs_selection,
-    multidim_spci_style_controller,
-    prc_profile_scale,
-    standard_cp_stagewise_radii,
-)
+from scpcp.aci import run_aci_panel
+from scpcp.baselines import OnlineBaselineResult, standard_cp_stagewise_radii
 from scpcp.behavior import fit_behavior_policy
 from scpcp.certification import CertificationResult
 from scpcp.config import ExperimentConfig
@@ -39,6 +34,14 @@ from scpcp.data import DataSplits, TrajectoryBatch, concatenate_trajectories, pa
 from scpcp.marginal_prefix import (
     MarginalPrefixSelection,
     select_marginal_prefix_schedule,
+)
+from scpcp.native_prc import NativePRCConfig, NativePRCResult, native_prc_profile_scale
+from scpcp.native_spci import (
+    NativeSPCIConfig,
+    NativeSPCIUnavailable,
+    StagewiseNativeSPCIResult,
+    run_stagewise_native_spci,
+    verify_native_spci_runtime,
 )
 from scpcp.outcome_model import fit_outcome_model
 from scpcp.policy import BehaviorAnchoredPolicy
@@ -301,66 +304,82 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         calibration_scores,
         config.certification.alpha,
     )
-    mfcs_selection, _ = finite_depth_mfcs_selection(
-        calibration.to(device),
-        calibration_scores.to(device),
-        q_grid=baseline_scale_grid.to(device),
-        stage_profile=initial_stage_profile.to(device),
-        target_policy=policy,
-        logging_policy=logging_policy,
-        depth=config.baselines.mfcs_depth,
-        alpha=config.certification.alpha,
-        weight_cap=config.cot.weight_cap,
+    # Native MFCS requires the full counterfactual query-law matrix in its
+    # replacement recursion.  The present runner exposes only action ratios
+    # after a candidate has been chosen, which is not that input.  Do not turn
+    # the missing object into a clipped likelihood-ratio approximation.
+    mfcs_selection = RadiusSelection(
+        radius=None,
+        index=None,
+        status="UNAVAILABLE_NATIVE_QUERY_LAW_NOT_IDENTIFIED",
     )
-
     adaptation_stream = _paper_seed(seed, 700_001)
     aci_adaptation_seed = _paper_seed(adaptation_stream, 101)
-    multidim_adaptation_seed = _paper_seed(adaptation_stream, 211)
+    spci_adaptation_seed = _paper_seed(adaptation_stream, 211)
     prc_adaptation_seed = _paper_seed(adaptation_stream, 307)
-    aci = aci_style_controller(
+    aci = run_aci_panel(
         task.environment,
         policy,
         region,
         calibration_scores,
         alpha=config.certification.alpha,
         gamma=config.baselines.aci_gamma,
-        rounds=config.baselines.online_rounds,
-        total_rollouts=config.samples.online_rollouts,
+        target_deployments=config.samples.online_rollouts,
         horizon=config.horizon,
         seed=aci_adaptation_seed,
         device=device,
     )
-    multidim = multidim_spci_style_controller(
+    # MultiDimSPCI is an online multivariate *prediction* method.  Its source
+    # does not specify a treatment policy induced by its ellipsoid, so the
+    # target observations are generated once under the frozen Standard-CP
+    # action policy.  The native SPCI ellipsoids are then evaluated on the full
+    # chronological 2,000-patient target stream.  This information regime is
+    # intentionally distinct from the offline box-policy rows.
+    try:
+        verify_native_spci_runtime()
+        spci_target_stream = rollout(
+            task.environment,
+            policy,
+            n=config.samples.online_rollouts,
+            horizon=config.horizon,
+            seed=spci_adaptation_seed,
+            device=device,
+            q=standard_radii.to(device),
+        )
+        spci = run_stagewise_native_spci(
+            calibration,
+            spci_target_stream,
+            n_actions=task.n_actions,
+            alpha=config.certification.alpha,
+            seed=spci_adaptation_seed,
+            config=NativeSPCIConfig(),
+        )
+        spci_record = _native_spci_record(spci, target_trajectories=spci_target_stream.n)
+        spci_status = "NATIVE_SOURCE_ONLINE_TARGET_STREAM"
+    except NativeSPCIUnavailable as error:
+        spci_record = _unavailable_record(
+            "SPCI",
+            RadiusSelection(None, None, f"UNAVAILABLE_PINNED_SPCI_DEPENDENCY: {error}"),
+            None,
+            information_regime="native_target_policy_adaptation_requires_pinned_dependency",
+        )
+        spci_status = "UNAVAILABLE_PINNED_SPCI_DEPENDENCY"
+    prc = native_prc_profile_scale(
         task.environment,
         policy,
         region,
-        calibration_scores,
-        alpha=config.certification.alpha,
-        rounds=config.baselines.online_rounds,
-        total_rollouts=config.samples.online_rollouts,
-        horizon=config.horizon,
-        seed=multidim_adaptation_seed,
-        device=device,
-        residual_window=config.baselines.multidim_buffer,
-    )
-    initial_prc_scale = float(
-        (standard_radii / initial_stage_profile.to(standard_radii)).max().item()
-    )
-    prc = prc_profile_scale(
-        task.environment,
-        policy,
-        region,
-        initial_prc_scale,
         baseline_scale_grid,
         initial_stage_profile,
-        alpha=config.certification.alpha,
-        delta=config.certification.delta,
-        rounds=config.baselines.online_rounds,
-        total_rollouts=config.samples.online_rollouts,
+        config=NativePRCConfig(
+            alpha=config.certification.alpha,
+            delta=config.certification.delta,
+            tightness=config.baselines.prc_tightness,
+            tau=config.baselines.prc_tau,
+            cohort_size=config.baselines.prc_cohort_size,
+        ),
         horizon=config.horizon,
         seed=prc_adaptation_seed,
         device=device,
-        maximum_step=config.baselines.prc_maximum_step,
     )
 
     evaluation_seed = _paper_seed(seed, 900_001)
@@ -389,9 +408,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         ),
         _evaluate_radius_method(
             "MFCS",
-            None
-            if mfcs_selection.radius is None
-            else mfcs_selection.radius * initial_stage_profile,
+            None,
             task,
             policy,
             region,
@@ -403,17 +420,7 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
             stage_profile=initial_stage_profile,
             outcome_sd=outcome_sd,
         ),
-        _evaluate_stagewise_method(
-            "SPCI",
-            multidim,
-            task,
-            policy,
-            region,
-            config,
-            evaluation_seed,
-            device,
-            outcome_sd=outcome_sd,
-        ),
+        spci_record,
         _evaluate_stagewise_method(
             "PRC",
             prc,
@@ -482,11 +489,11 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         "protocol": "committed_prefix_marginal_scpcp",
         "method": "direct_committed_prefix_uncapped_importance_weighting",
         "guarantee_scope": "asymptotic_per_step_marginal",
-        "baseline_scope": "task_adapted_common_prediction_set_interface",
+        "baseline_scope": "article_faithful_or_fail_closed",
         "matched_evaluation_random_stream": True,
         "adaptation_seeds": {
             "aci": aci_adaptation_seed,
-            "multidim_spci": multidim_adaptation_seed,
+            "spci": spci_adaptation_seed,
             "prc": prc_adaptation_seed,
         },
         "evaluation_seed": evaluation_seed,
@@ -517,10 +524,21 @@ def run_seed(config: ExperimentConfig, *, seed: int, device: str) -> SeedResult:
         ),
         "baseline_candidate_count": len(baseline_scale_grid),
         "baseline_settings": {
-            "MFCS": {"depth": config.baselines.mfcs_depth},
-            "ACI": {"gamma": config.baselines.aci_gamma},
-            "SPCI": {"buffer": config.baselines.multidim_buffer},
-            "PRC": {"maximum_step": config.baselines.prc_maximum_step},
+            "MFCS": {"status": mfcs_selection.status, "depth": config.baselines.mfcs_depth},
+            "ACI": {"gamma": config.baselines.aci_gamma, "updates": config.samples.online_rollouts},
+            "SPCI": {
+                "target_adaptations": config.samples.online_rollouts,
+                "implementation": "official_multidimensional_ellipsoid",
+                "action_generation": "frozen_standard_cp_box_policy",
+                "status": spci_status,
+            },
+            "PRC": {
+                "alpha": config.certification.alpha,
+                "delta": config.certification.delta,
+                "tightness": config.baselines.prc_tightness,
+                "tau": config.baselines.prc_tau,
+                "selection_cohort_size": config.baselines.prc_cohort_size,
+            },
         },
         "split_sizes": {
             "pred": splits.predictor.n,
@@ -569,11 +587,23 @@ def _annotate_paper_records(
         "Standard CP": {"alpha": config.certification.alpha},
         "MFCS": {
             "depth": config.baselines.mfcs_depth,
-            "weight_cap": config.cot.weight_cap,
+            "implementation": "official_replacement_recursion_or_fail_closed",
         },
-        "ACI": {"gamma": config.baselines.aci_gamma},
-        "SPCI": {"buffer": config.baselines.multidim_buffer},
-        "PRC": {"maximum_step": config.baselines.prc_maximum_step},
+        "ACI": {
+            "gamma": config.baselines.aci_gamma,
+            "updates": config.samples.online_rollouts,
+            "implementation": "gibbs_candes_eq_2_no_batching_clipping_or_truncation",
+        },
+        "SPCI": {
+            "target_adaptations": config.samples.online_rollouts,
+            "implementation": "official_multidimensional_ellipsoid_or_fail_closed",
+        },
+        "PRC": {
+            "tightness": config.baselines.prc_tightness,
+            "tau": config.baselines.prc_tau,
+            "selection_cohort_size": config.baselines.prc_cohort_size,
+            "implementation": "official_rcpp_main_run_trajectory",
+        },
         SCPCP_METHOD: {
             "candidate_count": config.q_grid_size,
             "weights": "uncapped_committed_prefix",
@@ -983,7 +1013,7 @@ def _evaluate_radius_method(
 
 def _evaluate_stagewise_method(
     name: str,
-    adaptation: OnlineBaselineResult,
+    adaptation: OnlineBaselineResult | NativePRCResult,
     task: _Task,
     policy: BehaviorAnchoredPolicy,
     outcome_model: object,
@@ -1039,6 +1069,82 @@ def _evaluate_stagewise_method(
         }
     )
     return record
+
+
+def _native_spci_record(
+    result: StagewiseNativeSPCIResult,
+    *,
+    target_trajectories: int,
+) -> dict[str, Any]:
+    """Record native online SPCI without relabeling ellipsoids as boxes.
+
+    SPCI's source returns a prediction region for every target-stream patient.
+    Its empirical coverage is therefore a target-adaptation-stream quantity,
+    not an independent offline-oracle estimate.  No clinical utility field is
+    populated because the source method has no rule that maps an ellipsoid to
+    the treatment policy used by this project.
+    """
+
+    covered = np.stack([stage.covered for stage in result.stages], axis=1)
+    volumes = np.stack([stage.ellipsoid_volumes for stage in result.stages], axis=1)
+    if covered.shape[0] != target_trajectories:
+        raise RuntimeError("native SPCI returned a target stream with an unexpected length")
+    coverage_by_time = covered.mean(axis=0)
+    finite_positive_volumes = volumes[np.isfinite(volumes) & (volumes > 0.0)]
+    return {
+        **_metric_placeholders(),
+        "track": "empirical_environment",
+        "evaluation_scope": "native_spci_online_target_adaptation_stream",
+        "prediction_set_metric_scope": "native_multidimensional_ellipsoid",
+        "clinical_value_metric_scope": "not_defined_by_native_spci",
+        "clinical_utility_definition": "",
+        "method": "SPCI",
+        "information_regime": "online_target_policy_adaptation_2000",
+        "selection_estimand": "per_step_native_ellipsoid_coverage",
+        "selection_parameter": "observation_specific_ellipsoid",
+        "selected_q": float("nan"),
+        "selected_scale": float("nan"),
+        "stage_profile": "[]",
+        "q_by_time": "",
+        "selection_status": "NATIVE_SOURCE_ONLINE_TARGET_STREAM",
+        "certificate_type": "",
+        "certificate_formal": False,
+        "selection_available": True,
+        "worst_coverage": float(coverage_by_time.min()),
+        "average_coverage": float(coverage_by_time.mean()),
+        "pathwise_coverage": float(covered.all(axis=1).mean()),
+        "worst_gap": float("nan"),
+        "per_time_coverage": json.dumps([float(value) for value in coverage_by_time]),
+        "mean_log_volume": (
+            float(np.log(finite_positive_volumes).mean())
+            if finite_positive_volumes.size
+            else float("nan")
+        ),
+        "median_volume": float(np.median(finite_positive_volumes)) if finite_positive_volumes.size else float("nan"),
+        "average_normalized_width": float("nan"),
+        "per_time_normalized_width": "[]",
+        "clinical_cost": float("nan"),
+        "clinical_utility": float("nan"),
+        "target_policy_trajectories": target_trajectories,
+        "oracle_evaluation_trajectories": 0,
+        "score_mean": float("nan"),
+        "estimated_min_coverage": float("nan"),
+        "lower_bound_min": float("nan"),
+        "certified": False,
+        "adaptation_trajectories": target_trajectories,
+        "adaptation_rounds": target_trajectories,
+        "adaptation_target_coverage": float("nan"),
+        "adaptation_empirical_target_met": float("nan"),
+        "adaptation_worst_coverage": float(coverage_by_time.min()),
+        "adaptation_average_coverage": float(coverage_by_time.mean()),
+        "adaptation_pathwise_coverage": float(covered.all(axis=1).mean()),
+        "adaptation_per_time_coverage": json.dumps([float(value) for value in coverage_by_time]),
+        "adaptation_round_worst_coverage": "[]",
+        "spci_upstream_repository": result.stages[0].upstream_repository,
+        "spci_upstream_commit": result.stages[0].upstream_commit,
+        "spci_upstream_entrypoint": result.stages[0].upstream_entrypoint,
+        "spci_target_action_generation": "frozen_standard_cp_box_policy",
+    }
 
 
 def _metric_placeholders() -> dict[str, float | str]:

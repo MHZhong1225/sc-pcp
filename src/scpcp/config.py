@@ -123,20 +123,30 @@ class SampleConfig:
     logged: int = 5_000
     oracle_rollouts: int = 50_000
     oracle_surface_rollouts: int = 5_000
-    # Total target-policy trajectories available to *each* online baseline.
-    # Controllers split this fixed budget across their adaptation rounds.
+    # Target-policy arrivals available to each online method.  ACI consumes
+    # these one patient at a time; native SPCI receives this chronological
+    # target stream.  Native PRC declares its own independent cohort size and
+    # reports the actual number of target trajectories it consumes.
     online_rollouts: int = 2_000
 
 
 @dataclass(frozen=True)
 class BaselineConfig:
-    """Prespecified settings for transparent task-aligned baselines."""
+    """Prespecified inputs for article-faithful baseline adapters.
+
+    ``online_rounds``, ``multidim_buffer``, and ``prc_maximum_step`` remain
+    only so older private YAML records can be parsed.  Strict baseline paths do
+    not read them and will not silently recreate their former local adapters.
+    """
 
     mfcs_depth: int = 3
     aci_gamma: float = 0.01
     multidim_buffer: int = 1_000
     online_rounds: int = 3
     prc_maximum_step: float = 0.35
+    prc_tightness: float = 0.08
+    prc_tau: float = 1.0
+    prc_cohort_size: int = 2_000
 
 
 @dataclass(frozen=True)
@@ -310,6 +320,12 @@ class ExperimentConfig:
             raise ValueError("online baseline rounds must be positive")
         if self.baselines.prc_maximum_step <= 0.0:
             raise ValueError("PRC maximum grid step must be positive")
+        if not 0.0 < self.baselines.prc_tightness < self.certification.alpha:
+            raise ValueError("PRC tightness must lie in (0, certification.alpha)")
+        if self.baselines.prc_tau <= 0.0:
+            raise ValueError("PRC tau must be positive")
+        if self.baselines.prc_cohort_size < 2:
+            raise ValueError("PRC cohort size must be at least two")
         if self.samples.online_rollouts < self.baselines.online_rounds:
             raise ValueError(
                 "online_rollouts must be at least online_rounds so every adaptation round "
