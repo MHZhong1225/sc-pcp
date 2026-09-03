@@ -178,16 +178,28 @@ EXPECTED_SETUP_EVENTS = [
 ]
 
 
-def test_run_seed_setup_sequence_and_seeds_are_unchanged(
+def test_experiment_context_setup_sequence_and_seeds_are_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[object, ...]] = []
-    _install_setup_spies(monkeypatch, events, stop_after_family=True)
+    expected = _install_setup_spies(monkeypatch, events, stop_after_family=False)
 
-    with pytest.raises(_SetupComplete):
-        experiment.run_seed(ExperimentConfig(), seed=7, device="cpu")
+    experiment.torch.manual_seed(7)
+    observed = experiment._prepare_experiment_context(
+        ExperimentConfig(),
+        seed=7,
+        device="cpu",
+    )
 
-    assert events == EXPECTED_SETUP_EVENTS
+    assert events == EXPECTED_SETUP_EVENTS[:6]
+    assert observed == experiment._ExperimentContext(
+        task=expected.task,
+        outcome_model=expected.outcome_model,
+        region=expected.region,
+        policy=expected.policy,
+        logging_policy=expected.logging_policy,
+        outcome_sd=expected.outcome_sd,
+    )
 
 
 def test_oracle_context_matches_existing_run_seed_setup(

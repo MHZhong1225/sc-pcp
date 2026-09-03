@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -23,48 +24,57 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 TARGET = 0.90
+EXPECTED_ALPHA = 0.10
+PAPER_PROTOCOL = "committed_prefix_marginal_scpcp"
+PAPER_METHOD = "direct_committed_prefix_uncapped_importance_weighting"
+SCPCP_GUARANTEE_SCOPE = "asymptotic_per_step_marginal"
+SCPCP_SELECTION_EVIDENCE = "committed_prefix_uncapped_hajek_point_estimate"
+FEEDBACK_LEVELS = (0.0, 0.5, 1.0, 2.0)
+WORST_COVERAGE_BOOTSTRAP_RESAMPLES = 10_000
+WORST_COVERAGE_BOOTSTRAP_SEED = 8_202_686
+WORST_COVERAGE_BOOTSTRAP_BATCH_SIZE = 500
 CONDITIONAL_SELECTION_NOTE = (
     "Coverage and width curves are conditional on successful method selection; "
     "see Selection Rate for abstentions."
 )
 METHOD_ORDER = (
     "Standard CP",
-    "ACI stagewise adaptation",
-    "MFCS task-adapted",
-    "MultiDimSPCI task-adapted",
-    "PRC grid-adapted",
+    "ACI",
+    "MFCS",
+    "SPCI",
+    "PRC",
     "SC-PCP",
 )
 METHOD_LABELS = {
     "Standard CP": "Standard CP",
-    "ACI stagewise adaptation": "ACI",
-    "MFCS task-adapted": "MFCS",
-    "MultiDimSPCI task-adapted": "SPCI",
-    "PRC grid-adapted": "PRC",
+    "ACI": "ACI",
+    "MFCS": "MFCS",
+    "SPCI": "SPCI",
+    "PRC": "PRC",
     "SC-PCP": "SC-PCP",
 }
 COLORS = {
     "Standard CP": "#7e8c9c",
-    "ACI stagewise adaptation": "#aa3831",
-    "MFCS task-adapted": "#02bec4",
-    "MultiDimSPCI task-adapted": "#7a3d9d",
-    "PRC grid-adapted": "#448c27",
+    "ACI": "#aa3831",
+    "MFCS": "#02bec4",
+    "SPCI": "#7a3d9d",
+    "PRC": "#448c27",
     "SC-PCP": "#4394f8",
 }
 MARKERS = {
     "Standard CP": "o",
-    "ACI stagewise adaptation": "v",
-    "MFCS task-adapted": "D",
-    "MultiDimSPCI task-adapted": "h",
-    "PRC grid-adapted": ">",
+    "ACI": "v",
+    "MFCS": "D",
+    "SPCI": "h",
+    "PRC": ">",
     "SC-PCP": "*",
 }
 LINESTYLES = {
     "Standard CP": (0, (7, 3)),
-    "ACI stagewise adaptation": "-.",
-    "MFCS task-adapted": ":",
-    "MultiDimSPCI task-adapted": (0, (3, 2)),
-    "PRC grid-adapted": (0, (5, 2, 1, 2, 1, 2)),
+    "ACI": "-.",
+    "MFCS": ":",
+    "SPCI": (0, (3, 2)),
+    "PRC": (0, (5, 2, 1, 2, 1, 2)),
     "SC-PCP": "-",
 }
 DATASET_LABELS = {
@@ -94,7 +104,7 @@ def main() -> None:
             ]
         ),
         args.output / "table_1_synthetic_main.pdf",
-        title="Table 1 | Synthetic main results (target worst-step coverage = 0.90)",
+        title="Table 1 | Synthetic main results (target marginal worst-step coverage = 0.90)",
         include_dataset=False,
     )
     render_table(
@@ -105,7 +115,7 @@ def main() -> None:
     )
     render_coverage_profiles(records, args.output / "figure_1_per_step_coverage.pdf")
     render_feedback_stress(records, args.output / "figure_2_feedback_stress.pdf")
-    render_mechanism(args.input, args.output / "figure_3_self_consistent_diagonal.pdf")
+    render_mechanism(args.input, args.output / "figure_3_committed_prefix_mechanism.pdf")
     _assert_pdf_only(args.output)
     print(args.output)
 
@@ -118,29 +128,70 @@ def validate_complete_suite(root: Path) -> None:
     manifest_path = root / "suite_manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("paper suite manifest is missing")
-    manifest = json.loads(manifest_path.read_text())
+    manifest = _read_json_mapping(manifest_path)
+    if manifest.get("protocol") != PAPER_PROTOCOL:
+        raise RuntimeError("paper suite manifest has the wrong protocol")
+    if manifest.get("method") != PAPER_METHOD:
+        raise RuntimeError("paper suite manifest has the wrong SC-PCP method")
+    if not _is_sha256(manifest.get("experiment_tree_sha256")):
+        raise RuntimeError("paper suite manifest has an invalid experiment source hash")
     if set(manifest.get("sections", ())) != {"rq1", "rq3"}:
         raise RuntimeError("formal PDF rendering requires complete RQ1 and RQ3 sections")
     if set(manifest.get("datasets", ())) != set(DATASET_LABELS):
         raise RuntimeError("formal PDF rendering requires all five prespecified datasets")
+    if tuple(manifest.get("feedback_levels", ())) != FEEDBACK_LEVELS:
+        raise RuntimeError("formal PDF rendering requires the prespecified feedback levels")
     studies = [root / "rq1" / dataset for dataset in manifest["datasets"]]
     studies.extend(
         root / "rq3" / f"beta_{float(beta):g}"
         for beta in manifest["feedback_levels"]
         if float(beta) != 1.0
     )
+    source_hashes: set[str] = set()
+    git_revisions: set[str] = set()
+    validated_records: set[Path] = set()
     for study in studies:
-        _validate_complete_study(study)
+        source_hash, git_revision, record_paths = _validate_complete_study(study)
+        source_hashes.add(source_hash)
+        git_revisions.add(git_revision)
+        validated_records.update(record_paths)
+    if len(source_hashes) != 1 or len(git_revisions) != 1:
+        raise RuntimeError("paper studies were not produced from one consistent source tree")
+    observed_records = {path.resolve() for path in root.rglob("records.csv")}
+    if observed_records != validated_records:
+        raise RuntimeError("paper suite contains records outside the validated studies")
 
 
-def _validate_complete_study(study: Path) -> None:
+def _validate_complete_study(study: Path) -> tuple[str, str, set[Path]]:
     if not (study / "COMPLETE").is_file():
         raise RuntimeError(f"paper study is incomplete: {study}")
     config_path = study / "config.yaml"
     if not config_path.is_file():
         raise RuntimeError(f"paper study config is missing: {study}")
     config = yaml.safe_load(config_path.read_text())
+    if not isinstance(config, dict):
+        raise RuntimeError(f"paper study config must be a mapping: {study}")
+    certification = config.get("certification")
+    alpha = None if not isinstance(certification, dict) else certification.get("alpha")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or float(alpha) != EXPECTED_ALPHA:
+        raise RuntimeError(f"paper study must use alpha={EXPECTED_ALPHA:.2f}: {study}")
     expected_seeds = tuple(int(seed) for seed in config["seeds"])
+    status = _read_json_mapping(study / "study_status.json")
+    if (
+        status.get("status") != "complete"
+        or status.get("expected_seeds") != list(expected_seeds)
+        or status.get("completed_seeds") != list(expected_seeds)
+        or status.get("missing_seeds") not in ([], None)
+        or status.get("error") is not None
+    ):
+        raise RuntimeError(f"paper study status is inconsistent: {study}")
+    study_metadata = _read_json_mapping(study / "study_metadata.json")
+    source_hash = study_metadata.get("source_tree_sha256")
+    git_revision = study_metadata.get("git_revision")
+    if not _is_sha256(source_hash) or not _is_git_revision(git_revision):
+        raise RuntimeError(f"paper study has invalid source provenance: {study}")
+    if study_metadata.get("seeds") != list(expected_seeds):
+        raise RuntimeError(f"paper study metadata has a different seed set: {study}")
     observed_seed_dirs = {
         path.name
         for path in study.glob("seed_*")
@@ -152,15 +203,123 @@ def _validate_complete_study(study: Path) -> None:
             f"seed set mismatch in {study}: expected {len(expected_seed_dirs)}, "
             f"found {len(observed_seed_dirs)}"
         )
+    record_paths: set[Path] = set()
     for seed_dir in sorted(expected_seed_dirs):
         seed_root = study / seed_dir
         if not (seed_root / "COMPLETE").is_file():
             raise RuntimeError(f"seed is incomplete: {seed_root}")
-        frame = pd.read_csv(seed_root / "records.csv")
+        record_path = seed_root / "records.csv"
+        metadata_path = seed_root / "metadata.json"
+        if not record_path.is_file() or not metadata_path.is_file():
+            raise RuntimeError(f"paper seed is missing records or metadata: {seed_root}")
+        seed = int(seed_dir.split("_")[-1])
+        seed_metadata = _read_json_mapping(metadata_path)
+        if (
+            seed_metadata.get("seed") != seed
+            or seed_metadata.get("source_tree_sha256") != source_hash
+            or seed_metadata.get("git_revision") != git_revision
+            or seed_metadata.get("config") != config
+        ):
+            raise RuntimeError(f"paper seed provenance differs from its study: {seed_root}")
+        diagnostics = seed_metadata.get("diagnostics")
+        if not isinstance(diagnostics, dict) or (
+            diagnostics.get("protocol") != PAPER_PROTOCOL
+            or diagnostics.get("method") != PAPER_METHOD
+            or diagnostics.get("guarantee_scope") != SCPCP_GUARANTEE_SCOPE
+        ):
+            raise RuntimeError(f"paper seed has the wrong SC-PCP protocol: {seed_root}")
+
+        frame = pd.read_csv(record_path)
         empirical = frame[frame["track"].eq("empirical_environment")]
-        families = tuple(method_family(value) for value in empirical["method"])
-        if len(families) != len(METHOD_ORDER) or set(families) != set(METHOD_ORDER):
+        methods = tuple(empirical["method"].astype(str))
+        if len(methods) != len(METHOD_ORDER) or set(methods) != set(METHOD_ORDER):
             raise RuntimeError(f"seed does not contain exactly the six paper methods: {seed_root}")
+        scpcp = empirical.loc[empirical["method"].eq("SC-PCP")].iloc[0]
+        selection_available = _validate_scpcp_claim_record(scpcp, seed_root)
+        if _strict_bool(
+            diagnostics.get("scpcp_selection_available"),
+            field="diagnostics.scpcp_selection_available",
+            source=seed_root,
+        ) != selection_available:
+            raise RuntimeError(f"paper seed SC-PCP selection status disagrees: {seed_root}")
+        record_paths.add(record_path.resolve())
+    return str(source_hash), str(git_revision), record_paths
+
+
+def _validate_scpcp_claim_record(record: pd.Series, source: Path) -> bool:
+    expected_text = {
+        "selection_estimand": "per_step_marginal",
+        "selection_parameter": "stagewise_radii",
+        "guarantee_scope": SCPCP_GUARANTEE_SCOPE,
+        "selection_evidence": SCPCP_SELECTION_EVIDENCE,
+    }
+    required = {
+        *expected_text,
+        "selection_status",
+        "selection_available",
+        "certificate_type",
+        "certificate_formal",
+        "certified",
+        "lower_bound_min",
+    }
+    missing = sorted(required - set(record.index))
+    if missing:
+        raise RuntimeError(f"SC-PCP record is missing claim fields {missing}: {source}")
+    for field, expected in expected_text.items():
+        if record[field] != expected:
+            raise RuntimeError(f"SC-PCP record has invalid {field}: {source}")
+    if not _is_missing(record["certificate_type"]) or not _is_missing(record["lower_bound_min"]):
+        raise RuntimeError(f"marginal SC-PCP record must not contain a certificate: {source}")
+    for field in ("certificate_formal", "certified"):
+        if _strict_bool(record[field], field=field, source=source):
+            raise RuntimeError(f"marginal SC-PCP record cannot set {field}=true: {source}")
+    available = _strict_bool(
+        record["selection_available"],
+        field="selection_available",
+        source=source,
+    )
+    expected_status = (
+        "SELECTED_MARGINAL_POINT"
+        if available
+        else "UNAVAILABLE_NO_FEASIBLE_CANDIDATE"
+    )
+    if record["selection_status"] != expected_status:
+        raise RuntimeError(f"SC-PCP record has inconsistent selection status: {source}")
+    return available
+
+
+def _read_json_mapping(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"required JSON artifact is missing: {path}")
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"JSON artifact is malformed: {path}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"JSON artifact must contain an object: {path}")
+    return value
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _is_git_revision(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def _is_missing(value: object) -> bool:
+    return value is None or (not isinstance(value, str) and bool(pd.isna(value))) or (
+        isinstance(value, str) and not value.strip()
+    )
+
+
+def _strict_bool(value: object, *, field: str, source: Path) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise RuntimeError(f"{field} must be a boolean: {source}")
 
 
 def load_suite_records(root: Path) -> pd.DataFrame:
@@ -198,21 +357,30 @@ def aggregate_main(records: pd.DataFrame) -> pd.DataFrame:
     for (dataset, method), group in records.groupby(["dataset", "method_family"], sort=False):
         selected = group["selection_available"].map(_as_bool)
         evaluated = group[selected]
-        target_met = selected & group["worst_coverage"].ge(TARGET)
-        cov_mean, cov_lo, cov_hi = mean_ci(evaluated["worst_coverage"])
+        marginal_worst, marginal_worst_lo, marginal_worst_hi = (
+            marginal_worst_coverage_ci(
+                evaluated,
+                dataset=str(dataset),
+                method=str(method),
+            )
+        )
         average_cov_mean, average_cov_lo, average_cov_hi = mean_ci(
             evaluated["average_coverage"]
         )
         width_mean, width_lo, width_hi = mean_ci(evaluated["average_normalized_width"])
         selection_rate = float(selected.mean())
         selection_lo, selection_hi = wilson_ci(int(selected.sum()), len(selected))
+        marginal_target_met = bool(
+            np.isfinite(marginal_worst) and marginal_worst >= TARGET
+        )
+        selection_rate_eligible = selection_rate >= 0.95
         rows.append(
             {
                 "dataset": dataset,
                 "method": method,
-                "worst_coverage": cov_mean,
-                "worst_coverage_ci_low": cov_lo,
-                "worst_coverage_ci_high": cov_hi,
+                "marginal_worst_coverage": marginal_worst,
+                "marginal_worst_coverage_ci_low": marginal_worst_lo,
+                "marginal_worst_coverage_ci_high": marginal_worst_hi,
                 "average_coverage": average_cov_mean,
                 "average_coverage_ci_low": average_cov_lo,
                 "average_coverage_ci_high": average_cov_hi,
@@ -222,7 +390,11 @@ def aggregate_main(records: pd.DataFrame) -> pd.DataFrame:
                 "selection_rate": selection_rate,
                 "selection_rate_ci_low": selection_lo,
                 "selection_rate_ci_high": selection_hi,
-                "target_met_rate": float(target_met.mean()),
+                "marginal_worst_target_met": marginal_target_met,
+                "selection_rate_at_least_95_percent": selection_rate_eligible,
+                "efficiency_eligible": (
+                    marginal_target_met and selection_rate_eligible
+                ),
                 "n_runs": len(group),
                 "n_selected": int(selected.sum()),
             }
@@ -246,11 +418,17 @@ def render_table(summary: pd.DataFrame, path: Path, *, title: str, include_datas
         values.extend(
             (
                 METHOD_LABELS[row.method],
-                ci_text(row.worst_coverage, row.worst_coverage_ci_low, row.worst_coverage_ci_high),
+                ci_text(
+                    row.marginal_worst_coverage,
+                    row.marginal_worst_coverage_ci_low,
+                    row.marginal_worst_coverage_ci_high,
+                    digits=4,
+                ),
                 ci_text(
                     row.average_coverage,
                     row.average_coverage_ci_low,
                     row.average_coverage_ci_high,
+                    digits=4,
                 ),
                 ci_text(
                     row.average_normalized_width,
@@ -263,16 +441,27 @@ def render_table(summary: pd.DataFrame, path: Path, *, title: str, include_datas
         rows.append(values)
     columns = (["Dataset"] if include_dataset else []) + [
         "Method",
-        "Worst-step coverage\nmean [95% CI]",
+        "Marginal worst-step\ncoverage point\n[seed-bootstrap 95% CI]",
         "Mean coverage\nmean [95% CI]",
-        "Average normalized width ↓\nmean [95% CI]",
+        "Average normalized\nwidth ↓\nmean [95% CI]",
         "Selection rate ↑\nmean (selected/runs)",
     ]
     height = max(5.0, 0.43 * len(rows) + 2.3)
     figure, axis = plt.subplots(figsize=(18, height))
     axis.axis("off")
     axis.set_title(title, loc="left", fontweight="bold", pad=18)
-    table = axis.table(cellText=rows, colLabels=columns, loc="center", cellLoc="center")
+    column_widths = (
+        [0.17, 0.12, 0.19, 0.16, 0.18, 0.18]
+        if include_dataset
+        else None
+    )
+    table = axis.table(
+        cellText=rows,
+        colLabels=columns,
+        colWidths=column_widths,
+        loc="center",
+        cellLoc="center",
+    )
     table.auto_set_font_size(False)
     table.set_fontsize(17)
     table.scale(1.0, 1.85)
@@ -282,6 +471,7 @@ def render_table(summary: pd.DataFrame, path: Path, *, title: str, include_datas
         if row_index == 0:
             cell.set_facecolor("#E8EEF7")
             cell.set_text_props(fontweight="bold")
+            cell.set_height(cell.get_height() * 2.1)
         elif row_index % 2 == 0:
             cell.set_facecolor("#F7F7F7")
     width_column = 4 if include_dataset else 3
@@ -294,9 +484,10 @@ def render_table(summary: pd.DataFrame, path: Path, *, title: str, include_datas
     figure.text(
         0.01,
         0.015,
-        "Coverage and width are averaged over selected runs; Selection Rate uses all prespecified runs. "
-        "Coverage is judged against the 0.90 target (larger is not intrinsically better). Bold width requires "
-        "at least 95% of all prespecified runs to select and attain the target.",
+        "Marginal WSC is min_t of the across-seed mean per-step coverage over selected runs. Its percentile "
+        f"95% CI resamples seeds as whole per-time vectors ({WORST_COVERAGE_BOOTSTRAP_RESAMPLES:,} draws).\n"
+        "Mean coverage and width are averaged over selected runs; Selection Rate uses all prespecified runs. "
+        "Bold marks the narrowest method with marginal WSC >= 0.90 and Selection Rate >= 95%.",
         ha="left",
         va="bottom",
         fontsize=17,
@@ -395,7 +586,13 @@ def render_feedback_stress(records: pd.DataFrame, path: Path) -> None:
         for beta, group in method_rows.groupby("feedback_strength"):
             selected = group["selection_available"].map(_as_bool)
             evaluated = group[selected]
-            c, clo, chi = mean_ci(evaluated["worst_coverage"])
+            # The bootstrap key deliberately excludes beta, so each method
+            # reuses the same seed-resampling stream across feedback levels.
+            c, clo, chi = marginal_worst_coverage_ci(
+                evaluated,
+                dataset="synthetic",
+                method=method,
+            )
             m, mlo, mhi = mean_ci(evaluated["average_coverage"])
             w, wlo, whi = mean_ci(evaluated["average_normalized_width"])
             values = (beta, c, clo, chi, m, mlo, mhi, w, wlo, whi)
@@ -455,7 +652,7 @@ def render_feedback_stress(records: pd.DataFrame, path: Path) -> None:
     flat_axes[0].axhline(TARGET, color="#111827", linestyle=(0, (1, 2)), linewidth=1.8)
     flat_axes[1].axhline(TARGET, color="#111827", linestyle=(0, (1, 2)), linewidth=1.8)
     labels = (
-        "Worst-step coverage",
+        "Marginal worst-step coverage",
         "Mean coverage",
         "Average normalized width",
         "Selection rate",
@@ -473,34 +670,81 @@ def render_feedback_stress(records: pd.DataFrame, path: Path) -> None:
 
 
 def render_mechanism(root: Path, path: Path) -> None:
-    seed_root = root / "rq1" / "synthetic" / "seed_00000"
+    synthetic_root = root / "rq1" / "synthetic"
+    mechanism_seed = configured_mechanism_seed(synthetic_root)
+    seed_root = synthetic_root / f"seed_{mechanism_seed:05d}"
     with np.load(seed_root / "surfaces.npz") as arrays:
-        required = {"scale_grid", "cot_diagonal", "cot_lower_bounds", "oracle_diagonal"}
+        required = {
+            "scpcp_stage_grids",
+            "scpcp_candidate_coverage",
+            "scpcp_selected_indices",
+            "scpcp_selected_radii",
+            "scpcp_selected_effective_sample_size",
+        }
         missing = required - set(arrays.files)
         if missing:
             raise RuntimeError(f"RQ4 arrays are missing: {sorted(missing)}")
-        scale_grid = arrays["scale_grid"]
-        cot = arrays["cot_diagonal"].min(axis=1)
-        lower = arrays["cot_lower_bounds"].min(axis=1)
-        oracle = arrays["oracle_diagonal"].min(axis=1)
+        stage_grids = arrays["scpcp_stage_grids"]
+        candidate_coverage = arrays["scpcp_candidate_coverage"]
+        selected_indices = arrays["scpcp_selected_indices"].astype(int)
+        selected_radii = arrays["scpcp_selected_radii"]
+        selected_ess = arrays["scpcp_selected_effective_sample_size"]
     records = pd.read_csv(seed_root / "records.csv")
     selected = records[records["method"].eq("SC-PCP")]
-    selected_scale = (
-        float(selected["selected_scale"].iloc[0])
-        if not selected.empty and "selected_scale" in selected
-        else math.nan
+    if len(selected) != 1:
+        raise RuntimeError("RQ4 requires exactly one SC-PCP record")
+    fresh_coverage = parse_curve(selected["per_time_coverage"].iloc[0])
+    horizon = len(selected_indices)
+    expected_shapes = {
+        "stage_grids": stage_grids.shape,
+        "candidate_coverage": candidate_coverage.shape,
+    }
+    if (
+        stage_grids.ndim != 2
+        or candidate_coverage.shape != stage_grids.shape
+        or selected_radii.shape != (horizon,)
+        or selected_ess.shape != (horizon,)
+        or fresh_coverage.shape != (horizon,)
+        or np.any(selected_indices < 0)
+        or np.any(selected_indices >= stage_grids.shape[1])
+    ):
+        raise RuntimeError(f"RQ4 arrays have incompatible shapes: {expected_shapes}")
+    selected_estimated_coverage = candidate_coverage[
+        np.arange(horizon), selected_indices
+    ]
+    stages = np.arange(horizon)
+
+    figure, axes = plt.subplots(1, 3, figsize=(20, 6.5), constrained_layout=True)
+    axes[0].plot(
+        stages,
+        selected_estimated_coverage,
+        color="#4394f8",
+        marker="o",
+        linewidth=2.4,
+        label="Calibration IW estimate",
     )
-    figure, axis = plt.subplots(figsize=(13, 8), constrained_layout=True)
-    axis.plot(scale_grid, oracle, color="#111827", linewidth=2.3, label="Fresh-rollout oracle diagonal")
-    axis.plot(scale_grid, cot, color="#4394f8", linewidth=2.3, label="COT estimate")
-    axis.plot(scale_grid, lower, color="#4394f8", linestyle="--", linewidth=2.0, label="Ordered-IUT marginal lower bound")
-    axis.axhline(TARGET, color="#111827", linestyle=":", linewidth=2.0, label="Target (0.90)")
-    if np.isfinite(selected_scale):
-        axis.axvline(selected_scale, color="#448c27", linestyle="-.", linewidth=2.0, label="Selected scale")
-    axis.set_xlabel("Global schedule scale, s")
-    axis.set_ylabel("Worst-step self-consistent coverage")
-    axis.set_ylim(0.0, 1.02)
-    axis.legend(loc="lower right")
+    axes[0].plot(
+        stages,
+        fresh_coverage,
+        color="#448c27",
+        marker="s",
+        linewidth=2.2,
+        label="Fresh evaluation",
+    )
+    axes[0].axhline(TARGET, color="#111827", linestyle=":", linewidth=2.0)
+    axes[0].set_ylabel("Per-step coverage")
+    axes[0].set_ylim(0.84, 0.96)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(stages, selected_radii, color="#4394f8", marker="o", linewidth=2.4)
+    axes[1].set_ylabel("Selected radius")
+    axes[2].plot(stages, selected_ess, color="#7a3d9d", marker="D", linewidth=2.4)
+    axes[2].set_ylabel("Effective sample size")
+    for panel, axis in enumerate(axes):
+        axis.set_xlabel("Sequential stage, t")
+        axis.set_xticks(stages)
+        axis.grid(True, color="#D1D5DB", linewidth=0.8, alpha=0.65)
+        axis.text(-0.10, 1.03, "abc"[panel], transform=axis.transAxes, fontweight="bold")
     figure.savefig(path, bbox_inches="tight")
     plt.close(figure)
 
@@ -516,11 +760,110 @@ def mean_ci(values: object) -> tuple[float, float, float]:
     return mean, mean - half, mean + half
 
 
+def marginal_worst_coverage_ci(
+    records: pd.DataFrame,
+    *,
+    dataset: str,
+    method: str,
+) -> tuple[float, float, float]:
+    """Estimate ``min_t mean_seed coverage_t`` and its seed bootstrap CI."""
+
+    if records.empty:
+        return math.nan, math.nan, math.nan
+    ordered = records.sort_values("seed") if "seed" in records else records
+    curves = [parse_curve(value) for value in ordered["per_time_coverage"]]
+    if any(not curve.size for curve in curves):
+        raise RuntimeError(
+            f"{dataset}/{method} contains an invalid per_time_coverage curve"
+        )
+    try:
+        matrix = np.stack(curves)
+    except ValueError as error:
+        raise RuntimeError(
+            f"{dataset}/{method} per_time_coverage horizons differ"
+        ) from error
+    if (
+        not np.isfinite(matrix).all()
+        or np.any(matrix < 0.0)
+        or np.any(matrix > 1.0)
+    ):
+        raise RuntimeError(
+            f"{dataset}/{method} per_time_coverage must be finite probabilities"
+        )
+
+    estimate = float(matrix.mean(axis=0).min())
+    if len(matrix) == 1:
+        return estimate, estimate, estimate
+
+    rng = np.random.default_rng(_group_bootstrap_seed(dataset, method))
+    bootstrap_minima = np.empty(WORST_COVERAGE_BOOTSTRAP_RESAMPLES)
+    for start in range(
+        0,
+        WORST_COVERAGE_BOOTSTRAP_RESAMPLES,
+        WORST_COVERAGE_BOOTSTRAP_BATCH_SIZE,
+    ):
+        stop = min(
+            start + WORST_COVERAGE_BOOTSTRAP_BATCH_SIZE,
+            WORST_COVERAGE_BOOTSTRAP_RESAMPLES,
+        )
+        indices = rng.integers(0, len(matrix), size=(stop - start, len(matrix)))
+        bootstrap_minima[start:stop] = matrix[indices].mean(axis=1).min(axis=1)
+    low, high = np.quantile(bootstrap_minima, (0.025, 0.975))
+    return estimate, float(low), float(high)
+
+
+def _group_bootstrap_seed(dataset: str, method: str) -> int:
+    key = f"{WORST_COVERAGE_BOOTSTRAP_SEED}\0{dataset}\0{method}".encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+
+
+def configured_mechanism_seed(synthetic_root: Path) -> int:
+    """Read the mechanism seed from the completed synthetic study config."""
+
+    config_path = synthetic_root / "config.yaml"
+    if not config_path.is_file():
+        raise RuntimeError(f"RQ4 synthetic config is missing: {config_path}")
+    config = yaml.safe_load(config_path.read_text())
+    if not isinstance(config, dict):
+        raise RuntimeError("RQ4 synthetic config must be a mapping")
+    paper = config.get("paper")
+    mechanism_seed = None if not isinstance(paper, dict) else paper.get("mechanism_seed")
+    if (
+        isinstance(mechanism_seed, bool)
+        or not isinstance(mechanism_seed, int)
+        or mechanism_seed < 0
+    ):
+        raise RuntimeError("RQ4 paper.mechanism_seed must be a nonnegative integer")
+
+    configured_seeds = config.get("seeds")
+    if isinstance(configured_seeds, dict) and set(configured_seeds) == {"start", "stop"}:
+        start = configured_seeds["start"]
+        stop = configured_seeds["stop"]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, stop)):
+            raise RuntimeError("RQ4 configured seed range must contain integers")
+        seeds = set(range(start, stop))
+    elif isinstance(configured_seeds, (list, tuple)):
+        if any(
+            isinstance(seed, bool) or not isinstance(seed, int)
+            for seed in configured_seeds
+        ):
+            raise RuntimeError("RQ4 configured seeds must be integers")
+        seeds = set(configured_seeds)
+    else:
+        raise RuntimeError("RQ4 synthetic config has an invalid seeds field")
+    if mechanism_seed not in seeds:
+        raise RuntimeError(
+            f"RQ4 mechanism seed {mechanism_seed} is not in the configured seeds"
+        )
+    return mechanism_seed
+
+
 def _efficient_eligible_methods(summary: pd.DataFrame) -> set[tuple[str, str]]:
     selected = set()
     for dataset, group in summary.groupby("dataset"):
         eligible = group[
-            group["target_met_rate"].ge(0.95)
+            group["marginal_worst_coverage"].ge(TARGET)
+            & group["selection_rate"].ge(0.95)
             & group["average_normalized_width"].notna()
         ]
         if eligible.empty:
@@ -569,8 +912,10 @@ def parse_curve(value: object) -> np.ndarray:
     return array if array.ndim == 1 else np.asarray([], dtype=float)
 
 
-def ci_text(mean: float, low: float, high: float) -> str:
-    return "—" if not np.isfinite(mean) else f"{mean:.3f} [{low:.3f}, {high:.3f}]"
+def ci_text(mean: float, low: float, high: float, *, digits: int = 3) -> str:
+    if not np.isfinite(mean):
+        return "—"
+    return f"{mean:.{digits}f} [{low:.{digits}f}, {high:.{digits}f}]"
 
 
 def rate_ci_text(mean: float, low: float, high: float, selected: int, total: int) -> str:
@@ -637,7 +982,7 @@ def _assert_pdf_only(output: Path) -> None:
         "table_2_clinical_main.pdf",
         "figure_1_per_step_coverage.pdf",
         "figure_2_feedback_stress.pdf",
-        "figure_3_self_consistent_diagonal.pdf",
+        "figure_3_committed_prefix_mechanism.pdf",
     }
     observed = {path.name for path in output.glob("*.pdf")}
     if observed != expected:
