@@ -8,10 +8,10 @@ import math
 import torch
 from torch import Tensor
 
-from scpcp.data import TrajectoryBatch
-from scpcp.policy import BehaviorAnchoredPolicy
-from scpcp.scores import score_batch
-from scpcp.simulator import rollout
+from data import TrajectoryBatch
+from anchored import BehaviorAnchoredPolicy
+from scores import score_batch
+from simulator import rollout
 
 
 def fixed_q_grid(scores: Tensor, *, size: int, lower_quantile: float, upper_quantile: float) -> Tensor:

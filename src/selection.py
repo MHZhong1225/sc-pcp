@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from scpcp.certification import CertificationResult
+from certification import CertificationResult
 
 
 @dataclass(frozen=True)

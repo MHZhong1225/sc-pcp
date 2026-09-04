@@ -20,16 +20,16 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from scpcp.artifacts import (
+from artifacts import (
     mark_study_complete,
     mark_study_failed,
     source_tree_sha256,
     write_seed_result,
     write_study_metadata,
 )
-from scpcp.config import ExperimentConfig
-from scpcp.device import resolve_devices
-from scpcp.experiment import run_seed
+from config import ExperimentConfig
+from device import resolve_devices
+from experiment import run_seed
 
 
 SEED_DIRECTORY = re.compile(r"seed_(\d{5})")

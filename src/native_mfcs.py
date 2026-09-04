@@ -23,7 +23,7 @@ UPSTREAM_MFCS_COMMIT = "c737536d874fda9f0da6dbc95a16a91c71df2512"
 UPSTREAM_MFCS_LICENSE = "MIT"
 UPSTREAM_MFCS_SOURCE_SHA256 = "766d54864467ce3db635a30da94e5284f1140fba7f5150ce93743896adb0e880"
 DEFAULT_MFCS_SOURCE = (
-    Path(__file__).resolve().parents[2]
+    Path(__file__).resolve().parents[1]
     / "internal"
     / "baselines"
     / "conformal-mfcs"

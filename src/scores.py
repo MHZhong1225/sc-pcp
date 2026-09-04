@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from scpcp.outcome_model import GaussianOutcomeModel
+from outcome_model import GaussianOutcomeModel
 
 
 _SCORE_INFERENCE_CHUNK_SIZE = 4_096

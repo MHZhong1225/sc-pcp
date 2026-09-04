@@ -9,10 +9,10 @@ import math
 import torch
 from torch import Tensor, nn
 
-from scpcp.config import COTConfig
-from scpcp.data import TrajectoryBatch
-from scpcp.outcome_model import GaussianOutcomeModel
-from scpcp.policy import BehaviorAnchoredPolicy
+from config import COTConfig
+from data import TrajectoryBatch
+from outcome_model import GaussianOutcomeModel
+from anchored import BehaviorAnchoredPolicy
 
 
 class _RatioHead(nn.Module):

@@ -12,8 +12,8 @@ from dataclasses import dataclass
 
 from torch import Tensor
 
-from scpcp.data import TrajectoryBatch
-from scpcp.marginal_prefix import (
+from data import TrajectoryBatch
+from marginal_prefix import (
     MarginalPrefixSelection,
     select_marginal_prefix_schedule,
 )

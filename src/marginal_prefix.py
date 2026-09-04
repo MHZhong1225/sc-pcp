@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from scpcp.data import TrajectoryBatch
+from data import TrajectoryBatch
 
 
 @dataclass(frozen=True)

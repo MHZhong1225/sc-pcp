@@ -20,10 +20,10 @@ from typing import Protocol
 import torch
 from torch import Tensor
 
-from scpcp.baselines import OnlineBaselineResult
-from scpcp.data import TrajectoryBatch
-from scpcp.scores import score_batch
-from scpcp.simulator import rollout
+from baselines import OnlineBaselineResult
+from data import TrajectoryBatch
+from scores import score_batch
+from simulator import rollout
 
 
 ACI_PAPER = "https://arxiv.org/abs/2106.00170"

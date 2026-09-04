@@ -8,8 +8,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as functional
 
-from scpcp.config import ModelConfig
-from scpcp.data import TrajectoryBatch
+from config import ModelConfig
+from data import TrajectoryBatch
 
 
 _ALL_ACTION_INFERENCE_CHUNK_SIZE = 4_096

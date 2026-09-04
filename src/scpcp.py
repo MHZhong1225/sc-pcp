@@ -1,8 +1,8 @@
 """Self-Consistent Performative Conformal Prediction."""
 
-from scpcp.config import ExperimentConfig
-from scpcp.experiments import PerStepCalibrationInputs, calibrate_per_step_marginal
-from scpcp.marginal_prefix import MarginalPrefixSelection
+from config import ExperimentConfig
+from experiments import PerStepCalibrationInputs, calibrate_per_step_marginal
+from marginal_prefix import MarginalPrefixSelection
 
 __all__ = [
     "ExperimentConfig",

@@ -10,16 +10,16 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from scpcp.aci import run_aci_panel
-from scpcp.baselines import OnlineBaselineResult, standard_cp_stagewise_radii
-from scpcp.behavior import fit_behavior_policy
-from scpcp.certification import CertificationResult
-from scpcp.config import ExperimentConfig
-from scpcp.cot import (
+from aci import run_aci_panel
+from baselines import OnlineBaselineResult, standard_cp_stagewise_radii
+from behavior import fit_behavior_policy
+from certification import CertificationResult
+from config import ExperimentConfig
+from cot import (
     cot_state_action_weights,
     fit_cot,
 )
-from scpcp.coverage import (
+from per_step import (
     effective_sample_sizes,
     fixed_q_grid,
     per_step_oracle_metrics,
@@ -30,24 +30,24 @@ from scpcp.coverage import (
     transport_refined_stage_profile,
     weighted_stage_score_quantiles,
 )
-from scpcp.data import DataSplits, TrajectoryBatch, concatenate_trajectories, patient_level_splits
-from scpcp.marginal_prefix import (
+from data import DataSplits, TrajectoryBatch, concatenate_trajectories, patient_level_splits
+from marginal_prefix import (
     MarginalPrefixSelection,
     select_marginal_prefix_schedule,
 )
-from scpcp.native_prc import NativePRCConfig, NativePRCResult, native_prc_profile_scale
-from scpcp.native_spci import (
+from native_prc import NativePRCConfig, NativePRCResult, native_prc_profile_scale
+from native_spci import (
     NativeSPCIConfig,
     NativeSPCIUnavailable,
     StagewiseNativeSPCIResult,
     run_stagewise_native_spci,
     verify_native_spci_runtime,
 )
-from scpcp.outcome_model import fit_outcome_model
-from scpcp.policy import BehaviorAnchoredPolicy
-from scpcp.scores import fit_conformal_region, predict_observed_actions, score_batch
-from scpcp.selection import RadiusSelection
-from scpcp.simulator import (
+from outcome_model import fit_outcome_model
+from anchored import BehaviorAnchoredPolicy
+from scores import fit_conformal_region, predict_observed_actions, score_batch
+from selection import RadiusSelection
+from simulator import (
     EmpiricalTransitionEnvironment,
     SyntheticBehaviorPolicy,
     SyntheticTreatmentEnvironment,
@@ -923,7 +923,7 @@ def _prepare_task(config: ExperimentConfig, *, seed: int, device: str) -> _Task:
             include_behavior=False,
         )
         return _Task(environment, splits, environment.n_actions, logging, "tabular", config.policy)
-    from scpcp.real_data import load_clinical_trajectories
+    from real_data import load_clinical_trajectories
 
     (
         logged,

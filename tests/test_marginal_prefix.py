@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from scpcp.data import TrajectoryBatch
-from scpcp.marginal_prefix import (
+from data import TrajectoryBatch
+from marginal_prefix import (
     profile_log_rmse,
     select_marginal_prefix_schedule,
     unit_geometric_profile,

@@ -7,8 +7,8 @@ from copy import deepcopy
 import torch
 from torch import Tensor, nn
 
-from scpcp.config import ModelConfig, PolicyConfig
-from scpcp.data import TrajectoryBatch
+from config import ModelConfig, PolicyConfig
+from data import TrajectoryBatch
 
 
 class BehaviorPolicy(nn.Module):

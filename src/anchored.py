@@ -7,9 +7,9 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from scpcp.config import PolicyConfig
-from scpcp.outcome_model import GaussianOutcomeModel
-from scpcp.scores import ConformalRegion
+from config import PolicyConfig
+from outcome_model import GaussianOutcomeModel
+from scores import ConformalRegion
 
 
 @dataclass(frozen=True)

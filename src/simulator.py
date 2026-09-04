@@ -8,8 +8,8 @@ from typing import Protocol
 import torch
 from torch import Tensor
 
-from scpcp.config import SyntheticConfig
-from scpcp.data import TrajectoryBatch
+from config import SyntheticConfig
+from data import TrajectoryBatch
 
 
 class StochasticPolicy(Protocol):

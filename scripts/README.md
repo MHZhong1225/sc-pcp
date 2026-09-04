@@ -1,7 +1,7 @@
 # Public runner boundary
 
-The public package is designed around `scpcp.experiments` and the small unit
-tests in `tests/per_step/`. Paper-scale runners, frozen study configurations,
+The public package is designed around `scpcp` and the small unit
+tests in `tests/`. Paper-scale runners, frozen study configurations,
 figure renderers, and repair/replay scripts are private research operations;
 they live under the local Git-ignored `internal/` archive and are not part of a
 GitHub release. The one compatibility PDF renderer required by the established

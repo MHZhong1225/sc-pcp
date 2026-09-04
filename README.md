@@ -31,7 +31,7 @@ build matching your CUDA environment before installing SC-PCP.
 For a quick smoke test:
 
 ```bash
-python -m pytest -q tests/per_step/test_public_api.py
+python -m pytest -q tests/test_public_api.py
 ```
 
 This runs a complete two-stage SC-PCP calibration example and checks the
@@ -80,14 +80,24 @@ stagewise radii. Otherwise, `result.failure_stage` identifies the first stage
 without a feasible candidate.
 
 See
-[`tests/per_step/test_public_api.py`](tests/per_step/test_public_api.py) for a
+[`tests/test_public_api.py`](tests/test_public_api.py) for a
 complete runnable example, including the required policy interfaces and tensor
 shapes.
 
 The core implementation is in
-[`src/scpcp/marginal_prefix.py`](src/scpcp/marginal_prefix.py). The stable
-experiment-facing wrapper is in
-[`src/scpcp/experiments/`](src/scpcp/experiments/).
+[`src/marginal_prefix.py`](src/marginal_prefix.py). The public wrapper is
+[`src/experiments.py`](src/experiments.py).
 
 Clinical data, patient-derived caches, paper result bundles, and generated
 figures are not distributed with this source release.
+
+## Baseline reproduction boundary
+
+The research adapters keep article algorithms separate from this package's data
+layout. `MFCS`, `PRC`, and `SPCI` require a caller-supplied checkout of the
+specific upstream release; the adapters verify its revision before running.
+`SPCI` additionally requires the upstream-pinned
+`sklearn-quantile==0.0.21`. A mismatched dependency is reported as unavailable
+rather than substituted with another version or a local score-based method.
+ACI implements the published sequential update directly, with one binary
+update per patient arrival and no clipping or batched replacement.

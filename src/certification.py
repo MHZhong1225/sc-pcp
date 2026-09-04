@@ -8,7 +8,7 @@ import math
 import torch
 from torch import Tensor
 
-from scpcp.config import CertificationConfig
+from config import CertificationConfig
 
 
 @dataclass(frozen=True)

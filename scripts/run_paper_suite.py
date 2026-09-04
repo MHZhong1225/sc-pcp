@@ -13,9 +13,9 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from run_per_step import run_config
-from scpcp.artifacts import experiment_tree_sha256
-from scpcp.config import ExperimentConfig
-from scpcp.device import resolve_devices
+from artifacts import experiment_tree_sha256
+from config import ExperimentConfig
+from device import resolve_devices
 
 
 _PRIVATE_CONFIGS = ROOT / "internal" / "configs"

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import importlib.metadata
+import math
 import sys
 import threading
 from pathlib import Path
@@ -24,10 +25,10 @@ import torch
 from sklearn.base import RegressorMixin
 from sklearn.linear_model import LinearRegression
 
-from scpcp.data import TrajectoryBatch
+from data import TrajectoryBatch
 
 
-UPSTREAM_SPCI_REPOSITORY = "https://github.com/hamrel-cxu/SPCI-code"
+UPSTREAM_SPCI_REPOSITORY = "https://github.com/hamrel-cxu/MultiDimSPCI"
 UPSTREAM_SPCI_COMMIT = "2b22e47088ed37ebc48d1bb9fdfa192450f289a2"
 UPSTREAM_SPCI_REQUIREMENT = "sklearn-quantile==0.0.21"
 UPSTREAM_SPCI_LICENSE = "MIT"
@@ -97,7 +98,7 @@ class StagewiseNativeSPCIResult:
 
 
 def official_spci_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "internal" / "baselines" / "MultiDimSPCI"
+    return Path(__file__).resolve().parents[1] / "internal" / "baselines" / "MultiDimSPCI"
 
 
 def verify_official_spci_source(upstream_root: Path | None = None) -> Path:
@@ -132,6 +133,12 @@ def _import_context(root: Path) -> Iterator[type]:
     inserted = root_text not in sys.path
     if inserted:
         sys.path.insert(0, root_text)
+    # NumPy 2 removed the historical ``np.math`` alias used by the untouched
+    # 2024 upstream helper.  Supplying the standard-library alias preserves
+    # its exact volume formula without editing the verified upstream source.
+    restore_numpy_math = not hasattr(np, "math")
+    if restore_numpy_math:
+        np.math = math  # type: ignore[attr-defined]
     try:
         try:
             verify_native_spci_runtime()
@@ -147,6 +154,8 @@ def _import_context(root: Path) -> Iterator[type]:
             raise RuntimeError("MultiDimSPCI was imported outside the verified checkout")
         yield module.SPCI_and_EnbPI
     finally:
+        if restore_numpy_math:
+            delattr(np, "math")
         if inserted:
             sys.path.remove(root_text)
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from scpcp.data import TrajectoryBatch
-from scpcp.experiments import PerStepCalibrationInputs, calibrate_per_step_marginal
+from data import TrajectoryBatch
+from experiments import PerStepCalibrationInputs, calibrate_per_step_marginal
 
 
 class _LoggingPolicy:

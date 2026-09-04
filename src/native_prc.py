@@ -21,9 +21,9 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from scpcp.data import TrajectoryBatch
-from scpcp.scores import score_batch
-from scpcp.simulator import rollout
+from data import TrajectoryBatch
+from scores import score_batch
+from simulator import rollout
 
 
 OFFICIAL_PRC_REPOSITORY = "https://github.com/livctr/rcpp"
@@ -105,7 +105,7 @@ class NativePRCResult:
 
 
 def official_prc_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "internal" / "baselines" / "Performative Risk Control"
+    return Path(__file__).resolve().parents[1] / "internal" / "baselines" / "Performative Risk Control"
 
 
 def verify_official_prc_source(upstream_root: Path | None = None) -> Path:

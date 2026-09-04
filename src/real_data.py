@@ -19,9 +19,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scpcp.config import ExperimentConfig
-from scpcp.cxr import index_cxr_embeddings
-from scpcp.data import TrajectoryBatch
+from config import ExperimentConfig
+from cxr import index_cxr_embeddings
+from data import TrajectoryBatch
 
 
 MIMIC_VITAL_KIND = {

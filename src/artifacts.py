@@ -16,8 +16,8 @@ import pandas as pd
 import torch
 import yaml
 
-from scpcp.config import ExperimentConfig
-from scpcp.device import runtime_metadata
+from config import ExperimentConfig
+from device import runtime_metadata
 
 
 def git_revision() -> str | None:
@@ -36,7 +36,7 @@ def git_revision() -> str | None:
 def source_tree_sha256() -> str:
     """Hash the active implementation when the workspace has no Git commit."""
 
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[1]
     paths = [
         *sorted((root / "src" / "scpcp").rglob("*.py")),
         *sorted((root / "scripts").glob("*.py")),
@@ -57,7 +57,7 @@ def source_tree_sha256() -> str:
 def experiment_tree_sha256() -> str:
     """Hash executable sources and paper configs for a whole-suite freeze."""
 
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[1]
     paths = [
         *sorted((root / "src" / "scpcp").rglob("*.py")),
         *sorted((root / "scripts").glob("*.py")),

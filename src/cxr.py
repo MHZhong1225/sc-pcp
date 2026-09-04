@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
-from scpcp.config import DataConfig
+from config import DataConfig
 
 
 class _CXRDataset(Dataset[tuple[Tensor, Tensor]]):
