@@ -1,8 +1,5 @@
 # **SC-PCP**
 
-This repository contains a minimal, runnable implementation of SC-PCP. The
-public release keeps the proposed committed-prefix marginal calibration method,
-its reusable Python API, and the tests needed to validate the implementation.
 
 ## **Install**
 
@@ -91,13 +88,4 @@ The core implementation is in
 Clinical data, patient-derived caches, paper result bundles, and generated
 figures are not distributed with this source release.
 
-## Baseline reproduction boundary
-
-The research adapters keep article algorithms separate from this package's data
-layout. `MFCS`, `PRC`, and `SPCI` require a caller-supplied checkout of the
-specific upstream release; the adapters verify its revision before running.
-`SPCI` additionally requires the upstream-pinned
-`sklearn-quantile==0.0.21`. A mismatched dependency is reported as unavailable
-rather than substituted with another version or a local score-based method.
-ACI implements the published sequential update directly, with one binary
-update per patient arrival and no clipping or batched replacement.
+## Datasets
